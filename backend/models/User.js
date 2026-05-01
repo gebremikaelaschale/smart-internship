@@ -12,6 +12,7 @@ const userSchema = new mongoose.Schema({
     },
     isFirstLogin: { type: Boolean, default: true },
     phone: { type: String },
+    profileImage: { type: String, default: '' },
     college: { type: String }, 
     department: { type: String },
     collegeId: { type: mongoose.Schema.Types.ObjectId, ref: 'College', default: null },
@@ -23,6 +24,8 @@ const userSchema = new mongoose.Schema({
     accountStatus: { type: String, enum: ['Active', 'Deactivated'], default: 'Active' },
     language: { type: String, default: 'English' },
     timezone: { type: String, default: 'GMT+3 (East Africa Time)' },
+    isOnline: { type: Boolean, default: false },
+    lastSeen: { type: Date, default: null },
     
     // Notification Matrix
     notificationSettings: {
@@ -75,6 +78,17 @@ const userSchema = new mongoose.Schema({
     
     resetPasswordToken: { type: String },
     resetPasswordExpires: { type: Number },
+    badges: [
+        { title: String, date: { type: Date, default: Date.now }, icon: String }
+    ],
+    skillAnalytics: {
+        type: Map,
+        of: Number,
+        default: {}
+    },
+    savedInternships: [
+        { type: mongoose.Schema.Types.ObjectId, ref: 'Internship' }
+    ],
     createdAt: { type: Date, default: Date.now }
 }, {
     timestamps: false

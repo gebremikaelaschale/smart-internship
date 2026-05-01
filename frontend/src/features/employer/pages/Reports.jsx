@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import Card from '@/components/ui/Card';
 import EmployerCard from '../components/EmployerCard';
 import { employerAPI } from '../employerAPI';
+import ProgramSubNav from '../components/ProgramSubNav';
 
 function renderStars(rating) {
   const value = Math.max(0, Math.min(5, Math.round(Number(rating) || 0)));
@@ -61,6 +62,8 @@ export default function Reports() {
 
   return (
     <div className="space-y-6">
+      <ProgramSubNav />
+
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <EmployerCard
           title="Total Interns"

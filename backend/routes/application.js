@@ -41,22 +41,66 @@ router.post('/apply', auth, async (req, res) => {
             return res.status(409).json({ message: 'You already applied to this internship.' });
         }
 
-        let finalResumeUrl = String(resumeUrl || '').trim();
-        if (!finalResumeUrl) {
-            const profile = await Profile.findOne({ userId: req.user.id }).lean();
-            finalResumeUrl = String(profile?.resumeUrl || '').trim();
+        const isAlreadyPlaced = await Application.findOne({ studentId: req.user.id, status: 'Placed' });
+        if (isAlreadyPlaced) {
+            return res.status(403).json({ message: 'You are already placed in an internship and cannot apply for another one.' });
         }
 
+        const [profile, internship] = await Promise.all([
+            Profile.findOne({ userId: req.user.id }).lean(),
+            Internship.findById(internshipId).lean()
+        ]);
+
+        if (!internship) {
+            return res.status(404).json({ message: 'Internship not found.' });
+        }
+
+        let calculatedScore = 0;
+        const studentSkills = (profile?.academicInfo?.skills || []).map(s => String(s).toLowerCase().trim());
+        const requiredSkills = (internship?.requiredSkills || []).map(s => String(s).toLowerCase().trim());
+
+        if (requiredSkills.length > 0) {
+            let matchedCount = 0;
+            requiredSkills.forEach(req => {
+                if (studentSkills.some(stu => stu.includes(req) || req.includes(stu))) {
+                    matchedCount++;
+                }
+            });
+            calculatedScore = Math.round((matchedCount / requiredSkills.length) * 100);
+            
+            const sDept = String(profile?.personalInfo?.department || '').toLowerCase().trim();
+            const iDept = String(internship?.department || '').toLowerCase().trim();
+            if (sDept && iDept && (sDept.includes(iDept) || iDept.includes(sDept))) {
+                calculatedScore = Math.max(calculatedScore, 95);
+            }
+        }
+        
+        calculatedScore = Math.min(100, calculatedScore);
+
+        const finalResumeUrl = String(resumeUrl || profile?.resumeUrl || '').trim();
         if (!finalResumeUrl) {
             return res.status(400).json({ message: 'Please add your resume URL in profile before applying.' });
         }
+
+        // Workflow Differentiation based on Interview Requirement
+        // interviewRequired: false => Direct Placement ('Placed')
+        // interviewRequired: true  => Screening Needed ('Shortlisted')
+        const initialStatus = internship?.interviewRequired ? 'Shortlisted' : 'Placed';
 
         const newApp = new Application({
             studentId: req.user.id,
             internshipId,
             resumeUrl: finalResumeUrl,
             coverLetter: String(coverLetter || '').trim(),
-            matchingScore: Number(matchScore || 0)
+            matchingScore: calculatedScore,
+            status: initialStatus,
+            timeline: [{
+                status: initialStatus,
+                date: new Date(),
+                comment: internship?.interviewRequired 
+                    ? 'Screening required. Waiting for employer interview.' 
+                    : 'Direct placement successful. You can now access your placement letter.'
+            }]
         });
         await newApp.save();
 
@@ -117,9 +161,60 @@ router.get('/my', auth, async (req, res) => {
         }
 
         const apps = await Application.find({ studentId: req.user.id })
-            .populate('internshipId', 'title location type status companyId')
-            .sort({ createdAt: -1 });
-        res.json(apps);
+            .populate('internshipId', 'title location type status companyId duration startDate description requirements requiredSkills programType department endDate isPaid stipend studentsNeeded trainingFocus')
+            .sort({ createdAt: -1 })
+            .lean();
+
+        const CompanyProfile = require('../models/CompanyProfile');
+        const companyIds = apps.map(app => app.internshipId?.companyId).filter(Boolean);
+        const uniqueCompanyIds = [...new Set(companyIds.map(id => String(id)))];
+        const companyProfiles = await CompanyProfile.find({ user: { $in: uniqueCompanyIds } }).lean();
+        const profileMap = {};
+        companyProfiles.forEach(cp => {
+            profileMap[String(cp.user)] = cp;
+        });
+
+        const profile = await Profile.findOne({ userId: req.user.id }).lean();
+        const studentSkills = (profile?.academicInfo?.skills || []).filter(Boolean).map(s => String(s).toLowerCase().trim());
+
+        const enrichedApps = apps.map(app => {
+            const internship = app.internshipId;
+            if (internship) {
+                internship.companyProfile = profileMap[String(internship.companyId)] || null;
+                
+                const reqSkillsArray = internship.requiredSkills || [];
+                const requiredSkills = reqSkillsArray.filter(Boolean).map(s => String(s).toLowerCase().trim());
+                
+                let calculatedScore = 0;
+                if (requiredSkills.length > 0) {
+                    let matchedCount = 0;
+                    requiredSkills.forEach(req => {
+                        if (studentSkills.some(stu => stu.includes(req) || req.includes(stu))) {
+                            matchedCount++;
+                        }
+                    });
+                    
+                    // Skill-based score (100% scale)
+                    calculatedScore = Math.round((matchedCount / requiredSkills.length) * 100);
+                    
+                    // Department Boost: If department matches, ensure it's at least high or give a +10 bonus
+                    const sDept = String(profile?.personalInfo?.department || '').toLowerCase().trim();
+                    const iDept = String(internship.department || '').toLowerCase().trim();
+                    if (sDept && iDept && (sDept.includes(iDept) || iDept.includes(sDept))) {
+                        calculatedScore = Math.max(calculatedScore, 95); // Ensure at least 95% if departments align
+                    }
+                }
+                
+                const finalScore = Math.min(100, calculatedScore);
+                app.matchingScore = finalScore;
+                
+                // Persist asynchronously
+                Application.updateOne({ _id: app._id }, { matchingScore: finalScore }).catch(() => {});
+            }
+            return app;
+        });
+
+        res.json(enrichedApps);
     } catch (err) { res.status(500).send("Fetching error."); }
 });
 
@@ -289,15 +384,18 @@ router.put('/status/:id', auth, async (req, res) => {
             }
         }
 
+        // Workflow Automation: If an employer accepts a student, finalize as 'Placed'
+        const finalStatus = (role === 'employer' && status === 'Accepted') ? 'Placed' : status;
+
         const updatedApp = await Application.findByIdAndUpdate(
             req.params.id, 
             {
-                $set: { status, remarks: normalizedRemarks, updatedAt: Date.now() },
+                $set: { status: finalStatus, remarks: normalizedRemarks, updatedAt: Date.now() },
                 $push: {
                     timeline: {
-                        status,
+                        status: finalStatus,
                         date: new Date(),
-                        comment: normalizedRemarks
+                        comment: normalizedRemarks || (finalStatus === 'Placed' ? 'Congratulations! You have been accepted and placed for this internship.' : '')
                     }
                 }
             }, 
@@ -338,6 +436,41 @@ router.put('/status/:id', auth, async (req, res) => {
 
         res.json(updatedApp);
     } catch (err) { res.status(500).send("Status update failed."); }
+});
+
+// 5. ተማሪው ማመልከቻውን እንዲሰርዝ (Withdraw)
+router.put('/withdraw/:id', auth, async (req, res) => {
+    try {
+        if (String(req.user?.role || '').toLowerCase() !== 'student') return res.status(403).send("Unauthorized.");
+        
+        const app = await Application.findOne({ _id: req.params.id, studentId: req.user.id });
+        if (!app) return res.status(404).send("Application not found.");
+        
+        app.status = 'Withdrawn';
+        await app.save();
+        
+        await writeActivity(req, 'STUDENT_WITHDREW_APPLICATION', `AppId=${app._id}`);
+        res.json({ message: "Application withdrawn successfully.", application: app });
+    } catch (err) { res.status(500).send("Withdrawal failed."); }
+});
+
+// 6. ተማሪው ለቀረበለት እድል ምላሽ እንዲሰጥ (Accept/Decline Offer)
+router.put('/respond/:id', auth, async (req, res) => {
+    try {
+        if (String(req.user?.role || '').toLowerCase() !== 'student') return res.status(403).send("Unauthorized.");
+        const { status } = req.body; // 'Accepted' or 'Rejected'
+        
+        if (!['Accepted', 'Rejected'].includes(status)) return res.status(400).send("Invalid status.");
+        
+        const app = await Application.findOne({ _id: req.params.id, studentId: req.user.id });
+        if (!app) return res.status(404).send("Application not found.");
+        
+        app.status = status === 'Accepted' ? 'Placed' : 'Rejected';
+        await app.save();
+        
+        await writeActivity(req, 'STUDENT_RESPONDED_TO_OFFER', `AppId=${app._id} Status=${status}`);
+        res.json({ message: `Offer ${status.toLowerCase()} successfully.`, application: app });
+    } catch (err) { res.status(500).send("Response failed."); }
 });
 
 module.exports = router;

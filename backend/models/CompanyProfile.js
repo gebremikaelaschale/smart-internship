@@ -41,7 +41,26 @@ const companyProfileSchema = new mongoose.Schema({
     requiredSkills: [String],
     preferredTech: [String],
     
-    // 10. Company Tags
+    // 10. Targeting & Facilities
+    targetDepartments: [String],
+    internshipFacilities: [String],
+    
+    // 10.1 AI Matching & Placement Preferences
+    intakeCapacities: [{ 
+        department: String, 
+        capacity: Number 
+    }],
+    internshipPeriod: String, // e.g., "Summer", "All-year"
+    internshipDuration: String, // e.g., "2 Months", "4 Months"
+    minimumCgpa: Number, // Optional constraint
+    expectedTasks: String, // Brief description of what students will do
+    focalPerson: { // Person responsible for handling interns directly
+        name: String,
+        email: String,
+        phone: String
+    },
+    
+    // 11. Company Tags
     tags: [String],
     
     // 13. Profile Completeness

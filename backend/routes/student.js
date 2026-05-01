@@ -160,4 +160,48 @@ router.put('/profile', auth, async (req, res) => {
     });
 });
 
+// 💾 Save/Toggle Internship
+router.post('/saved-internships', auth, async (req, res) => {
+    if (!ensureStudent(req, res)) return;
+    try {
+        const { internshipId } = req.body;
+        if (!internshipId) return res.status(400).json({ message: 'Internship ID required' });
+
+        const user = await User.findById(req.user.id);
+        if (!user.savedInternships) user.savedInternships = [];
+        
+        const idStr = String(internshipId);
+        const index = user.savedInternships.findIndex(id => String(id) === idStr);
+
+        if (index > -1) {
+            user.savedInternships.splice(index, 1);
+            await user.save();
+            return res.json({ message: 'Removed from saved items', savedIds: user.savedInternships });
+        } else {
+            user.savedInternships.push(internshipId);
+            await user.save();
+            return res.json({ message: 'Saved successfully', savedIds: user.savedInternships });
+        }
+    } catch (err) {
+        console.error("❌ Save Toggle Error Details:", {
+            userId: req.user?.id,
+            internshipId: req.body?.internshipId,
+            error: err.message,
+            stack: err.stack
+        });
+        res.status(500).json({ message: `Failed to toggle save: ${err.message}` });
+    }
+});
+
+// 📋 Fetch Saved Internships
+router.get('/saved-internships', auth, async (req, res) => {
+    if (!ensureStudent(req, res)) return;
+    try {
+        const user = await User.findById(req.user.id).populate('savedInternships');
+        res.json(user.savedInternships || []);
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch saved items.' });
+    }
+});
+
 module.exports = router;

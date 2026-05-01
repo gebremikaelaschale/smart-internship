@@ -11,6 +11,7 @@ export const adminAPI = {
   issueCertificate: (applicationId) => api.put(`/admin/certificates/${applicationId}/issue`),
   getInternshipStatistics: () => api.get('/admin/reports/internship-statistics'),
   generateReport: (payload = {}) => api.post('/admin/reports/generate', payload),
+  getEvaluations: () => api.get('/evaluation/admin/all'),
   getSettingsOverview: () => api.get('/admin/settings'),
   getSecurityOverview: () => api.get('/admin/security-overview'),
   updateRolePermissions: (payload) => api.put('/admin/settings/permissions', payload),

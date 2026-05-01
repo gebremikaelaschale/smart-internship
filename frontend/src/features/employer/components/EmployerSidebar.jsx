@@ -66,6 +66,15 @@ function MessageIcon() {
   );
 }
 
+function LogbookIcon() {
+  return (
+    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M9 11l3 3L22 4" />
+      <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" />
+    </svg>
+  );
+}
+
 const links = [
   { to: '/employer/dashboard', label: 'Dashboard', icon: <DashboardIcon />, accent: 'from-cyan-500 to-blue-600' },
   { to: '/employer/profile', label: 'Company Profile', icon: <UsersIcon />, accent: 'from-emerald-500 to-cyan-600' },
@@ -73,6 +82,7 @@ const links = [
   { to: '/employer/my-programs', label: 'My Programs', icon: <ListIcon />, accent: 'from-violet-500 to-purple-600' },
   { to: '/employer/applicants', label: 'Applicants', icon: <UsersIcon />, accent: 'from-amber-500 to-orange-600' },
   { to: '/employer/active-interns', label: 'Active Interns', icon: <UsersIcon />, accent: 'from-emerald-500 to-teal-600' },
+  { to: '/employer/logbooks', label: 'Student Logbooks', icon: <LogbookIcon />, accent: 'from-blue-500 to-indigo-600' },
   { to: '/employer/evaluation', label: 'Evaluation', icon: <ListIcon />, accent: 'from-sky-500 to-cyan-600' },
   { to: '/employer/reports', label: 'Reports', icon: <ReportIcon />, accent: 'from-rose-500 to-pink-600' },
   { to: '/employer/activity', label: 'Recent Activity', icon: <ListIcon />, accent: 'from-indigo-500 to-blue-700' },
@@ -271,27 +281,6 @@ export default function EmployerSidebar() {
 
       <div className="border-t border-white/10 px-6 py-5">
         {!collapsed ? (
-          <div className="rounded-2xl border border-white/10 bg-white/10 p-4 text-sm backdrop-blur">
-            <p className={`text-xs font-semibold uppercase tracking-[0.2em] ${activeTheme.tagClass}`}>Theme</p>
-            <div className="mt-2 flex items-center gap-2">
-              {Object.keys(themes).map((key) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => switchTheme(key)}
-                  disabled={isGlobalDarkMode}
-                  className={`h-4 w-4 rounded-full ring-2 transition ${theme === key ? 'ring-white' : 'ring-transparent hover:ring-white/40'} ${key === 'aurora' ? 'bg-cyan-400' : key === 'midnight' ? 'bg-violet-400' : 'bg-emerald-400'} ${isGlobalDarkMode ? 'cursor-not-allowed opacity-45 hover:ring-transparent' : ''}`}
-                  aria-label={`Switch to ${themes[key].label} theme`}
-                  title={isGlobalDarkMode ? 'Disabled while global dark mode is active' : themes[key].label}
-                />
-              ))}
-              <span className={`ml-1 text-xs ${activeTheme.subtitleClass}`}>{activeTheme.label}</span>
-            </div>
-
-            {isGlobalDarkMode ? (
-              <p className="mt-2 text-xs text-slate-300/90">Global dark mode is active. Sidebar follows dark palette automatically.</p>
-            ) : null}
-
             <button
               type="button"
               onClick={handleSignOut}
@@ -300,7 +289,6 @@ export default function EmployerSidebar() {
             >
               {signingOut ? 'Signing out...' : 'Sign out'}
             </button>
-          </div>
         ) : (
           <div className="grid place-items-center">
             <button

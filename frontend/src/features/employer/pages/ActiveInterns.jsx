@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import Card from '@/components/ui/Card';
 import { employerAPI } from '../employerAPI';
+import ProgramSubNav from '../components/ProgramSubNav';
 
 function progressColor(progress) {
   if (progress >= 80) return 'bg-emerald-500';
@@ -50,7 +51,10 @@ export default function ActiveInterns() {
   }, []);
 
   return (
-    <Card title="Active Interns" description="Accepted interns and their live progress from tasks.">
+    <div className="space-y-6">
+      <ProgramSubNav />
+
+      <Card title="Active Interns" description="Accepted interns and their live progress from tasks.">
       {error ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p> : null}
       {loading ? <p className="text-sm text-slate-500">Loading active interns...</p> : null}
 
@@ -103,5 +107,6 @@ export default function ActiveInterns() {
         </div>
       ) : null}
     </Card>
+    </div>
   );
 }

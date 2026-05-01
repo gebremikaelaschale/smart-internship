@@ -1,1245 +1,1601 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import Modal from '@/components/common/Modal';
-import Card from '@/components/ui/Card';
-import Button from '@/components/ui/Button';
+import React, { useEffect, useState, useRef } from 'react';
 import useAuth from '@/hooks/useAuth';
+import { Link } from 'react-router-dom';
 import { messagingAPI } from '../messagingAPI';
 import { io } from 'socket.io-client';
+import Button from '@/components/ui/Button';
+import DateDivider from '@/components/messaging/DateDivider';
+import MessageSelection, { SelectableMessageBubble, useMessageSelection } from '@/components/messaging/MessageSelection';
+import { 
+  groupMessagesByDate, 
+  formatMessageTime, 
+  formatFullTimestamp,
+  getUserTimeZone,
+  processMessagesForRendering
+} from '@/utils/messageUtils';
 
-const ROLE_FILTERS = [
-  { value: 'all', label: 'All' },
-  { value: 'student', label: 'Students' },
-  { value: 'employer', label: 'Industry Partners' },
-  { value: 'admin', label: 'Admins' }
-];
+// Telegram-style Avatar Component
+const Avatar = ({ name, avatarUrl, size = 'w-10 h-10' }) => {
+  const [imgError, setImgError] = useState(false);
+  const initials = (name || '?').charAt(0).toUpperCase();
 
-const CHAT_THEMES = {
-  modern: {
-    shell: 'bg-slate-50',
-    feed: 'bg-slate-50 border-slate-200',
-    mine: 'bg-brand-600 text-white',
-    theirs: 'bg-white text-slate-900 border border-slate-200'
-  },
-  ocean: {
-    shell: 'bg-cyan-50',
-    feed: 'bg-gradient-to-b from-cyan-50 to-blue-50 border-cyan-200',
-    mine: 'bg-cyan-700 text-white',
-    theirs: 'bg-white text-slate-900 border border-cyan-200'
-  },
-  sunset: {
-    shell: 'bg-rose-50',
-    feed: 'bg-gradient-to-b from-rose-50 to-amber-50 border-rose-200',
-    mine: 'bg-rose-600 text-white',
-    theirs: 'bg-white text-slate-900 border border-rose-200'
-  }
-};
-
-const FONT_SIZES = {
-  sm: '0.9rem',
-  md: '1rem',
-  lg: '1.1rem'
-};
-
-const ZOOMS = [75, 90, 100, 115, 130];
-const QUICK_REACTIONS = ['👍', '❤️', '🔥', '👏', '🎯', '✅', '😂', '😮'];
-
-function roleBadge(role) {
-  const value = String(role || '').toLowerCase();
-  if (value === 'student') return 'bg-cyan-100 text-cyan-700';
-  if (value === 'employer') return 'bg-violet-100 text-violet-700';
-  return 'bg-amber-100 text-amber-700';
-}
-
-function formatTime(value) {
-  const date = value ? new Date(value) : null;
-  if (!date || Number.isNaN(date.getTime())) return '';
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function formatDate(value) {
-  const date = value ? new Date(value) : null;
-  if (!date || Number.isNaN(date.getTime())) return 'Just now';
-  return date.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-}
-
-function makeCallId() {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function buildSocketBaseUrl() {
-  if (import.meta.env.VITE_SOCKET_URL) return import.meta.env.VITE_SOCKET_URL;
-  const apiBase = import.meta.env.VITE_API_BASE_URL || '/api';
-  if (apiBase.startsWith('http')) {
-    try {
-      const url = new URL(apiBase);
-      return `${url.protocol}//${url.host}`;
-    } catch {
-      return window.location.origin;
-    }
-  }
-  return window.location.origin;
-}
-
-function formatBytes(bytes) {
-  const size = Number(bytes || 0);
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function initials(name) {
-  return String(name || '')
-    .split(' ')
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase() || '')
-    .join('') || 'U';
-}
-
-export default function Messages() {
-  const auth = useAuth();
-  const navigate = useNavigate();
-  const [socket, setSocket] = useState(null);
-  const [contacts, setContacts] = useState([]);
-  const [rooms, setRooms] = useState([]);
-  const [messages, setMessages] = useState([]);
-  const [selectedContact, setSelectedContact] = useState(null);
-  const [selectedRoom, setSelectedRoom] = useState(null);
-  const [viewMode, setViewMode] = useState('direct');
-  const [roleFilter, setRoleFilter] = useState('all');
-  const [search, setSearch] = useState('');
-  const [loadingContacts, setLoadingContacts] = useState(true);
-  const [loadingRooms, setLoadingRooms] = useState(true);
-  const [loadingMessages, setLoadingMessages] = useState(false);
-  const [sending, setSending] = useState(false);
-  const [draft, setDraft] = useState('');
-  const [replyTo, setReplyTo] = useState(null);
-  const [pendingAttachment, setPendingAttachment] = useState(null);
-  const [error, setError] = useState('');
-  const [status, setStatus] = useState('');
-  const [uiTheme, setUiTheme] = useState(() => localStorage.getItem('chat_theme') || 'modern');
-  const [fontSize, setFontSize] = useState(() => localStorage.getItem('chat_font_size') || 'md');
-  const [zoom, setZoom] = useState(100);
-  const [callMode, setCallMode] = useState('');
-  const [inCall, setInCall] = useState(false);
-  const [callStatus, setCallStatus] = useState('');
-  const [incomingCallLabel, setIncomingCallLabel] = useState('');
-  const [outputMuted, setOutputMuted] = useState(false);
-  const [micMuted, setMicMuted] = useState(false);
-  const [recordingVoice, setRecordingVoice] = useState(false);
-  const [actionMenu, setActionMenu] = useState({ open: false, x: 0, y: 0, message: null });
-  const [actionDialog, setActionDialog] = useState({ type: '', message: null });
-  const [editDraft, setEditDraft] = useState('');
-  const [forwardType, setForwardType] = useState('user');
-  const [forwardTargetId, setForwardTargetId] = useState('');
-  const [reactionEmoji, setReactionEmoji] = useState('👍');
-  const [callHistory, setCallHistory] = useState([]);
-  const [showComposer, setShowComposer] = useState(true);
-  const [roomAdminBusyId, setRoomAdminBusyId] = useState('');
-  const [typingState, setTypingState] = useState({});
-  const [fullscreenVideo, setFullscreenVideo] = useState(false);
-  const [roomDraft, setRoomDraft] = useState({ name: '', type: 'group' });
-  const [roomMembersDraft, setRoomMembersDraft] = useState('');
-
-  const localVideoRef = useRef(null);
-  const remoteVideoRef = useRef(null);
-  const localAudioRef = useRef(null);
-  const remoteAudioRef = useRef(null);
-  const attachmentInputRef = useRef(null);
-  const peerRef = useRef(null);
-  const localStreamRef = useRef(null);
-  const callIdRef = useRef('');
-  const processedMessageIdsRef = useRef(new Set());
-  const searchTimeoutRef = useRef(null);
-  const selectedContactRef = useRef(null);
-  const selectedRoomRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
-  const recordingStreamRef = useRef(null);
-  const voiceChunksRef = useRef([]);
-  const socketRef = useRef(null);
-  const composerRef = useRef(null);
-  const actionMenuRef = useRef(null);
-
-  const myId = String(auth?.user?.id || auth?.user?._id || '');
-  const selectedContactId = String(selectedContact?.id || '');
-  const selectedRoomId = String(selectedRoom?.id || '');
-  const activeTheme = CHAT_THEMES[uiTheme] || CHAT_THEMES.modern;
-  const currentFontSize = FONT_SIZES[fontSize] || FONT_SIZES.md;
-
+  // Reset error state when URL changes
   useEffect(() => {
-    selectedContactRef.current = selectedContact;
-  }, [selectedContact]);
+    setImgError(false);
+  }, [avatarUrl]);
 
-  useEffect(() => {
-    selectedRoomRef.current = selectedRoom;
-  }, [selectedRoom]);
-
-  useEffect(() => {
-    localStorage.setItem('chat_theme', uiTheme);
-  }, [uiTheme]);
-
-  useEffect(() => {
-    localStorage.setItem('chat_font_size', fontSize);
-  }, [fontSize]);
-
-  useEffect(() => {
-    if (!auth?.isAuthenticated) {
-      navigate('/login', { replace: true });
-    }
-  }, [auth?.isAuthenticated, navigate]);
-
-  useEffect(() => {
-    const socketInstance = io(buildSocketBaseUrl(), {
-      transports: ['websocket'],
-      auth: { token: auth?.token }
-    });
-    setSocket(socketInstance);
-    socketRef.current = socketInstance;
-
-    socketInstance.on('message:new', (message) => {
-      const currentDirect = selectedContactRef.current;
-      const currentRoom = selectedRoomRef.current;
-      const isDirect = String(message?.conversationType || 'direct') === 'direct';
-      const matchesDirect = isDirect && currentDirect && String(message?.senderId?._id || message?.senderId) === String(currentDirect.id);
-      const matchesRoom = !isDirect && currentRoom && String(message?.roomId || '') === String(currentRoom.id);
-
-      if (matchesDirect || matchesRoom) {
-        setMessages((prev) => [...prev, message]);
-      }
-      refreshLists();
-    });
-
-    socketInstance.on('message:updated', (message) => {
-      setMessages((prev) => prev.map((item) => (String(item._id) === String(message._id) ? message : item)));
-    });
-
-    socketInstance.on('message:deleted', (payload) => {
-      if (payload?.message?._id) {
-        setMessages((prev) => prev.map((item) => (String(item._id) === String(payload.message._id) ? payload.message : item)));
-      }
-    });
-
-    socketInstance.on('chat:typing', (payload) => {
-      const key = payload.roomId ? `room:${payload.roomId}` : `user:${payload.fromUserId}`;
-      setTypingState((prev) => ({
-        ...prev,
-        [key]: { isTyping: Boolean(payload.isTyping), fromUserId: payload.fromUserId, timestamp: Date.now() }
-      }));
-    });
-
-    socketInstance.on('chat:seen', () => {
-      refreshLists();
-    });
-
-    socketInstance.on('presence:update', () => {});
-
-    socketInstance.on('call:ringing', async (payload) => {
-      if (payload?.mode) {
-        setIncomingCallLabel('Incoming ' + payload.mode + ' call...');
-      }
-    });
-
-    socketInstance.on('call:signal', async (payload) => {
-      if (payload?.toUserId && String(payload.toUserId) !== String(myId)) return;
-      if (payload?.signalType === 'offer') {
-        await acceptIncomingCall({
-          callId: payload.callId,
-          callMedia: payload.mode,
-          signalData: payload.signalData
-        });
-      } else if (payload?.signalType === 'answer' && peerRef.current) {
-        try {
-          await peerRef.current.setRemoteDescription(new RTCSessionDescription(payload.signalData));
-        } catch {}
-      } else if (payload?.signalType === 'candidate' && peerRef.current) {
-        try {
-          await peerRef.current.addIceCandidate(new RTCIceCandidate(payload.signalData));
-        } catch {}
-      } else if (payload?.signalType === 'hangup') {
-        stopCall(false);
-      }
-    });
-
-    socketInstance.on('call:state', (payload) => {
-      if (payload?.state) {
-        setCallStatus(`Call ${payload.state}`);
-      }
-    });
-
-    return () => {
-      socketInstance.disconnect();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auth?.token]);
-
-  useEffect(() => {
-    if (remoteAudioRef.current) remoteAudioRef.current.muted = outputMuted;
-    if (remoteVideoRef.current) remoteVideoRef.current.muted = outputMuted;
-  }, [outputMuted]);
-
-  useEffect(() => {
-    refreshLists();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roleFilter]);
-
-  useEffect(() => {
-    if (searchTimeoutRef.current) window.clearTimeout(searchTimeoutRef.current);
-    searchTimeoutRef.current = window.setTimeout(() => {
-      refreshLists();
-    }, 300);
-    return () => searchTimeoutRef.current && window.clearTimeout(searchTimeoutRef.current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search]);
-
-  useEffect(() => {
-    if (!selectedContactId && !selectedRoomId) return undefined;
-    loadHistory();
-    const timer = window.setInterval(() => loadHistory(true), 2000);
-    return () => window.clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedContactId, selectedRoomId, viewMode]);
-
-  useEffect(() => {
-    return () => {
-      stopCall(false);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    if (selectedContact && composerRef.current) composerRef.current.focus();
-  }, [selectedContact, selectedRoom]);
-
-  useEffect(() => {
-    if (!actionMenu.open) return undefined;
-    const handlePointerDown = (event) => {
-      if (actionMenuRef.current?.contains(event.target)) return;
-      setActionMenu({ open: false, x: 0, y: 0, message: null });
-    };
-    window.addEventListener('pointerdown', handlePointerDown);
-    return () => window.removeEventListener('pointerdown', handlePointerDown);
-  }, [actionMenu.open]);
-
-  const refreshLists = async () => {
-    try {
-      setLoadingContacts(true);
-      setLoadingRooms(true);
-      const [contactsRes, roomsRes] = await Promise.all([
-        messagingAPI.getContacts({ role: roleFilter, search }),
-        messagingAPI.getRooms().catch(() => ({ data: [] }))
-      ]);
-      const contactItems = Array.isArray(contactsRes.data) ? contactsRes.data : [];
-      const roomItems = Array.isArray(roomsRes.data) ? roomsRes.data : [];
-      setContacts(contactItems);
-      setRooms(roomItems);
-
-      if (selectedContactId) {
-        const selectedContactItem = contactItems.find((contact) => String(contact.id) === String(selectedContactId));
-        if (selectedContactItem) setSelectedContact(selectedContactItem);
-      }
-      if (selectedRoomId) {
-        const selectedRoomItem = roomItems.find((room) => String(room.id) === String(selectedRoomId));
-        if (selectedRoomItem) setSelectedRoom(selectedRoomItem);
-      }
-
-      if (!selectedContact && contactItems.length > 0 && viewMode === 'direct') {
-        setSelectedContact(contactItems[0]);
-      }
-      if (!selectedRoom && roomItems.length > 0 && viewMode !== 'direct') {
-        setSelectedRoom(roomItems[0]);
-      }
-    } catch (requestError) {
-      setError(requestError?.response?.data?.message || 'Failed to load chat data.');
-    } finally {
-      setLoadingContacts(false);
-      setLoadingRooms(false);
-    }
+  // Size mapping
+  const sizeMap = {
+    'w-10 h-10': 'w-10 h-10',
+    'lg': 'w-20 h-20',
+    'md': 'w-12 h-12',
+    'sm': 'w-8 h-8'
   };
+  const actualSize = sizeMap[size] || size;
 
-  const loadHistory = async (silent = false) => {
-    try {
-      if (!silent) setLoadingMessages(true);
-      let res = null;
-      if (viewMode === 'direct' && selectedContactId) {
-        res = await messagingAPI.getDirectHistory(selectedContactId, { limit: 200 });
-        await messagingAPI.markDirectSeen(selectedContactId).catch(() => {});
-      } else if (viewMode !== 'direct' && selectedRoomId) {
-        res = await messagingAPI.getRoomHistory(selectedRoomId, { limit: 200 });
-        await messagingAPI.markRoomSeen(selectedRoomId).catch(() => {});
-      }
-      const items = Array.isArray(res?.data) ? res.data : [];
-      setMessages(items);
-      processedMessageIdsRef.current = new Set(items.map((item) => String(item._id)));
-      if (viewMode === 'direct') {
-        setContacts((prev) => prev.map((contact) => String(contact.id) === String(selectedContactId) ? { ...contact, unreadCount: 0 } : contact));
-      } else {
-        setRooms((prev) => prev.map((room) => String(room.id) === String(selectedRoomId) ? { ...room, unreadCount: 0 } : room));
-      }
-    } catch (requestError) {
-      setError(requestError?.response?.data?.message || 'Failed to load messages.');
-    } finally {
-      if (!silent) setLoadingMessages(false);
-    }
-  };
+  // Color mapping based on name length for Telegram-like variety
+  const colors = ['bg-blue-500', 'bg-emerald-500', 'bg-purple-500', 'bg-amber-500', 'bg-rose-500', 'bg-cyan-600'];
+  const bgColor = colors[(name?.length || 0) % colors.length];
 
-  const selectContact = (contact) => {
-    if (!contact) return;
-    setViewMode('direct');
-    setSelectedContact(contact);
-    setSelectedRoom(null);
-    setMessages([]);
-    setReplyTo(null);
-    setError('');
-    setStatus('');
-  };
-
-  const selectRoom = (room) => {
-    if (!room) return;
-    setViewMode(room.type || 'group');
-    setSelectedRoom(room);
-    setSelectedContact(null);
-    setMessages([]);
-    setReplyTo(null);
-    setError('');
-    setStatus('');
-    socket?.emit?.('chat:joinRoom', { roomId: room.id });
-  };
-
-  const createRoom = async (event) => {
-    event.preventDefault();
-    const name = String(roomDraft.name || '').trim();
-    const memberIds = roomMembersDraft.split(',').map((item) => item.trim()).filter(Boolean);
-    if (!name) return;
-    try {
-      const { data } = await messagingAPI.createRoom({ name, type: roomDraft.type, members: memberIds });
-      setRoomDraft({ name: '', type: 'group' });
-      setRoomMembersDraft('');
-      await refreshLists();
-      selectRoom({
-        id: data._id,
-        name: data.name,
-        type: data.type,
-        members: data.members || []
-      });
-    } catch (requestError) {
-      setError(requestError?.response?.data?.message || 'Failed to create room.');
-    }
-  };
-
-  const handleRoomAdminAction = async (memberId, makeAdmin) => {
-    if (!selectedRoomId || !memberId) return;
-    try {
-      setRoomAdminBusyId(String(memberId));
-      if (makeAdmin) {
-        await messagingAPI.promoteRoomAdmin(selectedRoomId, { memberId });
-        setStatus('Member promoted to admin.');
-      } else {
-        await messagingAPI.demoteRoomAdmin(selectedRoomId, memberId);
-        setStatus('Admin demoted to member.');
-      }
-      await refreshLists();
-      setTimeout(() => setStatus(''), 1200);
-    } catch (requestError) {
-      setError(requestError?.response?.data?.message || 'Failed to update room admin role.');
-    } finally {
-      setRoomAdminBusyId('');
-    }
-  };
-
-  const emitTyping = (isTyping) => {
-    if (!socket) return;
-    if (viewMode === 'direct' && selectedContactId) {
-      socket.emit('chat:typing', { toUserId: selectedContactId, isTyping });
-    } else if (selectedRoomId) {
-      socket.emit('chat:typing', { roomId: selectedRoomId, isTyping });
-    }
-  };
-
-  const handleDraftChange = (event) => {
-    setDraft(event.target.value);
-    emitTyping(Boolean(event.target.value));
-  };
-
-  const handleAttachmentChange = async (event) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    const maxSize = 20 * 1024 * 1024;
-    if (file.size > maxSize) {
-      setError('Attachment must be smaller than 20MB.');
-      event.target.value = '';
-      return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      setPendingAttachment({
-        name: file.name,
-        type: file.type,
-        size: file.size,
-        url: String(reader.result || '')
-      });
-      setError('');
-    };
-    reader.readAsDataURL(file);
-  };
-
-  const removeAttachment = () => {
-    setPendingAttachment(null);
-    if (attachmentInputRef.current) attachmentInputRef.current.value = '';
-  };
-
-  const startVoiceRecording = async () => {
-    try {
-      setError('');
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      recordingStreamRef.current = stream;
-      const recorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
-      voiceChunksRef.current = [];
-      recorder.ondataavailable = (event) => event.data?.size > 0 && voiceChunksRef.current.push(event.data);
-      recorder.onstop = () => {
-        const blob = new Blob(voiceChunksRef.current, { type: 'audio/webm' });
-        const reader = new FileReader();
-        reader.onload = () => setPendingAttachment({ name: `voice-note-${Date.now()}.webm`, type: 'audio/webm', size: blob.size, url: String(reader.result || '') });
-        reader.readAsDataURL(blob);
-        recordingStreamRef.current?.getTracks()?.forEach((track) => track.stop());
-        recordingStreamRef.current = null;
-      };
-      recorder.start();
-      setRecordingVoice(true);
-    } catch (requestError) {
-      setError(requestError?.message || 'Unable to start voice recording.');
-    }
-  };
-
-  const stopVoiceRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-    setRecordingVoice(false);
-  };
-
-  const sendMessage = async (event) => {
-    event.preventDefault();
-    if (!canPostInCurrentConversation) {
-      setError('This channel is read-only for members. Only channel admins can post.');
-      return;
-    }
-    const content = String(draft || '').trim();
-    if (!content && !pendingAttachment) return;
-    try {
-      setSending(true);
-      const payload = {
-        content,
-        messageType: 'text',
-        attachment: pendingAttachment || undefined,
-        replyTo: replyTo?._id || undefined
-      };
-      if (viewMode === 'direct' && selectedContactId) {
-        payload.receiverId = selectedContactId;
-      } else if (selectedRoomId) {
-        payload.roomId = selectedRoomId;
-        payload.conversationType = 'group';
-      }
-      const { data } = await messagingAPI.sendMessage(payload);
-      setMessages((prev) => [...prev, data]);
-      setDraft('');
-      setReplyTo(null);
-      setPendingAttachment(null);
-      if (attachmentInputRef.current) attachmentInputRef.current.value = '';
-      emitTyping(false);
-      setStatus('Message sent.');
-      setTimeout(() => setStatus(''), 1200);
-      refreshLists();
-    } catch (requestError) {
-      setError(requestError?.response?.data?.message || 'Failed to send message.');
-    } finally {
-      setSending(false);
-    }
-  };
-
-  const openActionMenu = (event, message, byContext = false) => {
-    event.preventDefault();
-    event.stopPropagation();
-    const x = byContext ? event.clientX : Math.min(window.innerWidth - 220, event.clientX + 8);
-    const y = byContext ? event.clientY : event.clientY + 8;
-    setActionMenu({ open: true, x, y, message });
-  };
-
-  const closeActionMenu = () => setActionMenu({ open: false, x: 0, y: 0, message: null });
-
-  const openActionDialog = (type, message) => {
-    const current = message || actionMenu.message;
-    if (!current) return;
-    if (type === 'edit') {
-      setEditDraft(String(current.content || ''));
-    }
-    if (type === 'forward') {
-      setForwardType(viewMode === 'direct' ? 'room' : 'user');
-      setForwardTargetId('');
-    }
-    if (type === 'react') {
-      setReactionEmoji('👍');
-    }
-    setActionDialog({ type, message: current });
-    closeActionMenu();
-  };
-
-  const closeActionDialog = () => setActionDialog({ type: '', message: null });
-
-  const handleMessageAction = async (action, options = {}) => {
-    const current = options.message || actionMenu.message || actionDialog.message;
-    if (!current) return;
-    try {
-      if (action === 'edit') {
-        const nextContent = String(options.content || '').trim();
-        if (!nextContent) return;
-        const { data } = await messagingAPI.editMessage(current._id, { content: nextContent });
-        setMessages((prev) => prev.map((item) => String(item._id) === String(data._id) ? data : item));
-        setStatus('Message updated.');
-      }
-      if (action === 'delete') {
-        await messagingAPI.deleteMessage(current._id, true);
-        setMessages((prev) => prev.map((item) => String(item._id) === String(current._id) ? { ...item, deletedForEveryone: true, content: 'This message was deleted.' } : item));
-        setStatus('Message deleted.');
-      }
-      if (action === 'reply') {
-        setReplyTo(current);
-        composerRef.current?.focus();
-      }
-      if (action === 'forward') {
-        const target = String(options.targetId || '').trim();
-        const targetType = options.targetType || 'user';
-        if (!target) return;
-        if (targetType === 'user') {
-          await messagingAPI.forwardMessage(current._id, { receiverId: target });
-        } else {
-          await messagingAPI.forwardMessage(current._id, { roomId: target });
-        }
-        setStatus('Message forwarded.');
-      }
-      if (action === 'react') {
-        const emoji = String(options.emoji || '').trim();
-        if (!emoji) return;
-        const { data } = await messagingAPI.reactMessage(current._id, { emoji });
-        setMessages((prev) => prev.map((item) => String(item._id) === String(data._id) ? data : item));
-      }
-    } catch (requestError) {
-      setError(requestError?.response?.data?.message || 'Message action failed.');
-    } finally {
-      closeActionMenu();
-      closeActionDialog();
-      setTimeout(() => setStatus(''), 1200);
-    }
-  };
-
-  const attachLocalStream = async (stream) => {
-    localStreamRef.current = stream;
-    if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-    if (localAudioRef.current) localAudioRef.current.srcObject = stream;
-  };
-
-  const createPeer = (mode) => {
-    const peer = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-      ]
-    });
-
-    peer.onicecandidate = async (event) => {
-      if (!event.candidate || !callIdRef.current) return;
-      const payload = {
-        callId: callIdRef.current,
-        messageType: 'signal',
-        content: '[candidate]',
-        callMedia: mode,
-        signalType: 'candidate',
-        signalData: event.candidate.toJSON()
-      };
-      if (viewMode === 'direct' && selectedContactId) payload.receiverId = selectedContactId;
-      if (selectedRoomId) payload.roomId = selectedRoomId;
-      await messagingAPI.sendMessage(payload).catch(() => {});
-      socket?.emit('call:signal', { ...payload, toUserId: selectedContactId || null });
-    };
-
-    peer.ontrack = (event) => {
-      const [stream] = event.streams;
-      if (stream) {
-        if (mode === 'video' && remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
-        if (remoteAudioRef.current) remoteAudioRef.current.srcObject = stream;
-      }
-    };
-
-    peer.onconnectionstatechange = () => {
-      const state = peer.connectionState;
-      if (state === 'connected') setCallStatus('Connected');
-      if (['failed', 'disconnected', 'closed'].includes(state)) setCallStatus('Call ended');
-    };
-
-    peerRef.current = peer;
-    return peer;
-  };
-
-  const startCall = async (mode) => {
-    if (inCall) return;
-    const hasTarget = (viewMode === 'direct' && Boolean(selectedContactId)) || (viewMode !== 'direct' && Boolean(selectedRoomId));
-    if (!hasTarget) {
-      setError(viewMode === 'direct' ? 'Select a contact before starting a call.' : 'Select a room before starting a call.');
-      return;
-    }
-    try {
-      setError('');
-      setCallStatus(`Starting ${mode} call...`);
-      setCallMode(mode);
-      setIncomingCallLabel('');
-      setOutputMuted(false);
-      setMicMuted(false);
-      const participants = selectedRoom?.members || (selectedContactId ? [selectedContactId] : []);
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: mode === 'video' });
-      await attachLocalStream(stream);
-      const peer = createPeer(mode);
-      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
-      callIdRef.current = makeCallId();
-      await messagingAPI.startCallSession({ callId: callIdRef.current, roomId: selectedRoomId || undefined, participantIds: participants, mode });
-      socket?.emit('call:join', { callId: callIdRef.current });
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      const payload = {
-        messageType: 'signal',
-        content: '[offer]',
-        callId: callIdRef.current,
-        callMedia: mode,
-        signalType: 'offer',
-        signalData: offer
-      };
-      if (viewMode === 'direct' && selectedContactId) payload.receiverId = selectedContactId;
-      if (selectedRoomId) payload.roomId = selectedRoomId;
-      await messagingAPI.sendMessage(payload);
-      socket?.emit('call:signal', { callId: callIdRef.current, signalType: 'offer', signalData: offer, mode, toUserId: selectedContactId || null });
-      setInCall(true);
-      setCallStatus('Calling...');
-    } catch (requestError) {
-      stopCall(false);
-      setError(requestError?.response?.data?.message || requestError.message || 'Unable to start call.');
-    }
-  };
-
-  const acceptIncomingCall = async (signalMessage) => {
-    if (!signalMessage || inCall) return;
-    try {
-      const mode = String(signalMessage.callMedia || 'audio');
-      setCallMode(mode);
-      setOutputMuted(false);
-      setMicMuted(false);
-      setInCall(true);
-      setCallStatus('Connecting...');
-      callIdRef.current = String(signalMessage.callId || makeCallId());
-      socket?.emit('call:join', { callId: callIdRef.current });
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: mode === 'video' });
-      await attachLocalStream(stream);
-      const peer = createPeer(mode);
-      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
-      await peer.setRemoteDescription(new RTCSessionDescription(signalMessage.signalData));
-      const answer = await peer.createAnswer();
-      await peer.setLocalDescription(answer);
-      const payload = {
-        messageType: 'signal',
-        content: '[answer]',
-        callId: callIdRef.current,
-        callMedia: mode,
-        signalType: 'answer',
-        signalData: answer
-      };
-      if (viewMode === 'direct' && selectedContactId) payload.receiverId = selectedContactId;
-      if (selectedRoomId) payload.roomId = selectedRoomId;
-      await messagingAPI.sendMessage(payload);
-      socket?.emit('call:signal', { callId: callIdRef.current, signalType: 'answer', signalData: answer, mode, toUserId: selectedContactId || null });
-      setCallStatus('Connected');
-    } catch (requestError) {
-      stopCall(false);
-      setError(requestError?.response?.data?.message || requestError.message || 'Unable to answer call.');
-    }
-  };
-
-  const stopCall = async (notifyPeer = true) => {
-    try {
-      if (notifyPeer && callIdRef.current) {
-        const payload = {
-          messageType: 'signal',
-          content: '[hangup]',
-          callId: callIdRef.current,
-          callMedia: callMode,
-          signalType: 'hangup',
-          signalData: { reason: 'ended' }
-        };
-        if (viewMode === 'direct' && selectedContactId) payload.receiverId = selectedContactId;
-        if (selectedRoomId) payload.roomId = selectedRoomId;
-        await messagingAPI.sendMessage(payload).catch(() => {});
-        socket?.emit('call:signal', { callId: callIdRef.current, signalType: 'hangup', signalData: { reason: 'ended' }, mode: callMode, toUserId: selectedContactId || null });
-        await messagingAPI.updateCallState(callIdRef.current, { state: 'ended' }).catch(() => {});
-      }
-    } finally {
-      peerRef.current?.close?.();
-      peerRef.current = null;
-      localStreamRef.current?.getTracks()?.forEach((track) => track.stop());
-      localStreamRef.current = null;
-      if (localVideoRef.current) localVideoRef.current.srcObject = null;
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-      if (localAudioRef.current) localAudioRef.current.srcObject = null;
-      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
-      callIdRef.current = '';
-      setCallMode('');
-      setInCall(false);
-      setCallStatus('');
-      setIncomingCallLabel('');
-      setMicMuted(false);
-      setOutputMuted(false);
-    }
-  };
-
-  const toggleMic = () => {
-    const stream = localStreamRef.current;
-    if (!stream) return;
-    const nextMuted = !micMuted;
-    stream.getAudioTracks().forEach((track) => {
-      track.enabled = !nextMuted;
-    });
-    setMicMuted(nextMuted);
-  };
-
-  const toggleFullscreen = async () => {
-    const element = remoteVideoRef.current || localVideoRef.current;
-    if (!element) return;
-    if (document.fullscreenElement) {
-      await document.exitFullscreen().catch(() => {});
-      setFullscreenVideo(false);
-    } else {
-      await element.parentElement?.requestFullscreen?.().catch(() => {});
-      setFullscreenVideo(true);
-    }
-  };
-
-  const handleDirectTyping = (event) => {
-    handleDraftChange(event);
-  };
-
-  const conversations = viewMode === 'direct' ? contacts : rooms;
-  const selectedTitle = viewMode === 'direct' ? (selectedContact?.name || 'Chat Window') : (selectedRoom?.name || 'Room');
-  const selectedSubtitle = viewMode === 'direct'
-    ? (selectedContact ? `${selectedContact.email} • ${selectedContact.role}` : 'Pick a person on the left to start chatting.')
-    : (selectedRoom ? `${selectedRoom.type} • ${selectedRoom.membersCount || selectedRoom.members?.length || 0} members` : 'Pick a room or create one.');
-  const canStartCall = (viewMode === 'direct' && Boolean(selectedContactId)) || (viewMode !== 'direct' && Boolean(selectedRoomId));
-  const canPostInCurrentConversation = viewMode === 'direct' || !selectedRoom || selectedRoom.canPost !== false;
-  const selectedRoomMembersPreview = selectedRoom?.memberProfiles?.length ? selectedRoom.memberProfiles : (selectedRoom?.members || []).map((memberId) => ({
-    id: memberId,
-    name: String(memberId).slice(0, 8)
-  }));
-
-  const typingKey = viewMode === 'direct' && selectedContactId ? `user:${selectedContactId}` : selectedRoomId ? `room:${selectedRoomId}` : '';
-  const typingInfo = typingKey ? typingState[typingKey] : null;
-
-  const forwardUsers = useMemo(() => contacts.filter((contact) => String(contact.id) !== selectedContactId), [contacts, selectedContactId]);
-  const forwardRooms = useMemo(() => rooms.filter((room) => String(room.id) !== selectedRoomId), [rooms, selectedRoomId]);
-  const canEditOrDeleteSelected = String(actionMenu?.message?.senderId?._id || actionMenu?.message?.senderId || '') === myId;
-  const isSelectedRoomOwner = String(selectedRoom?.ownerId || '') === myId;
-  const roomAdminIds = useMemo(() => new Set((selectedRoom?.admins || []).map((id) => String(id))), [selectedRoom]);
-  const roomMemberNameById = useMemo(() => {
-    const map = new Map();
-    selectedRoomMembersPreview.forEach((member) => {
-      map.set(String(member.id), member.name || String(member.id).slice(0, 8));
-    });
-    return map;
-  }, [selectedRoomMembersPreview]);
-
-  const renderMessage = (message) => {
-    const isMine = String(message?.senderId?._id || message?.senderId) === myId;
-    const attachment = message?.attachment;
-    const isDeleted = Boolean(message?.deletedForEveryone);
-    const senderId = String(message?.senderId?._id || message?.senderId || '');
-    const seenByIds = Array.isArray(message?.seenBy) ? message.seenBy.map((id) => String(id)) : [];
-    const directSeen = isMine && viewMode === 'direct' && (seenByIds.includes(String(selectedContactId)) || Boolean(message?.isRead));
-    const roomSeenByOthers = viewMode !== 'direct' && isMine
-      ? seenByIds.filter((id) => id !== myId && id !== senderId)
-      : [];
-    const deliveredByOthers = viewMode !== 'direct' && isMine
-      ? (Array.isArray(message?.deliveredTo) ? message.deliveredTo.map((id) => String(id)) : []).filter((id) => id !== myId && id !== senderId)
-      : [];
-
+  if (avatarUrl && !imgError) {
     return (
-      <div key={message._id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`} onContextMenu={(event) => openActionMenu(event, message, true)}>
-        <div className={`max-w-[82%] rounded-2xl px-4 py-3 shadow-sm ${isMine ? activeTheme.mine : activeTheme.theirs}`}>
-          <div className="flex items-center justify-between gap-4">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] opacity-80">{isMine ? 'You' : message?.senderId?.fullName || message?.senderId?.name || 'Contact'}</p>
-            <div className="flex items-center gap-2 text-[10px] opacity-70">
-              <span>{formatTime(message.createdAt)}</span>
-              {message.editedAt ? <span>edited</span> : null}
-              {isMine && viewMode === 'direct' ? (directSeen ? <span>✓✓</span> : <span>✓</span>) : null}
+      <img
+        src={avatarUrl}
+        alt={name}
+        onError={() => setImgError(true)}
+        className={`${actualSize} rounded-full object-cover border border-slate-100 shadow-sm shrink-0`}
+      />
+    );
+  }
+
+  return (
+    <div className={`${actualSize} rounded-full ${bgColor} flex items-center justify-center text-white font-bold text-sm shrink-0 shadow-sm border border-white/20`}>
+      {initials}
+    </div>
+  );
+};
+
+// Telegram-style Custom Modal for Deletion
+const DeleteMessageModal = ({ isOpen, onConfirm, onCancel, message, contactName }) => {
+  const [deleteForEveryone, setDeleteForEveryone] = useState(true);
+  
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-[10000] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-[320px] overflow-hidden animate-in zoom-in-95 duration-200">
+        <div className="p-5">
+          <h3 className="text-[17px] font-semibold text-slate-900 mb-2">Delete message?</h3>
+          <p className="text-[15px] text-slate-600 mb-6 leading-relaxed">
+            Do you want to delete this message?
+          </p>
+          
+          <label className="flex items-center gap-3 cursor-pointer group mb-8 select-none">
+            <div className="relative flex items-center justify-center">
+              <input 
+                type="checkbox" 
+                className="peer appearance-none w-5 h-5 border-2 border-slate-300 rounded-[4px] checked:bg-blue-500 checked:border-blue-500 transition-all cursor-pointer"
+                checked={deleteForEveryone}
+                onChange={(e) => setDeleteForEveryone(e.target.checked)}
+              />
+              <svg className="absolute w-3.5 h-3.5 text-white opacity-0 peer-checked:opacity-100 transition-opacity pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="4">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+              </svg>
             </div>
-          </div>
+            <span className="text-[14px] text-slate-700 font-medium group-hover:text-slate-900 transition-colors">
+              Also delete for {contactName || 'the other user'}
+            </span>
+          </label>
 
-          {message.replyTo ? (
-            <div className="mt-2 rounded-xl border border-white/20 bg-white/10 px-3 py-2 text-xs opacity-90">
-              <p className="font-semibold">Replying to</p>
-              <p className="truncate">{message.replyTo.content}</p>
-            </div>
-          ) : null}
-
-          {message.messageType === 'signal' ? (
-            <p className="mt-2 text-sm font-semibold">
-              {String(message.signalType || 'signal').toUpperCase()} {message.callMedia ? `• ${message.callMedia}` : ''}
-            </p>
-          ) : !isDeleted ? (
-            String(message.content || '').startsWith('[') && attachment ? null : <p className="mt-2 whitespace-pre-wrap text-sm leading-6">{message.content}</p>
-          ) : (
-            <p className="mt-2 italic text-sm opacity-80">This message was deleted.</p>
-          )}
-
-          {attachment?.url ? (
-            <div className="mt-3 overflow-hidden rounded-xl border border-white/20 bg-white/10">
-              {String(attachment.type || '').startsWith('image/') ? (
-                <img src={attachment.url} alt={attachment.name || 'attachment'} className="max-h-72 w-full object-cover" />
-              ) : String(attachment.type || '').startsWith('video/') ? (
-                <video src={attachment.url} controls className="w-full max-h-72 bg-black" />
-              ) : String(attachment.type || '').startsWith('audio/') ? (
-                <audio src={attachment.url} controls className="w-full" />
-              ) : (
-                <a href={attachment.url} download={attachment.name || 'attachment'} className="block px-3 py-2 text-sm underline">
-                  {attachment.name || 'Download attachment'}
-                </a>
-              )}
-            </div>
-          ) : null}
-
-          {message.reactions?.length ? (
-            <div className="mt-2 flex flex-wrap gap-2">
-              {message.reactions.map((reaction, index) => (
-                <span key={`${message._id}-${reaction.emoji}-${index}`} className="rounded-full bg-white/20 px-2 py-0.5 text-xs">
-                  {reaction.emoji}
-                </span>
-              ))}
-            </div>
-          ) : null}
-
-          {roomSeenByOthers.length ? (
-            <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] opacity-85">
-              <span className="font-semibold">Seen by</span>
-              {roomSeenByOthers.slice(0, 5).map((id) => {
-                const name = roomMemberNameById.get(String(id)) || String(id).slice(0, 8);
-                return (
-                  <span key={`${message._id}-seen-${id}`} title={name} className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-white/20 px-1.5 text-[9px] font-semibold">
-                    {initials(name)}
-                  </span>
-                );
-              })}
-              {roomSeenByOthers.length > 5 ? <span>+{roomSeenByOthers.length - 5}</span> : null}
-            </div>
-          ) : null}
-
-          {viewMode !== 'direct' && isMine ? (
-            <div className="mt-1 flex items-center gap-2 text-[10px] opacity-75">
-              <span>Delivered: {deliveredByOthers.length}</span>
-              <span>Seen: {roomSeenByOthers.length}</span>
-            </div>
-          ) : null}
-
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] opacity-90">
-            <button type="button" onClick={() => setReplyTo(message)} className="rounded-full bg-white/10 px-2 py-1">Reply</button>
-            <button type="button" onClick={(event) => openActionMenu(event, message)} className="rounded-full bg-white/10 px-2 py-1">More</button>
-            <button type="button" onClick={() => openActionDialog('react', message)} className="rounded-full bg-white/10 px-2 py-1">React</button>
+          <div className="flex justify-end gap-2">
+            <button
+              onClick={onCancel}
+              className="px-4 py-2 text-[14px] font-semibold text-blue-500 hover:bg-blue-50 rounded-lg transition-colors uppercase tracking-wide"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => onConfirm(message._id, deleteForEveryone)}
+              className="px-4 py-2 text-[14px] font-semibold text-rose-500 hover:bg-rose-50 rounded-lg transition-colors uppercase tracking-wide"
+            >
+              Delete
+            </button>
           </div>
         </div>
       </div>
-    );
+    </div>
+  );
+};
+
+// Helper Functions for File Attachments
+const formatFileSize = (bytes) => {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+const getFileIcon = (filename) => {
+  const extension = filename.split('.').pop().toLowerCase();
+  
+  switch (extension) {
+    case 'pdf':
+      return (
+        <svg className="w-6 h-6 text-red-500" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z" />
+        </svg>
+      );
+    case 'doc':
+    case 'docx':
+      return (
+        <svg className="w-6 h-6 text-blue-500" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20M10,19H12V17H10V19M10,16H12V14H10V16M10,13H12V11H10V13M10,10H12V8H10V10Z" />
+        </svg>
+      );
+    case 'xls':
+    case 'xlsx':
+      return (
+        <svg className="w-6 h-6 text-green-500" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20M8,12H16V14H8V12M8,16H16V18H8V16Z" />
+        </svg>
+      );
+    case 'jpg':
+    case 'jpeg':
+    case 'png':
+    case 'gif':
+    case 'bmp':
+    case 'svg':
+      return (
+        <svg className="w-6 h-6 text-purple-500" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M8.5,13.5L11,16.5L14.5,12L19,18H5M21,19V5C21,3.89 20.1,3 19,3H5A2,2 0 0,0 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19Z" />
+        </svg>
+      );
+    case 'txt':
+      return (
+        <svg className="w-6 h-6 text-gray-500" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20M8,12H16V14H8V12M8,16H13V18H8V16Z" />
+        </svg>
+      );
+    default:
+      return (
+        <svg className="w-6 h-6 text-gray-500" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M13,9V3.5L18.5,9M6,2C4.89,2 4,2.89 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2H6Z" />
+        </svg>
+      );
+  }
+};
+
+const isImageFile = (filename) => {
+  const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'webp'];
+  const extension = filename.split('.').pop().toLowerCase();
+  return imageExtensions.includes(extension);
+};
+
+const handlePreviewImage = (attachment) => {
+  const imageUrl = attachment.url || attachment.data;
+  if (!imageUrl) {
+    console.warn('No image URL available for preview');
+    return;
+  }
+  
+  // Open image in new tab for better preview
+  const win = window.open();
+  win.document.write(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Image Preview - ${attachment.filename || 'Image'}</title>
+        <style>
+          body { margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f5f5f5; }
+          img { max-width: 100%; max-height: 90vh; object-fit: contain; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        </style>
+      </head>
+      <body>
+        <img src="${imageUrl}" alt="${attachment.filename || 'Image'}" />
+      </body>
+    </html>
+  `);
+};
+
+const handleOpenFile = (attachment) => {
+  const fileUrl = attachment.url;
+  const filename = attachment.filename || attachment.originalname;
+  
+  if (!fileUrl) {
+    console.warn('No file URL available for opening');
+    return;
+  }
+  
+  // For documents, try to open in new tab
+  if (filename) {
+    const extension = filename.split('.').pop().toLowerCase();
+    
+    // For PDFs and other viewable documents, open in new tab
+    if (['pdf', 'txt', 'json', 'xml', 'csv'].includes(extension)) {
+      window.open(fileUrl, '_blank');
+    } else {
+      // For other file types, fallback to download
+      handleDownloadFile(attachment);
+    }
+  } else {
+    // Fallback to download if no filename
+    handleDownloadFile(attachment);
+  }
+};
+
+const handleDownloadFile = async (attachment) => {
+  try {
+    const fileUrl = attachment.url;
+    const filename = attachment.filename || attachment.originalname || 'download';
+    
+    if (!fileUrl) {
+      console.warn('No file URL available for download');
+      return;
+    }
+    
+    // Try to fetch the file first to ensure it's accessible
+    const response = await fetch(fileUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch file: ${response.statusText}`);
+    }
+    
+    // Get the blob data
+    const blob = await response.blob();
+    
+    // Create download link
+    const link = document.createElement('a');
+    link.href = window.URL.createObjectURL(blob);
+    link.download = filename;
+    link.style.display = 'none';
+    
+    // Trigger download
+    document.body.appendChild(link);
+    link.click();
+    
+    // Cleanup
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(link.href);
+    
+    console.log(`Downloaded: ${filename}`);
+  } catch (error) {
+    console.error('Download failed:', error);
+    
+    // Fallback: try direct link download
+    const link = document.createElement('a');
+    link.href = attachment.url;
+    link.download = attachment.filename || attachment.originalname || 'download';
+    link.target = '_blank';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+};
+
+// Telegram-style Message Bubble Component with Enhanced Timestamping, Context Menu, and Selection
+const MessageBubble = ({ message, isMine, showSenderInfo = false, isConsecutive = false, messageSelection, socket, setReplyingTo, textareaRef, setContextMenu }) => {
+  const messageStatus = message.status || (message.isRead ? 'read' : 'sent');
+  const userTimeZone = getUserTimeZone();
+  const formattedTime = formatMessageTime(message.createdAt, userTimeZone);
+  const fullTimestamp = formatFullTimestamp(message.createdAt, userTimeZone);
+  
+  // Adjust styling for consecutive messages
+  const bubbleStyles = isConsecutive 
+    ? `${isMine ? 'rounded-tr-[4px]' : 'rounded-tl-[4px]'}`
+    : `${isMine ? 'rounded-[18px] rounded-br-[4px]' : 'rounded-[18px] rounded-bl-[4px]'}`;
+  
+  const isSelected = messageSelection?.isMessageSelected(message._id);
+  
+  return (
+    <SelectableMessageBubble
+      message={message}
+      isMine={isMine}
+      isSelectionMode={messageSelection?.isSelectionMode}
+      isSelected={isSelected}
+      onToggleSelection={messageSelection?.toggleMessageSelection}
+    >
+      <div 
+        className={`message-bubble-wrapper ${isMine ? 'sent' : 'received'} cursor-pointer`}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          
+          setContextMenu({
+            x: e.pageX,
+            y: e.pageY,
+            messageId: message._id,
+            isMine: isMine,
+            message: message
+          });
+        }}
+      >
+        {/* Message Content */}
+        <div className={`${bubbleStyles} ${isMine ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-900'} px-4 py-2 max-w-xs lg:max-w-md shadow-sm relative group`}>
+          <>
+          {/* Quoted Message (Reply) - Telegram/WhatsApp Style */}
+          {(message.replyTo || message.replyPreview) && (
+            <div 
+              className={`mb-3 p-2 rounded-t-lg border-l-4 ${
+                isMine 
+                  ? 'bg-blue-700/30 border-blue-400' 
+                  : 'bg-gray-200/70 border-gray-400'
+              }`}
+            >
+              <div className={`text-xs font-semibold mb-1 ${
+                isMine ? 'text-blue-200' : 'text-gray-600'
+              }`}>
+                {message.replyTo?.senderName || message.replyPreview?.senderName || 'Unknown'}
+              </div>
+              <div className={`text-xs truncate ${
+                isMine ? 'text-blue-100 opacity-80' : 'text-gray-600 opacity-80'
+              }`}>
+                {message.replyTo?.content || message.replyPreview?.content || 
+                 (message.replyPreview?.attachmentType ? '📎 Attachment' : 'No content')}
+              </div>
+            </div>
+          )}
+          
+          {/* Show sender info for group messages or when appropriate */}
+          {showSenderInfo && !isMine && (
+            <div className="text-[11px] font-semibold text-blue-600 mb-1 opacity-80">
+              {message.senderId?.fullName || message.senderId?.name || 'Unknown'}
+            </div>
+          )}
+          
+          {/* Message Text and File Extraction wrapper */}
+          {(() => {
+            const isLegacyFile = (!message.attachment?.url && !message.attachments?.length && message.content && message.content.startsWith('Sent a file:'));
+            const legacyFilename = isLegacyFile ? message.content.replace('Sent a file:', '').trim() : null;
+            const attachmentsToRender = [
+              ...(message.attachments || []),
+              ...(message.attachment?.url ? [message.attachment] : []),
+              ...(isLegacyFile ? [{ name: legacyFilename, size: 0, url: '' }] : [])
+            ].filter(Boolean);
+
+            return (
+              <>
+                {/* Message Text */}
+                {message.content && !isLegacyFile && !(message.messageType === 'file' && message.content.startsWith('Sent a file:')) && (
+                  <div className="text-sm break-words">
+                    {message.content}
+                  </div>
+                )}
+                
+                {/* Enhanced File Attachments with Real Preview */}
+                {attachmentsToRender.length > 0 ? (
+                  <div className="mt-2 space-y-2">
+                    {attachmentsToRender.map((attachment, index) => {
+                      console.log('Rendering attachment:', attachment);
+                      const filename = attachment.filename || attachment.originalname || attachment.name || 'Unknown file';
+                      const fileSize = attachment.size ? formatFileSize(attachment.size) : 'Unknown size';
+                      const fileIcon = getFileIcon(filename);
+                      const isImage = isImageFile(filename);
+                      const fileUrl = attachment.url || attachment.data;
+                      
+                      return (
+                        <div 
+                          key={index} 
+                          className={`rounded-lg border transition-all hover:shadow-md ${
+                            isMine 
+                              ? 'bg-blue-50 border-blue-200 hover:bg-blue-100' 
+                              : 'bg-gray-50 border-gray-200 hover:bg-gray-100'
+                          }`}
+                        >
+                          {/* Image Preview - Display inline for images */}
+                          {isImage && (
+                            <div className="relative">
+                              {fileUrl ? (
+                                <img 
+                                  src={fileUrl} 
+                                  alt={filename}
+                                  className="w-full max-h-64 object-cover rounded-t-lg cursor-pointer"
+                                  onClick={() => handlePreviewImage(attachment)}
+                                  loading="lazy"
+                                />
+                              ) : (
+                                <div className="w-full h-32 bg-gray-200 flex items-center justify-center rounded-t-lg">
+                                  <svg className="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                  </svg>
+                                </div>
+                              )}
+                              <div className="absolute top-2 right-2 bg-black/50 text-white px-2 py-1 rounded text-xs">
+                                Image
+                              </div>
+                            </div>
+                          )}
+                          
+                          {/* File Info and Actions */}
+                          <div className={`p-3 ${isImage ? 'border-t' : ''}`}>
+                            <div className="flex items-center gap-3">
+                              {/* File Icon */}
+                              <div className={`p-2 rounded-lg flex-shrink-0 ${isMine ? 'bg-blue-100' : 'bg-gray-200'}`}>
+                                {fileIcon}
+                              </div>
+                              
+                              {/* File Info */}
+                              <div className="flex-1 min-w-0">
+                                <div className={`text-sm font-medium truncate ${
+                                  isMine ? 'text-blue-900' : 'text-gray-900'
+                                }`}>
+                                  {filename}
+                                </div>
+                                <div className={`text-xs ${
+                                  isMine ? 'text-blue-600' : 'text-gray-500'
+                                }`}>
+                                  {fileSize}
+                                </div>
+                              </div>
+                              
+                              {/* Action Buttons */}
+                              <div className="flex gap-2 flex-shrink-0">
+                                {/* Preview/Open Button */}
+                                <button
+                                  onClick={() => fileUrl ? (isImage ? handlePreviewImage(attachment) : handleOpenFile(attachment)) : null}
+                                  className={`p-2 rounded-lg transition-colors ${
+                                    isMine 
+                                      ? 'bg-blue-200 hover:bg-blue-300 text-blue-700' 
+                                      : 'bg-gray-200 hover:bg-gray-300 text-gray-700'
+                                  } ${!fileUrl ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                  title={!fileUrl ? "File not available" : (isImage ? "Preview" : "Open")}
+                                  disabled={!fileUrl}
+                                >
+                                  {isImage ? (
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                                    </svg>
+                                  ) : (
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                                    </svg>
+                                  )}
+                                </button>
+                                
+                                {/* Download Button */}
+                                <button
+                                  onClick={() => fileUrl ? handleDownloadFile(attachment) : null}
+                                  className={`p-2 rounded-lg transition-colors ${
+                                    isMine 
+                                      ? 'bg-blue-200 hover:bg-blue-300 text-blue-700' 
+                                      : 'bg-gray-200 hover:bg-gray-300 text-gray-700'
+                                  } ${!fileUrl ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                  title={!fileUrl ? "File not available" : "Download"}
+                                  disabled={!fileUrl}
+                                >
+                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                  </svg>
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </>
+            )
+          })()}
+          </>
+        </div>
+        
+        {/* Timestamp and Read Receipt */}
+        <div className={`flex items-center justify-end gap-1 mt-1 text-[10.5px] font-medium ${isMine ? 'text-gray-500' : 'text-gray-500'}`}>
+          <span className="hover:text-gray-700 transition-colors cursor-default" title={fullTimestamp}>
+            {formattedTime}
+          </span>
+          {isMine && (
+            <div className="flex items-center gap-1">
+              {messageStatus === 'read' && (
+                <div className="flex items-center" title="Read">
+                  <svg className="w-3.5 h-3.5 text-cyan-500 drop-shadow-sm" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="3">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  </svg>
+                  <svg className="w-3.5 h-3.5 text-cyan-500 drop-shadow-sm -ml-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="3">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  </svg>
+                </div>
+              )}
+              {messageStatus === 'delivered' && (
+                <div className="flex items-center" title="Delivered">
+                  <svg className="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="3">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  </svg>
+                  <svg className="w-3.5 h-3.5 text-gray-400 -ml-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="3">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  </svg>
+                </div>
+              )}
+              {messageStatus === 'sent' && (
+                <div className="flex items-center" title="Sent">
+                  <svg className="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="3">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  </svg>
+                </div>
+              )}
+            </div>
+          )}
+          {/* Edit indicator inside timestamp row for better alignment */}
+          {message.isEdited && (
+            <span className={`italic font-semibold ml-1 ${isMine ? 'text-blue-500' : 'text-gray-600'}`}>
+              (edited)
+            </span>
+          )}
+        </div>
+      </div>
+    </SelectableMessageBubble>
+  );
+};
+
+export default function Messages() {
+  const auth = useAuth();
+  const [contacts, setContacts] = useState([]);
+  const [selectedContact, setSelectedContact] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [processedMessages, setProcessedMessages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState('');
+  const [attachment, setAttachment] = useState(null);
+  const [showInfo, setShowInfo] = useState(false);
+  const [replyingTo, setReplyingTo] = useState(null);
+  const [editingMessage, setEditingMessage] = useState(null);
+  const [editContent, setEditContent] = useState('');
+  const [onlineStatus, setOnlineStatus] = useState({});
+  const [contactSearchQuery, setContactSearchQuery] = useState('');
+  const [contactSearchResults, setContactSearchResults] = useState([]);
+  const [messageSearchQuery, setMessageSearchQuery] = useState('');
+  const [messageSearchResults, setMessageSearchResults] = useState([]);
+  const [typingUsers, setTypingUsers] = useState(new Set());
+  const [showSearch, setShowSearch] = useState(false);
+  const [contextMenu, setContextMenu] = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  
+  const [socket, setSocket] = useState(null);
+  const messagesEndRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const textareaRef = useRef(null);
+  const myId = auth?.user?.id || auth?.user?._id;
+  
+  // Message selection handler
+  const messageSelection = useMessageSelection();
+
+  // Handle bulk delete
+  const handleBulkDelete = async (selectedMessageIds) => {
+    try {
+      const { data } = await messagingAPI.bulkDeleteMessages(selectedMessageIds);
+      
+      // Remove deleted messages from local state
+      setMessages(prev => prev.filter(msg => !selectedMessageIds.includes(String(msg._id))));
+      
+      // Emit socket events for real-time updates
+      if (socket) {
+        selectedMessageIds.forEach(messageId => {
+          socket.emit('message:hard-delete', {
+            messageId,
+            roomId: null, // Will be determined from message
+            toUserId: selectedContact._id
+          });
+        });
+      }
+    } catch (error) {
+      console.error('Failed to bulk delete messages:', error);
+    }
   };
 
+  // Process messages for rendering with date dividers
+  useEffect(() => {
+    // COMPLETELY ERASE: Robust filtering for any variation of deleted messages
+    const cleanMessages = messages.filter(msg => {
+      if (!msg) return false;
+      const content = String(msg.content || '').toLowerCase();
+      const isDeletedText = content.includes('message was deleted') || content === 'deleted';
+      return !msg.deletedForEveryone && !isDeletedText;
+    });
+
+    const processed = processMessagesForRendering(cleanMessages, {
+      groupByDate: true,
+      showSenderInfo: false, // For direct messages, sender info not needed
+      optimizeForPerformance: true
+    });
+    setProcessedMessages(processed);
+  }, [messages]);
+
+  // Auto-expand textarea
+  const handleInput = () => {
+    const tx = textareaRef.current;
+    if (!tx) return;
+    tx.style.height = 'auto';
+    tx.style.height = `${Math.min(tx.scrollHeight, 120)}px`; // Max height ~120px
+  };
+
+  const handleFileChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    console.log('File selected:', file);
+    
+    // For now, use base64 to ensure it works
+    const reader = new FileReader();
+    reader.onload = () => {
+      const attachmentData = {
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        url: reader.result, // Base64 data URL
+        filename: file.name,
+        originalname: file.name
+      };
+      
+      console.log('Attachment data prepared:', attachmentData);
+      setAttachment(attachmentData);
+    };
+    
+    reader.onerror = (error) => {
+      console.error('FileReader error:', error);
+    };
+    
+    reader.readAsDataURL(file);
+  };
+
+  // Format avatar URL (handles Base64, full URLs, and relative paths)
+  const formatAvatar = (url) => {
+    if (!url) return null;
+    if (url.startsWith('data:') || url.startsWith('http')) return url;
+    const apiBase = import.meta.env.VITE_API_BASE_URL || '';
+    const origin = apiBase.startsWith('http') ? new URL(apiBase).origin : window.location.origin;
+    return `${origin}/${url.replace(/^\//, '')}`;
+  };
+
+  // Format timestamp like WhatsApp/Telegram
+  const formatTime = (dateStr) => {
+    if (!dateStr) return '';
+    const date = new Date(dateStr);
+    const now = new Date();
+    const diff = now - date;
+    const oneMinute = 60 * 1000;
+    const oneHour = 60 * oneMinute;
+    const oneDay = 24 * oneHour;
+
+    if (diff < oneMinute) {
+      return 'just now';
+    } else if (diff < oneHour) {
+      const minutes = Math.floor(diff / oneMinute);
+      return `${minutes} minute${minutes !== 1 ? 's' : ''} ago`;
+    } else if (diff < oneDay && now.getDate() === date.getDate()) {
+      const hours = Math.floor(diff / oneHour);
+      return `${hours} hour${hours !== 1 ? 's' : ''} ago`;
+    } else if (diff < oneDay * 2) {
+      return `Yesterday at ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    } else if (diff < oneDay * 7) {
+      return `${date.toLocaleDateString([], { weekday: 'short' })} at ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    }
+    return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+  };
+
+  // Typing indicator handlers
+  const typingTimeoutRef = useRef(null);
+  const handleTypingStart = () => {
+    if (socket && selectedContact && draft.trim()) {
+      socket.emit('user:typing', {
+        userId: myId,
+        receiverId: selectedContact._id
+      });
+      
+      // Clear existing timeout
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      
+      // Stop typing after 3 seconds of inactivity
+      typingTimeoutRef.current = setTimeout(() => {
+        socket.emit('user:stop-typing', {
+          userId: myId,
+          receiverId: selectedContact._id
+        });
+      }, 3000);
+    }
+  };
+
+  const handleTypingStop = () => {
+    if (socket && selectedContact) {
+      socket.emit('user:stop-typing', {
+        userId: myId,
+        receiverId: selectedContact._id
+      });
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    }
+  };
+
+  // Contact Search functionality (for left sidebar)
+  const handleContactSearch = (query) => {
+    setContactSearchQuery(query);
+    
+    if (!query.trim()) {
+      setContactSearchResults([]);
+      return;
+    }
+
+    const filtered = contacts.filter(contact => 
+      (contact.fullName && contact.fullName.toLowerCase().includes(query.toLowerCase())) ||
+      (contact.name && contact.name.toLowerCase().includes(query.toLowerCase())) ||
+      (contact.email && contact.email.toLowerCase().includes(query.toLowerCase()))
+    );
+    
+    setContactSearchResults(filtered);
+  };
+
+  // Message Search functionality (for chat header)
+  useEffect(() => {
+    if (!messageSearchQuery.trim()) {
+      setMessageSearchResults([]);
+      return;
+    }
+
+    const filtered = messages.filter(msg => 
+      !msg.deletedForEveryone && 
+      msg.content && 
+      msg.content !== 'This message was deleted.' &&
+      msg.content !== 'This message was deleted' &&
+      msg.content.toLowerCase().includes(messageSearchQuery.toLowerCase())
+    );
+    
+    setMessageSearchResults(filtered);
+  }, [messageSearchQuery, messages]);
+
+  // Build socket URL
+  const getSocketUrl = () => {
+    const apiBase = import.meta.env.VITE_API_BASE_URL || '/api';
+    return apiBase.startsWith('http') ? new URL(apiBase).origin : window.location.origin;
+  };
+
+  useEffect(() => {
+    if (!auth?.token) return;
+    const s = io(getSocketUrl(), { transports: ['websocket'], auth: { token: auth.token } });
+    setSocket(s);
+    
+    // Listen for new messages
+    s.on('message:new', (msg) => {
+      const otherId = String(msg.senderId?._id || msg.senderId) === String(myId) 
+        ? String(msg.receiverId?._id || msg.receiverId) 
+        : String(msg.senderId?._id || msg.senderId);
+      
+      if (selectedContact && String(otherId) === String(selectedContact._id)) {
+        setMessages(prev => [...prev, msg]);
+        
+        // Auto-mark as delivered when received
+        if (String(msg.senderId?._id || msg.senderId) !== String(myId)) {
+          messagingAPI.markMessageDelivered(msg._id);
+        }
+      }
+    });
+
+    // Listen for message seen events
+    s.on('message:seen', (data) => {
+      if (selectedContact && String(data.byUserId) === String(selectedContact._id)) {
+        setMessages(prev => prev.map(m => ({ ...m, isRead: true, status: 'read' })));
+      }
+    });
+
+    // Listen for message delivered events
+    s.on('message:delivered', (data) => {
+      setMessages(prev => prev.map(m => 
+        String(m._id) === String(data.messageId) 
+          ? { ...m, status: 'delivered', deliveredAt: data.deliveredAt }
+          : m
+      ));
+    });
+
+    // Listen for message read events
+    s.on('message:read', (data) => {
+      setMessages(prev => prev.map(m => 
+        String(m._id) === String(data.messageId) 
+          ? { ...m, status: 'read', readAt: data.readAt, isRead: true }
+          : m
+      ));
+    });
+
+    // Listen for batch read events
+    s.on('message:batch-read', (data) => {
+      setMessages(prev => prev.map(m => 
+        data.messageIds.includes(String(m._id)) 
+          ? { ...m, status: 'read', readAt: data.readAt, isRead: true }
+          : m
+      ));
+    });
+
+    // Listen for presence updates
+    s.on('presence:update', (data) => {
+      setOnlineStatus(prev => ({
+        ...prev,
+        [String(data.userId)]: { isOnline: data.online, lastSeen: data.lastSeen }
+      }));
+    });
+
+    // Listen for typing indicators
+    s.on('user:typing', (data) => {
+      if (selectedContact && String(data.userId) === String(selectedContact._id)) {
+        setTypingUsers(prev => new Set(prev).add(String(data.userId)));
+      }
+    });
+
+    // Listen for stop typing
+    s.on('user:stop-typing', (data) => {
+      setTypingUsers(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(String(data.userId));
+        return newSet;
+      });
+    });
+
+    // Listen for deleted messages (Complete Removal)
+    s.on('message:deleted', (data) => {
+      setMessages(prev => prev.filter(m => String(m._id) !== String(data.messageId || data.id)));
+    });
+
+    // Listen for edited messages
+    s.on('message:edited', (data) => {
+      console.log('Real-time: Message edited event received:', data);
+      setMessages(prev => prev.map(m => 
+        String(m._id) === String(data._id || data.messageId) 
+          ? { ...m, ...data, isEdited: true }
+          : m
+      ));
+    });
+
+    // Listen for hard deleted messages (Complete Removal)
+    s.on('message:hard-deleted', (data) => {
+      setMessages(prev => prev.filter(m => String(m._id) !== String(data.messageId || data.id)));
+    });
+
+    // Emit user online status
+    s.emit('user:online', { userId: myId });
+
+    return () => {
+      s.emit('user:offline', { userId: myId });
+      s.disconnect();
+    };
+  }, [auth?.token]);
+
+  const loadData = async (query = '') => {
+    try {
+      const { data } = await messagingAPI.getContacts({ search: query });
+      // Filter contacts to only show Companies and Admin for Students, etc.
+      const filtered = data.filter(u => {
+        const role = String(u.role).toLowerCase();
+        if (auth.user.role === 'student') {
+           return role === 'employer' || role === 'admin' || role === 'superadmin';
+        }
+        if (auth.user.role === 'employer') {
+           return role === 'student' || role === 'admin' || role === 'superadmin';
+        }
+        return true; // Admin sees everyone
+      });
+      setContacts(filtered);
+      
+      // Seed onlineStatus from API data — only if we don't already have a live socket value
+      setOnlineStatus(prev => {
+        const merged = { ...prev };
+        filtered.forEach(u => {
+          const id = String(u._id);
+          // Only seed if we have no live socket data for this user yet
+          if (!merged[id]) {
+            merged[id] = {
+              isOnline: Boolean(u.isOnline),
+              lastSeen: u.lastSeen || null
+            };
+          }
+        });
+        return merged;
+      });
+      
+      if (!selectedContact && filtered.length > 0) {
+        setSelectedContact(filtered[0]);
+      } else if (selectedContact) {
+        // Refresh selected contact data if it exists in the new list
+        const updated = filtered.find(c => String(c._id) === String(selectedContact._id));
+        if (updated) setSelectedContact(updated);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  // Poll online status every 10 seconds (reliable fallback that doesn't depend on sockets)
+  useEffect(() => {
+    const pollOnlineStatus = async () => {
+      try {
+        const ids = contacts.map(c => String(c._id));
+        if (!ids.length) return;
+        const { data } = await messagingAPI.getOnlineStatus(ids);
+        setOnlineStatus(prev => {
+          const updated = { ...prev };
+          Object.entries(data).forEach(([id, status]) => {
+            updated[id] = status;
+          });
+          return updated;
+        });
+      } catch (_) {}
+    };
+
+    if (contacts.length > 0) {
+      pollOnlineStatus(); // run immediately when contacts load
+      const interval = setInterval(pollOnlineStatus, 10000);
+      return () => clearInterval(interval);
+    }
+  }, [contacts]);
+
+  // Debounced search
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      loadData(contactSearchQuery);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [contactSearchQuery]);
+
+  useEffect(() => {
+    if (!selectedContact) return;
+    const fetchHistory = async () => {
+      try {
+        const { data } = await messagingAPI.getDirectHistory(selectedContact._id);
+        setMessages(data);
+        
+        // Mark unread messages as read using batch API
+        const unreadMessageIds = data
+          .filter(msg => String(msg.senderId?._id || msg.senderId) !== String(myId) && !msg.isRead)
+          .map(msg => String(msg._id));
+        
+        if (unreadMessageIds.length > 0) {
+          await messagingAPI.markMessagesRead(unreadMessageIds, null, selectedContact._id);
+        }
+      } catch (err) { console.error(err); }
+    };
+    fetchHistory();
+  }, [selectedContact?._id]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const handleSend = async (e) => {
+    e.preventDefault();
+    if (!draft.trim() && !attachment) return;
+    if (!selectedContact) return;
+
+    try {
+      if (editingMessage) {
+        console.log('Sending edit request for message:', editingMessage._id);
+        const { data } = await messagingAPI.editMessage(editingMessage._id, { content: draft.trim() });
+        
+        // Update locally immediately for snappy feel
+        setMessages(prev => prev.map(m => 
+          String(m._id) === String(editingMessage._id) 
+            ? { ...m, content: draft.trim(), isEdited: true, editedAt: new Date() }
+            : m
+        ));
+        
+        setEditingMessage(null);
+        setDraft('');
+        return;
+      }
+
+      const payload = {
+        receiverId: selectedContact._id,
+        content: draft.trim() || (attachment ? `Sent a file: ${attachment.filename || attachment.name}` : ''),
+        messageType: 'text',
+        attachment: attachment ? {
+          name: attachment.filename || attachment.name,
+          type: attachment.type,
+          size: attachment.size,
+          url: attachment.url
+        } : undefined,
+        replyTo: replyingTo?._id || undefined
+      };
+      
+      console.log('Sending message with payload:', payload);
+      
+      const { data } = await messagingAPI.sendMessage(payload);
+      setMessages(prev => [...prev, data]);
+      
+      // Clear form and reply state
+      setDraft('');
+      setAttachment(null);
+      setReplyingTo(null);
+      
+      if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    } catch (err) { console.error(err); }
+  };
+
+  const handleCopyText = (text) => {
+    if (!text) return;
+    navigator.clipboard.writeText(text).catch(err => console.error('Copy failed:', err));
+    setContextMenu(null);
+  };
+
+  const handleSaveImage = (url, filename) => {
+    if (!url) return;
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename || 'download';
+    link.target = '_blank';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setContextMenu(null);
+  };
+
+  const handleDeleteMessage = async (messageId, forEveryone) => {
+    console.log('Attempting to erase message:', messageId, 'forEveryone:', forEveryone);
+    try {
+      await messagingAPI.deleteMessage(messageId, forEveryone);
+      console.log('Message erased successfully from backend');
+      
+      // Immediately remove locally for responsive feel
+      setMessages(prev => prev.filter(m => String(m._id) !== String(messageId)));
+      setDeleteTarget(null);
+    } catch (err) {
+      console.error('Erase failed:', err);
+    }
+  };
+
+  const handleEditStart = (msg) => {
+    setEditingMessage(msg);
+    setDraft(msg.content);
+    if (textareaRef.current) {
+      textareaRef.current.focus();
+    }
+  };
+
+  if (loading) return <div className="p-8 text-center">Loading Messages...</div>;
+
   return (
-    <div className={`grid gap-6 xl:grid-cols-[340px_1fr] ${activeTheme.shell}`} style={{ fontSize: currentFontSize, transform: `scale(${zoom / 100})`, transformOrigin: 'top center', width: `${100 / (zoom / 100)}%` }}>
-      <Card title="Messages" description="Telegram-style enterprise messaging for students, industry partners, admins, rooms, and channels.">
-        <div className="mb-4 flex flex-wrap gap-2">
-          <button type="button" onClick={() => setViewMode('direct')} className={`rounded-full px-3 py-1.5 text-xs font-semibold ${viewMode === 'direct' ? 'bg-brand-600 text-white' : 'border border-slate-200 bg-white text-slate-600'}`}>Direct</button>
-          <button type="button" onClick={() => setViewMode('group')} className={`rounded-full px-3 py-1.5 text-xs font-semibold ${viewMode !== 'direct' ? 'bg-brand-600 text-white' : 'border border-slate-200 bg-white text-slate-600'}`}>Rooms</button>
-        </div>
+    <div className="flex h-[calc(100vh-140px)] bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm relative">
+      {/* Selection Toolbar */}
+      <MessageSelection
+        messages={messages} // Include all messages for proper selection counting
+        selectedMessages={messageSelection?.selectedMessages}
+        setSelectedMessages={messageSelection?.setSelectedMessages}
+        onSelectAll={() => messageSelection?.selectAllMessages(messages.filter(msg => String(msg.senderId) === String(myId)))}
+        onClearSelection={messageSelection?.clearSelection}
+        onDeleteSelected={handleBulkDelete}
+        isSelectionMode={messageSelection?.isSelectionMode}
+        setIsSelectionMode={messageSelection?.setIsSelectionMode}
+        myId={myId}
+      />
 
-        <div className="mb-3 flex flex-wrap gap-2">
-          {ROLE_FILTERS.map((filter) => (
-            <button key={filter.value} type="button" onClick={() => setRoleFilter(filter.value)} className={`rounded-full px-3 py-1.5 text-xs font-semibold ${roleFilter === filter.value ? 'bg-slate-900 text-white' : 'border border-slate-200 bg-white text-slate-600'}`}>
-              {filter.label}
-            </button>
-          ))}
-        </div>
-
-        <input
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Search people or rooms..."
-          className="mb-4 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
-        />
-
-        <form onSubmit={createRoom} className="mb-4 space-y-2 rounded-2xl border border-slate-200 bg-white p-3">
-          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Create room/channel</p>
-          <input value={roomDraft.name} onChange={(e) => setRoomDraft((prev) => ({ ...prev, name: e.target.value }))} placeholder="Room name" className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
-          <div className="grid grid-cols-2 gap-2">
-            <select value={roomDraft.type} onChange={(e) => setRoomDraft((prev) => ({ ...prev, type: e.target.value }))} className="rounded-xl border border-slate-200 px-3 py-2 text-sm">
-              <option value="group">Group</option>
-              <option value="channel">Channel</option>
-            </select>
-            <input value={roomMembersDraft} onChange={(e) => setRoomMembersDraft(e.target.value)} placeholder="Member IDs, comma separated" className="rounded-xl border border-slate-200 px-3 py-2 text-sm" />
-          </div>
-          <Button type="submit" size="sm" className="w-full border border-slate-900 bg-slate-900 text-white">Create</Button>
-        </form>
-
-        <div className="space-y-2 max-h-[64vh] overflow-y-auto pr-1">
-          {viewMode === 'direct' ? contacts.map((contact) => (
-            <button key={contact.id} type="button" onClick={() => selectContact(contact)} className={`w-full rounded-2xl border p-3 text-left transition ${String(selectedContactId) === String(contact.id) ? 'border-brand-500 bg-brand-50' : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-sm font-semibold text-slate-900">{contact.name}</p>
-                  <p className="text-xs text-slate-500">{contact.email}</p>
-                </div>
-                <span className={`rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] ${roleBadge(contact.role)}`}>{contact.role}</span>
-              </div>
-              <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
-                <span>{contact.department || contact.college || 'General'}</span>
-                <span>{contact.unreadCount > 0 ? `${contact.unreadCount} unread` : formatDate(contact?.lastMessage?.createdAt)}</span>
-              </div>
-              {contact.lastMessage ? <p className="mt-2 truncate text-xs text-slate-600">{contact.lastMessage.messageType === 'text' ? contact.lastMessage.content : `${contact.lastMessage.signalType || 'signal'} message`}</p> : null}
-            </button>
-          )) : rooms.map((room) => (
-            <button key={room.id} type="button" onClick={() => selectRoom(room)} className={`w-full rounded-2xl border p-3 text-left transition ${String(selectedRoomId) === String(room.id) ? 'border-brand-500 bg-brand-50' : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-sm font-semibold text-slate-900">{room.name}</p>
-                  <p className="text-xs text-slate-500 uppercase tracking-[0.12em]">{room.type}</p>
-                </div>
-                <span className="rounded-full bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white">{room.membersCount || room.members?.length || 0}</span>
-              </div>
-              <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
-                <span>{room.isMuted ? 'Muted' : 'Active'}</span>
-                <span>{room.unreadCount > 0 ? `${room.unreadCount} unread` : formatDate(room?.lastMessage?.createdAt)}</span>
-              </div>
-            </button>
-          ))}
-          {!loadingContacts && !loadingRooms && conversations.length === 0 ? <p className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500">No conversations found.</p> : null}
-        </div>
-      </Card>
-
-      <Card title={selectedTitle} description={selectedSubtitle}>
-        <div className="mb-4 flex flex-wrap items-center gap-2">
-          <span className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Theme</span>
-          {Object.keys(CHAT_THEMES).map((key) => (
-            <button key={key} type="button" onClick={() => setUiTheme(key)} className={`rounded-full px-3 py-1 text-xs font-semibold ${uiTheme === key ? 'bg-slate-900 text-white' : 'border border-slate-200 bg-white text-slate-700'}`}>{key}</button>
-          ))}
-          <span className="ml-3 text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Font</span>
-          {Object.keys(FONT_SIZES).map((key) => (
-            <button key={key} type="button" onClick={() => setFontSize(key)} className={`rounded-full px-3 py-1 text-xs font-semibold ${fontSize === key ? 'bg-slate-900 text-white' : 'border border-slate-200 bg-white text-slate-700'}`}>{key.toUpperCase()}</button>
-          ))}
-          <span className="ml-3 text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Zoom</span>
-          {ZOOMS.map((item) => (
-            <button key={item} type="button" onClick={() => setZoom(item)} className={`rounded-full px-3 py-1 text-xs font-semibold ${zoom === item ? 'bg-slate-900 text-white' : 'border border-slate-200 bg-white text-slate-700'}`}>{item}%</button>
-          ))}
-          <Button type="button" size="sm" variant="outline" onClick={toggleFullscreen}>{fullscreenVideo ? 'Exit Fullscreen' : 'Fullscreen Video'}</Button>
-          <Button type="button" size="sm" variant="outline" onClick={() => setShowComposer((prev) => !prev)}>{showComposer ? 'Hide Composer' : 'Show Composer'}</Button>
-        </div>
-
-        {error ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p> : null}
-        {status ? <p className="mb-4 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{status}</p> : null}
-        {incomingCallLabel ? <p className="mb-4 rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm text-cyan-700">{incomingCallLabel}</p> : null}
-        {typingInfo?.isTyping ? <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">Typing...</p> : null}
-
-        <div className="mb-4 grid gap-4 lg:grid-cols-[1fr_320px]">
-          <div className="space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <p className="text-sm font-semibold text-slate-900">{selectedTitle}</p>
-                <p className="text-xs text-slate-500">{selectedSubtitle}</p>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <Button type="button" size="sm" variant="outline" onClick={() => startCall('audio')} disabled={inCall || !canStartCall}>Audio Call</Button>
-                <Button type="button" size="sm" variant="outline" onClick={() => startCall('video')} disabled={inCall || !canStartCall}>Video Call</Button>
-                {viewMode !== 'direct' ? <Button type="button" size="sm" variant="outline" onClick={() => startCall('video')} disabled={inCall || !canStartCall}>Group Conference</Button> : null}
-                {inCall ? <Button type="button" size="sm" variant="outline" onClick={toggleMic}>{micMuted ? 'Unmute Mic' : 'Mute Mic'}</Button> : null}
-                {inCall ? <Button type="button" size="sm" variant="outline" onClick={() => setOutputMuted((prev) => !prev)}>{outputMuted ? 'Unmute Sound' : 'Mute Sound'}</Button> : null}
-                {inCall ? <Button type="button" size="sm" variant="secondary" onClick={() => stopCall(true)}>End Call</Button> : null}
-              </div>
-            </div>
-            {callStatus ? <p className="text-xs font-semibold text-brand-700">{callStatus}</p> : null}
-            {viewMode !== 'direct' && selectedRoom?.members?.length ? (
-              <div className="flex flex-wrap gap-2">
-                  {selectedRoomMembersPreview.slice(0, 12).map((member) => (
-                    <div key={member.id} className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 ring-1 ring-slate-200">
-                      <span>{member.name}</span>
-                      {roomAdminIds.has(String(member.id)) ? <span className="rounded-full bg-slate-900 px-1.5 py-0.5 text-[9px] text-white">ADMIN</span> : null}
-                      {isSelectedRoomOwner && String(member.id) !== myId && String(member.id) !== String(selectedRoom?.ownerId || '') ? (
-                        roomAdminIds.has(String(member.id)) ? (
-                          <button
-                            type="button"
-                            onClick={() => handleRoomAdminAction(String(member.id), false)}
-                            disabled={roomAdminBusyId === String(member.id)}
-                            className="rounded-full border border-rose-300 px-1.5 py-0.5 text-[9px] font-semibold text-rose-700 disabled:opacity-50"
-                          >
-                            Demote
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => handleRoomAdminAction(String(member.id), true)}
-                            disabled={roomAdminBusyId === String(member.id)}
-                            className="rounded-full border border-emerald-300 px-1.5 py-0.5 text-[9px] font-semibold text-emerald-700 disabled:opacity-50"
-                          >
-                            Promote
-                          </button>
-                        )
-                      ) : null}
-                    </div>
-                ))}
-              </div>
-            ) : null}
-          </div>
-
-          <div className="grid gap-3 rounded-2xl border border-slate-200 bg-white p-3">
-            <video ref={remoteVideoRef} autoPlay playsInline className={`h-40 w-full rounded-xl bg-slate-950 object-cover ${callMode === 'video' ? '' : 'hidden'}`} />
-            <video ref={localVideoRef} autoPlay muted playsInline className={`h-40 w-full rounded-xl bg-slate-900 object-cover ${callMode === 'video' ? '' : 'hidden'}`} />
-            <audio ref={remoteAudioRef} autoPlay className="hidden" />
-            <audio ref={localAudioRef} autoPlay muted className="hidden" />
-            {callMode !== 'video' ? <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-center text-xs text-slate-500">Audio call active controls appear here.</div> : null}
-          </div>
-        </div>
-
-        <div className={`h-[46vh] space-y-3 overflow-y-auto rounded-2xl border p-4 ${activeTheme.feed}`} style={{ fontSize: currentFontSize }}>
-          {loadingMessages ? <p className="text-sm text-slate-500">Loading messages...</p> : null}
-          {messages.map(renderMessage)}
-          {!loadingMessages && messages.length === 0 ? <p className="rounded-xl border border-dashed border-slate-300 bg-white px-4 py-6 text-sm text-slate-500">No messages yet. Send the first one.</p> : null}
-        </div>
-
-        {showComposer ? (
-          <form className="mt-4 space-y-3" onSubmit={sendMessage}>
-            {replyTo ? (
-              <div className="flex items-center justify-between rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
-                <div className="min-w-0">
-                  <p className="font-semibold">Replying to {replyTo?.senderId?.fullName || replyTo?.senderId?.name || 'message'}</p>
-                  <p className="truncate">{replyTo.content}</p>
-                </div>
-                <button type="button" onClick={() => setReplyTo(null)} className="rounded-full border border-amber-300 px-3 py-1 text-xs font-semibold hover:bg-amber-100">Cancel</button>
-              </div>
-            ) : null}
-
-            <textarea
-              ref={composerRef}
-              value={draft}
-              onChange={handleDirectTyping}
-              rows={5}
-              placeholder={canPostInCurrentConversation ? 'Type a message, reply, forward or send a voice note...' : 'Read-only channel for members'}
-              disabled={!canPostInCurrentConversation}
-              className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+      {/* Contact Sidebar */}
+      <div className="w-80 border-r border-slate-100 flex flex-col bg-slate-50/30 h-full">
+        <div className="p-5 border-b border-slate-100 bg-white flex-shrink-0">
+          <h2 className="font-bold text-slate-800 text-lg">Inbox</h2>
+          <div className="mt-3 relative">
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+            </span>
+            <input 
+              type="text"
+              placeholder="Search contacts..."
+              className="w-full pl-9 pr-4 py-2 bg-slate-100 border-none rounded-xl text-xs focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+              value={contactSearchQuery}
+              onChange={(e) => setContactSearchQuery(e.target.value)}
             />
-
-            {pendingAttachment ? (
-              <div className="flex items-center justify-between gap-3 rounded-2xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm text-cyan-900">
-                <div className="min-w-0">
-                  <p className="truncate font-semibold">{pendingAttachment.name}</p>
-                  <p className="text-xs text-cyan-700">{pendingAttachment.type || 'attachment'} • {formatBytes(pendingAttachment.size)}</p>
-                </div>
-                <button type="button" onClick={removeAttachment} className="rounded-full border border-cyan-300 px-3 py-1 text-xs font-semibold hover:bg-cyan-100">Remove</button>
-              </div>
-            ) : null}
-
-            <div className="flex flex-wrap items-center gap-3">
-              <input ref={attachmentInputRef} type="file" accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.txt" onChange={handleAttachmentChange} className="hidden" />
-              <Button type="button" variant="outline" onClick={() => attachmentInputRef.current?.click()} disabled={!canPostInCurrentConversation}>Attach File</Button>
-              <Button type="button" variant="outline" onClick={recordingVoice ? stopVoiceRecording : startVoiceRecording} disabled={!canPostInCurrentConversation}>{recordingVoice ? 'Stop Voice Note' : 'Record Voice Note'}</Button>
-              <Button type="submit" className="border border-slate-900 bg-slate-900 text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60" disabled={sending || !canPostInCurrentConversation}>{sending ? 'Sending...' : 'Send'}</Button>
-            </div>
-            {!canPostInCurrentConversation ? <p className="text-xs font-semibold text-amber-700">Channel posting is restricted. Ask a channel admin to post announcements.</p> : null}
-            {recordingVoice ? <p className="text-xs font-semibold text-rose-600">Recording voice note...</p> : null}
-          </form>
-        ) : null}
-
-        <div className="mt-4 grid gap-4 md:grid-cols-2">
-          <Card title="Call History" description="Enterprise call audit trail">
-            <Button type="button" variant="outline" onClick={async () => setCallHistory((await messagingAPI.getCallHistory()).data || [])}>Refresh Call History</Button>
-            <div className="mt-3 space-y-2 max-h-56 overflow-y-auto">
-              {callHistory.map((item) => (
-                <div key={item._id} className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm">
-                  <p className="font-semibold text-slate-900">{item.mode} • {item.state}</p>
-                  <p className="text-xs text-slate-500">Duration: {item.durationSeconds}s</p>
-                </div>
-              ))}
-            </div>
-          </Card>
-          <Card title="Message Actions" description="Right-click a bubble or tap More to open Telegram-style actions">
-            <p className="text-sm text-slate-600">Actions are now in-context: Reply, Edit, Forward, React, and Delete appear directly on the selected message.</p>
-          </Card>
+          </div>
         </div>
+        <div className="flex-1 overflow-y-auto bg-slate-50/30">
+          {contacts.length > 0 ? (
+            <div className="divide-y divide-slate-100">
+              {contacts.map(c => (
+                <div 
+                  key={c._id} 
+                  onClick={() => setSelectedContact(c)}
+                  className={`p-4 cursor-pointer hover:bg-white transition-colors flex items-center gap-3 ${
+                    selectedContact?._id === c._id 
+                      ? 'bg-white border-l-4 border-l-blue-600 shadow-sm' 
+                      : 'hover:bg-white/80'
+                  }`}
+                >
+                  <div className="relative">
+                    <Avatar 
+                      name={c.fullName || c.name} 
+                      avatarUrl={formatAvatar(c.avatar)} 
+                    />
+                    {/* Online/Offline Status Indicator */}
+                    <div 
+                      className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-white ${
+                        (onlineStatus[String(c._id)]?.isOnline ?? c.isOnline)
+                          ? 'bg-green-500' 
+                          : 'bg-gray-400'
+                      }`}
+                      title={(onlineStatus[String(c._id)]?.isOnline ?? c.isOnline) ? 'Online' : 'Offline'}
+                    />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between">
+                      <div className="font-semibold text-sm text-slate-900 truncate">{c.fullName || c.name}</div>
+                      {c.lastMessage && (
+                        <span className="text-[10px] text-slate-400 shrink-0">
+                          {formatTime(c.lastMessage.createdAt)}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1.5 mt-1">
+                      <span className="text-[10px] text-blue-600 font-bold uppercase tracking-tighter opacity-70">
+                        {String(c.role).toUpperCase()}
+                      </span>
+                    </div>
+                    {c.lastMessage && (() => {
+                      const msg = c.lastMessage;
+                      const content = String(msg.content || '').toLowerCase();
+                      const isDeleted = msg.deletedForEveryone || content.includes('message was deleted') || content === 'deleted';
+                      if (isDeleted) return null;
+                      
+                      return (
+                        <div className="text-xs text-slate-400 truncate mt-1">
+                          {String(msg.senderId) === String(myId) ? 'You: ' : ''}
+                          {msg.content}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="flex flex-col items-center justify-center h-full p-8">
+              <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center mb-4">
+                <svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
+                </svg>
+              </div>
+              <p className="text-xs text-slate-400 text-center">No contacts found</p>
+            </div>
+          )}
+        </div>
+      </div>
 
-        {actionMenu.open && actionMenu.message ? (
-          <div ref={actionMenuRef} className="fixed z-50 w-52 rounded-xl border border-slate-200 bg-white p-2 shadow-xl" style={{ left: `${actionMenu.x}px`, top: `${actionMenu.y}px` }}>
-            <button type="button" onClick={() => handleMessageAction('reply', { message: actionMenu.message })} className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100">Reply</button>
-            {canEditOrDeleteSelected ? <button type="button" onClick={() => openActionDialog('edit', actionMenu.message)} className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100">Edit</button> : null}
-            <button type="button" onClick={() => openActionDialog('forward', actionMenu.message)} className="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100">Forward</button>
-            <div className="my-1 border-t border-slate-200" />
-            <div className="px-3 pb-2 pt-1">
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">React</p>
-              <div className="flex flex-wrap gap-1">
-                {QUICK_REACTIONS.slice(0, 6).map((emoji) => (
-                  <button key={emoji} type="button" onClick={() => handleMessageAction('react', { message: actionMenu.message, emoji })} className="rounded-md border border-slate-200 px-2 py-1 text-sm hover:bg-slate-50">
-                    {emoji}
+      {/* Chat Area */}
+      <div className="flex-1 flex overflow-hidden min-w-0">
+        <div className="flex-1 flex flex-col bg-white h-full">
+          {selectedContact ? (
+            <>
+              <div className="p-4 border-b border-slate-100 bg-white z-10 flex-shrink-0">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-3">
+                    <Avatar 
+                      name={selectedContact.fullName || selectedContact.name} 
+                      avatarUrl={formatAvatar(selectedContact.avatar)} 
+                    />
+                    <div>
+                      <div className="font-semibold text-slate-900">{selectedContact.fullName || selectedContact.name}</div>
+                      <div className={`text-xs ${(onlineStatus[String(selectedContact._id)]?.isOnline ?? selectedContact.isOnline) ? 'text-green-600' : 'text-gray-500'}`}>
+                        {(onlineStatus[String(selectedContact._id)]?.isOnline ?? selectedContact.isOnline) 
+                          ? '🟢 Online' 
+                          : (onlineStatus[String(selectedContact._id)]?.lastSeen ?? selectedContact.lastSeen) 
+                            ? `Last seen at ${formatTime(onlineStatus[String(selectedContact._id)]?.lastSeen ?? selectedContact.lastSeen)}`
+                            : 'Offline'
+                        }
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => setShowSearch(!showSearch)}
+                      className={`p-2 rounded-lg transition-all ${showSearch ? 'bg-blue-50 text-blue-600' : 'text-slate-400 hover:bg-slate-50 hover:text-slate-600'}`}
+                      title="Search Chat"
+                    >
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                      </svg>
+                    </button>
+                    {['student', 'employer'].includes(String(auth?.user?.role).toLowerCase()) && (
+                      <Link 
+                        to={String(auth?.user?.role).toLowerCase() === 'student' ? '/student/logbook' : '/employer/logbooks'}
+                        className="p-2 rounded-lg text-slate-400 hover:bg-slate-50 hover:text-slate-600 flex items-center gap-2 text-xs font-medium border border-transparent hover:border-slate-100"
+                        title="Manage Logbooks"
+                      >
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+                        </svg>
+                        <span className="hidden sm:inline">Logbook</span>
+                      </Link>
+                    )}
+                    <button 
+                      onClick={() => setShowInfo(!showInfo)}
+                      className={`p-2 rounded-lg transition-all ${showInfo ? 'bg-blue-50 text-blue-600' : 'text-slate-400 hover:bg-slate-50 hover:text-slate-600'}`}
+                      title="Contact Info"
+                    >
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+                
+                {/* Search Input */}
+                {showSearch && (
+                  <div className="relative">
+                    <input
+                      type="text"
+                      autoFocus
+                      placeholder="Search messages..."
+                      value={messageSearchQuery}
+                      onChange={(e) => setMessageSearchQuery(e.target.value)}
+                      className="w-full pl-10 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
+                    />
+                    <svg className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                    </svg>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-6 bg-slate-50/10 min-h-0">
+
+              
+              {/* Typing Indicator */}
+              {typingUsers.has(String(selectedContact?._id)) && (
+                <div className="flex items-center gap-2 px-4 py-2 text-sm text-gray-500 italic">
+                  <div className="flex gap-1">
+                    <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                    <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                    <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                  </div>
+                  {selectedContact?.fullName || selectedContact?.name || 'Someone'} is typing...
+                </div>
+              )}
+              
+              {(messageSearchQuery ? messageSearchResults.map(msg => ({ type: 'message', key: msg._id, message: msg })) : processedMessages).map((item) => {
+                if (item.type === 'date-divider') {
+                  return <DateDivider key={item.key} label={item.label} date={item.date} />;
+                }
+                
+                const msg = item.message || item;
+                const isMine = String(msg.senderId?._id || msg.senderId) === String(myId);
+                return (
+                  <div key={item.key} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
+                    <MessageBubble 
+                      message={msg} 
+                      isMine={isMine} 
+                      showSenderInfo={item.showSenderInfo}
+                      isConsecutive={item.isConsecutive}
+                      messageSelection={messageSelection}
+                      socket={socket}
+                      setReplyingTo={setReplyingTo}
+                      textareaRef={textareaRef}
+                      setContextMenu={setContextMenu}
+                    />
+                  </div>
+                );
+              })}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Message Input Area */}
+            <div className="p-4 bg-white border-t border-slate-100">
+              {/* Telegram-style Reply Preview Bar */}
+              {replyingTo && (
+                <div className="flex items-center gap-3 mb-3 animate-in slide-in-from-bottom-2 duration-200">
+                  <div className="w-1 self-stretch bg-blue-500 rounded-full"></div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] font-semibold text-blue-500 flex items-center gap-1.5">
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
+                      Reply to {replyingTo.senderName}
+                    </div>
+                    <div className="text-[12px] text-slate-500 truncate leading-relaxed">
+                      {replyingTo.content}
+                    </div>
+                  </div>
+                  <button 
+                    onClick={() => setReplyingTo(null)}
+                    className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-full transition-all"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
                   </button>
-                ))}
+                </div>
+              )}
+
+              {/* Edit Mode Banner */}
+              {editingMessage && (
+                <div className="mb-3 p-3 bg-blue-50 border border-blue-200 rounded-lg flex items-center justify-between animate-in slide-in-from-bottom-2 duration-300">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 bg-blue-100 rounded shadow-sm text-blue-600">
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                      </svg>
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-blue-600 uppercase tracking-wider">Editing Message</div>
+                      <div className="text-sm text-slate-600 truncate max-w-[250px] lg:max-w-[400px]">
+                        {editingMessage.content}
+                      </div>
+                    </div>
+                  </div>
+                  <button 
+                    onClick={() => {
+                      setEditingMessage(null);
+                      setDraft('');
+                    }}
+                    className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                    title="Cancel Edit"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+              )}
+              {attachment && (
+                <div className="mb-3 p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 bg-white rounded shadow-sm">
+                      <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                      </svg>
+                    </div>
+                    <div className="text-sm font-medium text-slate-700 truncate max-w-[200px]">
+                      {attachment.filename || attachment.name}
+                    </div>
+                  </div>
+                  <button 
+                    onClick={() => setAttachment(null)}
+                    className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+              )}
+              <form onSubmit={handleSend} className="flex items-end gap-2">
+                <div className="flex-1 bg-slate-50 border border-slate-200 rounded-xl flex items-end p-1 focus-within:ring-2 focus-within:ring-blue-500/20 focus-within:border-blue-500 transition-all">
+                  <button 
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="p-2 text-slate-400 hover:text-blue-500 transition-colors flex-shrink-0"
+                    title="Attach file"
+                  >
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                    </svg>
+                  </button>
+                  <input 
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleFileChange}
+                    className="hidden"
+                  />
+                  <textarea
+                    ref={textareaRef}
+                    value={draft}
+                    onChange={(e) => {
+                      setDraft(e.target.value);
+                      handleInput();
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSend(e);
+                      }
+                      handleTypingStart();
+                    }}
+                    onKeyUp={handleTypingStop}
+                    placeholder="Type a message..."
+                    className="flex-1 max-h-32 min-h-[44px] bg-transparent border-none focus:ring-0 resize-none py-3 px-2 text-sm outline-none"
+                    rows="1"
+                  />
+                </div>
+                <button 
+                  type="submit"
+                  disabled={!draft.trim() && !attachment}
+                  className={`p-3 ${editingMessage ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-blue-600 hover:bg-blue-700'} disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl shadow-sm hover:shadow transition-all flex-shrink-0`}
+                  title={editingMessage ? 'Save Changes' : 'Send Message'}
+                >
+                  {editingMessage ? (
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2.5">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                  ) : (
+                    <svg className="w-5 h-5 transform rotate-90 translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                    </svg>
+                  )}
+                </button>
+              </form>
+            </div>
+            </>
+          ) : (
+            <div className="flex-1 flex items-center justify-center text-slate-400 text-sm italic">
+              Select a contact to start messaging
+            </div>
+          )}
+
+          {/* Contact Info Sidebar */}
+          {selectedContact && showInfo && (
+            <div className="w-[300px] border-l border-slate-100 bg-white flex flex-col animate-in slide-in-from-right-4 duration-300 flex-shrink-0">
+              <div className="p-4 border-b border-slate-100 flex items-center justify-between">
+                <h3 className="font-bold text-slate-900">User Info</h3>
+                <button 
+                  onClick={() => setShowInfo(false)}
+                  className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto p-6 flex flex-col items-center text-center">
+                <div className="mb-4">
+                  <Avatar 
+                    name={selectedContact.fullName || selectedContact.name} 
+                    avatarUrl={formatAvatar(selectedContact.avatar)} 
+                    size="w-24 h-24"
+                  />
+                </div>
+                
+                <h2 className="text-xl font-bold text-slate-900 mb-1">
+                  {selectedContact.fullName || selectedContact.name}
+                </h2>
+                <div className="px-3 py-1 bg-blue-50 text-blue-600 text-[10px] font-bold rounded-full uppercase tracking-widest mb-4">
+                  {selectedContact.role || 'User'}
+                </div>
+
+                <div className="w-full space-y-6 text-left mt-4">
+                  <div className="flex items-start gap-4">
+                    <div className="p-2 bg-slate-50 rounded-lg text-slate-400">
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002-2z" /></svg>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[11px] text-slate-400 font-medium uppercase tracking-wider mb-0.5">Email</div>
+                      <div className="text-sm text-slate-700 truncate">{selectedContact.email || 'N/A'}</div>
+                    </div>
+                  </div>
+
+                  {(selectedContact.department || selectedContact.college) && (
+                    <div className="flex items-start gap-4">
+                      <div className="p-2 bg-slate-50 rounded-lg text-slate-400">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" /></svg>
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[11px] text-slate-400 font-medium uppercase tracking-wider mb-0.5">Organization</div>
+                        <div className="text-sm text-slate-700">
+                          {selectedContact.department && <div className="font-medium">{selectedContact.department}</div>}
+                          {selectedContact.college && <div className="text-xs text-slate-500 mt-0.5">{selectedContact.college}</div>}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex items-start gap-4">
+                    <div className="p-2 bg-slate-50 rounded-lg text-slate-400">
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[11px] text-slate-400 font-medium uppercase tracking-wider mb-0.5">Status</div>
+                      <div className="text-sm">
+                        {(onlineStatus[String(selectedContact._id)]?.isOnline ?? selectedContact.isOnline) 
+                          ? <span className="text-green-600 font-semibold">Online</span> 
+                          : <span className="text-slate-500">Offline</span>
+                        }
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
-            {canEditOrDeleteSelected ? <div className="my-1 border-t border-slate-200" /> : null}
-            {canEditOrDeleteSelected ? <button type="button" onClick={() => handleMessageAction('delete', { message: actionMenu.message })} className="block w-full rounded-lg px-3 py-2 text-left text-sm text-rose-600 hover:bg-rose-50">Delete</button> : null}
-          </div>
-        ) : null}
+          )}
 
-        <Modal open={actionDialog.type === 'edit'} title="Edit Message" onClose={closeActionDialog}>
-          <div className="space-y-3">
-            <textarea value={editDraft} onChange={(event) => setEditDraft(event.target.value)} rows={5} className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
-            <div className="flex justify-end gap-2">
-              <Button type="button" variant="outline" onClick={closeActionDialog}>Cancel</Button>
-              <Button type="button" className="border border-slate-900 bg-slate-900 text-white" onClick={() => handleMessageAction('edit', { content: editDraft })}>Save</Button>
-            </div>
-          </div>
-        </Modal>
+          {/* Custom Context Menu */}
+          {contextMenu && (
+            <div 
+              className="fixed z-[9999] bg-white border border-slate-200 rounded-xl shadow-2xl py-1.5 min-w-[180px] animate-in fade-in zoom-in duration-200 backdrop-blur-sm bg-white/95"
+              style={{ 
+                left: Math.min(contextMenu.x, window.innerWidth - 200), 
+                top: Math.min(contextMenu.y, window.innerHeight - 250) 
+              }}
+              onMouseLeave={() => setContextMenu(null)}
+            >
+              {/* Common Reply Action */}
+              <button 
+                onClick={() => {
+                  setReplyingTo({ 
+                    _id: contextMenu.messageId, 
+                    content: contextMenu.message.content, 
+                    senderName: contextMenu.message.senderId?.fullName || contextMenu.message.senderId?.name || 'Unknown' 
+                  });
+                  setContextMenu(null);
+                  if (textareaRef.current) textareaRef.current.focus();
+                }}
+                className="w-full text-left px-4 py-2.5 text-xs hover:bg-slate-100 flex items-center gap-3 transition-colors text-slate-700 font-medium"
+              >
+                <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" /></svg>
+                Reply
+              </button>
 
-        <Modal open={actionDialog.type === 'forward'} title="Forward Message" onClose={closeActionDialog}>
-          <div className="space-y-3">
-            <div className="grid grid-cols-2 gap-2">
-              <button type="button" onClick={() => { setForwardType('user'); setForwardTargetId(''); }} className={`rounded-xl border px-3 py-2 text-sm ${forwardType === 'user' ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700'}`}>User</button>
-              <button type="button" onClick={() => { setForwardType('room'); setForwardTargetId(''); }} className={`rounded-xl border px-3 py-2 text-sm ${forwardType === 'room' ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700'}`}>Room</button>
-            </div>
-            <select value={forwardTargetId} onChange={(event) => setForwardTargetId(event.target.value)} className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm">
-              <option value="">Select destination</option>
-              {(forwardType === 'user' ? forwardUsers : forwardRooms).map((item) => (
-                <option key={item.id} value={item.id}>{forwardType === 'user' ? `${item.name} (${item.role || 'user'})` : `${item.name} (${item.type || 'room'})`}</option>
-              ))}
-            </select>
-            <div className="flex justify-end gap-2">
-              <Button type="button" variant="outline" onClick={closeActionDialog}>Cancel</Button>
-              <Button type="button" className="border border-slate-900 bg-slate-900 text-white" disabled={!forwardTargetId} onClick={() => handleMessageAction('forward', { targetType: forwardType, targetId: forwardTargetId })}>Forward</Button>
-            </div>
-          </div>
-        </Modal>
-
-        <Modal open={actionDialog.type === 'react'} title="React To Message" onClose={closeActionDialog}>
-          <div className="space-y-3">
-            <div className="flex flex-wrap gap-2">
-              {QUICK_REACTIONS.map((emoji) => (
-                <button key={emoji} type="button" onClick={() => setReactionEmoji(emoji)} className={`rounded-lg border px-3 py-2 text-lg ${reactionEmoji === emoji ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white'}`}>
-                  {emoji}
+              {/* Type-Specific Actions: TEXT */}
+              {!contextMenu.message.attachment && (
+                <button 
+                  onClick={() => handleCopyText(contextMenu.message.content)}
+                  className="w-full text-left px-4 py-2.5 text-xs hover:bg-slate-100 flex items-center gap-3 transition-colors text-slate-700 font-medium"
+                >
+                  <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" /></svg>
+                  Copy Text
                 </button>
-              ))}
+              )}
+
+              {/* Type-Specific Actions: IMAGE */}
+              {contextMenu.message.attachment && contextMenu.message.attachment.type?.startsWith('image/') && (
+                <>
+                  <button 
+                    onClick={() => handleSaveImage(contextMenu.message.attachment.url, contextMenu.message.attachment.name)}
+                    className="w-full text-left px-4 py-2.5 text-xs hover:bg-slate-100 flex items-center gap-3 transition-colors text-slate-700 font-medium"
+                  >
+                    <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                    Save Image
+                  </button>
+                  <button 
+                    onClick={() => handleCopyText(contextMenu.message.attachment.url)}
+                    className="w-full text-left px-4 py-2.5 text-xs hover:bg-slate-100 flex items-center gap-3 transition-colors text-slate-700 font-medium"
+                  >
+                    <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                    Copy Photo Link
+                  </button>
+                </>
+              )}
+
+              {/* Edit Action (Only mine) */}
+              {contextMenu.isMine && (
+                <button 
+                  onClick={() => {
+                    handleEditStart(contextMenu.message);
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-4 py-2.5 text-xs hover:bg-slate-100 flex items-center gap-3 transition-colors text-slate-700 font-medium"
+                >
+                  <svg className="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                  Edit Message
+                </button>
+              )}
+
+              {/* Delete Action (Always) */}
+              <button 
+                onClick={() => {
+                  setDeleteTarget(contextMenu.message);
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-4 py-2.5 text-xs text-red-600 hover:bg-red-50 flex items-center gap-3 transition-colors font-medium"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                Delete Message
+              </button>
+
+              <div className="border-t border-slate-100 my-1"></div>
+              <button 
+                onClick={() => setContextMenu(null)}
+                className="w-full text-left px-4 py-2 text-[10px] text-slate-400 hover:text-slate-600"
+              >
+                Cancel
+              </button>
             </div>
-            <input value={reactionEmoji} onChange={(event) => setReactionEmoji(event.target.value)} placeholder="Custom emoji" className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
-            <div className="flex justify-end gap-2">
-              <Button type="button" variant="outline" onClick={closeActionDialog}>Cancel</Button>
-              <Button type="button" className="border border-slate-900 bg-slate-900 text-white" onClick={() => handleMessageAction('react', { emoji: reactionEmoji })}>React</Button>
-            </div>
-          </div>
-        </Modal>
-      </Card>
+          )}
+
+          {/* Delete Confirmation Modal */}
+          <DeleteMessageModal
+            isOpen={!!deleteTarget}
+            message={deleteTarget}
+            contactName={selectedContact?.fullName || selectedContact?.name}
+            onConfirm={handleDeleteMessage}
+            onCancel={() => setDeleteTarget(null)}
+          />
+        </div>
+      </div>
     </div>
   );
 }

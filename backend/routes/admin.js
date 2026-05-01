@@ -2299,12 +2299,72 @@ router.put('/internships/:id/status', auth, async (req, res) => {
             { $set: { status } },
             { returnDocument: 'after' }
         )
-            .select('title location status studentsNeeded deadline companyId createdAt')
+            .select('title location status description studentsNeeded deadline companyId createdAt')
             .populate('companyId', 'name fullName email')
             .lean();
 
         if (!internship) {
             return res.status(404).json({ message: 'Internship not found.' });
+        }
+
+        // 🚀 Trigger Email Notifications if newly opened
+        if (status === 'Open') {
+            console.log(`🚀 Internship [${internship.title}] was approved. Starting notification fan-out...`);
+            const { sendEmail } = require('../utils/mailer');
+            const UserPreferences = require('../models/UserPreferences');
+            
+            try {
+                // Fetch all students
+                const students = await User.find({ role: { $in: ['student', 'Student'] } })
+                    .select('_id email name fullName')
+                    .lean();
+                
+                console.log(`👥 Found ${students.length} total students in database.`);
+                
+                const studentIds = students.map(s => s._id);
+                
+                // Filter out only those who specifically disabled emailAlerts
+                const optOutPrefs = await UserPreferences.find({ 
+                    userId: { $in: studentIds },
+                    'notifications.emailAlerts': false 
+                }).select('userId').lean();
+                
+                const optOutIds = new Set(optOutPrefs.map(p => String(p.userId)));
+                const targets = students.filter(s => !optOutIds.has(String(s._id)));
+
+                console.log(`📣 Target list finalized: ${targets.length} students to be notified.`);
+
+                if (targets.length) {
+                    const companyName = internship.companyId?.fullName || internship.companyId?.name || 'A Partner Company';
+                    targets.forEach((student, index) => {
+                        console.log(`📧 Queuing email to: ${student.email} (${index + 1}/${targets.length})`);
+                        sendEmail({
+                            to: student.email,
+                            subject: `New Internship Opportunity: ${internship.title}`,
+                            html: `
+                                <div style="font-family: sans-serif; padding: 20px; color: #333;">
+                                    <h2 style="color: #0891b2;">🚀 New Internship Published!</h2>
+                                    <p>Hello ${student.name || student.fullName},</p>
+                                    <p>The internship <strong>${internship.title}</strong> by <strong>${companyName}</strong> has just been approved and is now open for applications!</p>
+                                    <div style="background: #f0f9ff; padding: 15px; border-radius: 12px; border: 1px solid #bae6fd; margin: 20px 0;">
+                                        <h3 style="margin: 0; color: #0369a1;">${internship.title}</h3>
+                                        <p style="margin: 5px 0; font-size: 14px;">📍 Location: ${internship.location || 'Remote'}</p>
+                                        <p style="margin: 10px 0; color: #475569;">${internship.description ? internship.description.substring(0, 150) + '...' : ''}</p>
+                                    </div>
+                                    <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/student/internships" 
+                                       style="display: inline-block; background: #0891b2; color: white; padding: 12px 30px; border-radius: 50px; text-decoration: none; font-weight: bold;">
+                                        Apply Now
+                                    </a>
+                                </div>
+                            `
+                        });
+                    });
+                } else {
+                    console.warn('⚠️ No eligible students found for notification.');
+                }
+            } catch (err) {
+                console.error("❌ Admin approval email fan-out failed:", err);
+            }
         }
 
         await logAdminAction(
@@ -2314,7 +2374,7 @@ router.put('/internships/:id/status', auth, async (req, res) => {
         );
 
         return res.json({ message: 'Internship status updated.', item: internship });
-    } catch {
+    } catch (err) {
         return res.status(500).json({ message: 'Failed to update internship status.' });
     }
 });
@@ -3261,15 +3321,37 @@ router.get('/partners', auth, async (req, res) => {
     } catch (err) { res.status(500).send("Partner fetch failed."); }
 });
 
-router.put('/verify-partner/:id', auth, async (req, res) => {
-    if (!isSuperAdmin(req)) return res.status(403).send("SuperAdmin only.");
+router.put('/companies/:id/verification', auth, async (req, res) => {
+    if (!isSuperAdmin(req)) return res.status(403).json({ message: "SuperAdmin only." });
     try {
-        const { status } = req.body; // 'Verified' or 'Rejected'
+        const { status } = req.body; // 'Verified', 'Rejected', or 'Pending'
         const profile = await CompanyProfile.findByIdAndUpdate(req.params.id, { 
             'verification.status': status 
         }, { returnDocument: 'after' });
         
-        // Also update the User model verification status
+        if (!profile) return res.status(404).json({ message: "Company profile not found." });
+
+        // Sync with User model
+        if (status === 'Verified') {
+            await User.findByIdAndUpdate(profile.user, { isVerified: true });
+        } else {
+            await User.findByIdAndUpdate(profile.user, { isVerified: false });
+        }
+        
+        await logAdminAction(req, 'ADMIN_COMPANY_VERIFICATION', `Company=${profile.companyName} Status=${status}`);
+        
+        res.json({ message: `Company verification updated to ${status}.`, item: profile });
+    } catch (err) { res.status(500).json({ message: "Verification update failed." }); }
+});
+
+router.put('/verify-partner/:id', auth, async (req, res) => {
+    if (!isSuperAdmin(req)) return res.status(403).send("SuperAdmin only.");
+    try {
+        const { status } = req.body; 
+        const profile = await CompanyProfile.findByIdAndUpdate(req.params.id, { 
+            'verification.status': status 
+        }, { returnDocument: 'after' });
+        
         if (status === 'Verified') {
             await User.findByIdAndUpdate(profile.user, { isVerified: true });
         } else {

@@ -6,10 +6,13 @@ const InternshipSchema = new mongoose.Schema({
     trainingFocus: { type: Boolean, default: true },
     title: { type: String, required: true },
     description: { type: String, required: true },
-    location: { type: String }, // e.g., Remote, Addis Ababa
-    duration: { type: String }, // e.g., 3 months
-    startDate: { type: Date },
-    endDate: { type: Date },
+    location: { type: String, default: 'Addis Ababa' },
+    targetDepartments: [String],
+    targetBatch: { type: String }, // e.g. 3rd Year, 4th Year, Graduating
+    workModality: { type: String, enum: ['On-site', 'Remote', 'Hybrid'], default: 'On-site' },
+    compensationType: { type: String, enum: ['Unpaid', 'Allowance', 'Paid'], default: 'Unpaid' },
+    minCgpa: { type: Number, default: 0 },
+    interviewRequired: { type: Boolean, default: false },
     studentsNeeded: { type: Number, min: 1 },
     isPaid: { type: Boolean, default: false },
     stipend: { type: String },

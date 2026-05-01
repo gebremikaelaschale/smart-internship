@@ -8,7 +8,7 @@ const ApplicationSchema = new mongoose.Schema({
     remarks: { type: String, default: '' },
     status: { 
         type: String, 
-        enum: ['Pending', 'Under Review', 'Interview', 'Accepted', 'Rejected'], 
+        enum: ['Pending', 'Seen', 'Shortlisted', 'Interview', 'Accepted', 'Offered', 'Placed', 'Rejected', 'Withdrawn'], 
         default: 'Pending' 
     },
     matchingScore: { type: Number, default: 0 }, // AI Internship Matching Score based on Skills & GPA

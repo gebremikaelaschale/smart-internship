@@ -43,11 +43,22 @@ function ProfileIcon() {
   );
 }
 
+function LogbookIcon() {
+  return (
+    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M9 11l3 3L22 4" />
+      <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" />
+    </svg>
+  );
+}
+
 const links = [
   { to: '/student/dashboard', label: 'Dashboard', icon: <DashboardIcon />, accent: 'from-cyan-500 to-blue-600' },
-  { to: '/student/internships', label: 'Internships', icon: <InternshipIcon />, accent: 'from-blue-500 to-indigo-600' },
-  { to: '/student/applications', label: 'Applications', icon: <ApplicationsIcon />, accent: 'from-violet-500 to-purple-600' },
+  { to: '/student/internships', label: 'Internships', icon: <InternshipIcon />, accent: 'from-sky-500 to-cyan-600' },
+  { to: '/student/applications', label: 'Applications', icon: <ApplicationsIcon />, accent: 'from-cyan-400 to-sky-500' },
+  { to: '/student/logbook', label: 'Logbook', icon: <LogbookIcon />, accent: 'from-blue-500 to-cyan-500' },
   { to: '/student/messages', label: 'Messages', icon: <ApplicationsIcon />, accent: 'from-amber-500 to-orange-600' },
+  { to: '/student/settings', label: 'Settings', icon: <ProfileIcon />, accent: 'from-indigo-500 to-violet-600' },
   { to: '/student/profile', label: 'Profile', icon: <ProfileIcon />, accent: 'from-emerald-500 to-teal-600' }
 ];
 
@@ -230,18 +241,25 @@ export default function StudentSidebar() {
           >
             {({ isActive }) => (
               <>
-                <span className={`grid h-8 w-8 place-items-center rounded-xl ${isActive ? `bg-gradient-to-br ${link.accent} text-white` : 'bg-white/10 text-cyan-100 group-hover:bg-white/20'}`}>
+                <span className={`grid h-8 w-8 place-items-center rounded-xl shrink-0 ${isActive ? `bg-gradient-to-br ${link.accent} text-white` : 'bg-white/10 text-cyan-100 group-hover:bg-white/20'}`}>
                   {link.icon}
                 </span>
 
-                {!collapsed ? <span className="flex-1">{link.label}</span> : null}
-                {!collapsed && isActive ? <span className="h-2 w-2 rounded-full bg-cyan-500" /> : null}
+                {!collapsed && (
+                  <span className="flex-1 font-bold whitespace-nowrap overflow-hidden text-ellipsis">
+                    {link.label}
+                  </span>
+                )}
 
-                {collapsed ? (
+                {!collapsed && isActive && (
+                  <span className="h-2 w-2 rounded-full bg-cyan-500 shrink-0" />
+                )}
+
+                {collapsed && (
                   <span className="pointer-events-none absolute left-[78px] top-1/2 z-30 -translate-y-1/2 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white opacity-0 shadow-lg transition group-hover:opacity-100">
                     {link.label}
                   </span>
-                ) : null}
+                )}
               </>
             )}
           </NavLink>
@@ -250,36 +268,14 @@ export default function StudentSidebar() {
 
       <div className="border-t border-white/10 px-6 py-5">
         {!collapsed ? (
-          <div className="rounded-2xl border border-white/10 bg-white/10 p-4 text-sm backdrop-blur">
-            <p className={`text-xs font-semibold uppercase tracking-[0.2em] ${activeTheme.tagClass}`}>Theme</p>
-            <div className="mt-2 flex items-center gap-2">
-              {Object.keys(themes).map((key) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => switchTheme(key)}
-                  disabled={isGlobalDarkMode}
-                  className={`h-4 w-4 rounded-full ring-2 transition ${theme === key ? 'ring-white' : 'ring-transparent hover:ring-white/40'} ${key === 'aurora' ? 'bg-cyan-400' : key === 'midnight' ? 'bg-violet-400' : 'bg-emerald-400'} ${isGlobalDarkMode ? 'cursor-not-allowed opacity-45 hover:ring-transparent' : ''}`}
-                  aria-label={`Switch to ${themes[key].label} theme`}
-                  title={isGlobalDarkMode ? 'Disabled while global dark mode is active' : themes[key].label}
-                />
-              ))}
-              <span className={`ml-1 text-xs ${activeTheme.subtitleClass}`}>{activeTheme.label}</span>
-            </div>
-
-            {isGlobalDarkMode ? (
-              <p className="mt-2 text-xs text-slate-300/90">Global dark mode is active. Sidebar follows dark palette automatically.</p>
-            ) : null}
-
-            <button
-              type="button"
-              onClick={handleSignOut}
-              disabled={signingOut}
-              className="mt-4 w-full rounded-xl bg-white/90 px-3 py-2.5 text-sm font-semibold text-slate-900 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-70"
-            >
-              {signingOut ? 'Signing out...' : 'Sign out'}
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={handleSignOut}
+            disabled={signingOut}
+            className="mt-4 w-full rounded-xl bg-white/90 px-3 py-2.5 text-sm font-semibold text-slate-900 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-70"
+          >
+            {signingOut ? 'Signing out...' : 'Sign out'}
+          </button>
         ) : (
           <div className="grid place-items-center">
             <button

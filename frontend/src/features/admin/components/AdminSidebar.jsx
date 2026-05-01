@@ -52,9 +52,9 @@ const links = [
   { to: '/admin/applications', label: 'Applications', icon: <GridIcon />, accent: 'from-lime-500 to-emerald-600' },
   { to: '/admin/colleges', label: 'Colleges', icon: <GridIcon />, accent: 'from-sky-500 to-cyan-600' },
   { to: '/admin/departments', label: 'Departments', icon: <GridIcon />, accent: 'from-rose-500 to-pink-600' },
+  { to: '/admin/evaluations', label: 'Evaluations', icon: <GridIcon />, accent: 'from-blue-500 to-indigo-600' },
   { to: '/admin/reports', label: 'Reports', icon: <MessageIcon />, accent: 'from-teal-500 to-cyan-600' },
   { to: '/admin/certificates', label: 'Certificates', icon: <GridIcon />, accent: 'from-fuchsia-500 to-rose-600' },
-  { to: '/admin/analytics', label: 'Analytics', icon: <GridIcon />, accent: 'from-indigo-500 to-blue-600' },
   { to: '/admin/settings', label: 'Settings', icon: <GridIcon />, accent: 'from-slate-500 to-slate-700' }
 ];
 
@@ -250,27 +250,6 @@ export default function AdminSidebar() {
 
       <div className="border-t border-white/10 px-6 py-5">
         {!collapsed ? (
-          <div className="rounded-2xl border border-white/10 bg-white/10 p-4 text-sm backdrop-blur">
-            <p className={`text-xs font-semibold uppercase tracking-[0.2em] ${activeTheme.tagClass}`}>Theme</p>
-            <div className="mt-2 flex items-center gap-2">
-              {Object.keys(themes).map((key) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => switchTheme(key)}
-                  disabled={isGlobalDarkMode}
-                  className={`h-4 w-4 rounded-full ring-2 transition ${theme === key ? 'ring-white' : 'ring-transparent hover:ring-white/40'} ${key === 'aurora' ? 'bg-cyan-400' : key === 'midnight' ? 'bg-violet-400' : 'bg-emerald-400'} ${isGlobalDarkMode ? 'cursor-not-allowed opacity-45 hover:ring-transparent' : ''}`}
-                  aria-label={`Switch to ${themes[key].label} theme`}
-                  title={isGlobalDarkMode ? 'Disabled while global dark mode is active' : themes[key].label}
-                />
-              ))}
-              <span className={`ml-1 text-xs ${activeTheme.subtitleClass}`}>{activeTheme.label}</span>
-            </div>
-
-            {isGlobalDarkMode ? (
-              <p className="mt-2 text-xs text-slate-300/90">Global dark mode is active. Sidebar follows dark palette automatically.</p>
-            ) : null}
-
             <button
               type="button"
               onClick={handleSignOut}
@@ -279,7 +258,6 @@ export default function AdminSidebar() {
             >
               {signingOut ? 'Signing out...' : 'Sign out'}
             </button>
-          </div>
         ) : (
           <div className="grid place-items-center">
             <button

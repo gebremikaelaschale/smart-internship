@@ -13,6 +13,8 @@ import StudentDashboard from '@/features/student/pages/Dashboard';
 import StudentProfile from '@/features/student/pages/Profile';
 import StudentApplications from '@/features/student/pages/Applications';
 import StudentInternships from '@/features/student/pages/Internships';
+import StudentLogbook from '@/features/student/pages/Logbook';
+import StudentSettings from '@/features/student/pages/Settings';
 import Messages from '@/features/messaging/pages/Messages';
 import EmployerDashboard from '@/features/employer/pages/Dashboard';
 import EmployerProfile from '@/features/employer/pages/Profile';
@@ -21,6 +23,7 @@ import MyPrograms from '@/features/employer/pages/MyPrograms';
 import Activity from '@/features/employer/pages/Activity';
 import Applicants from '@/features/employer/pages/Applicants';
 import ActiveInterns from '@/features/employer/pages/ActiveInterns';
+import EmployerLogbooks from '@/features/employer/pages/Logbooks';
 import Evaluation from '@/features/employer/pages/Evaluation';
 import Reports from '@/features/employer/pages/Reports';
 import SuperAdminDashboard from '@/features/admin/pages/SuperAdminDashboard';
@@ -40,13 +43,13 @@ import Departments from '@/features/admin/pages/Departments';
 import ReportsAdmin from '@/features/admin/pages/ReportsAdmin';
 import Certificates from '@/features/admin/pages/Certificates';
 import AnalyticsAdmin from '@/features/admin/pages/AnalyticsAdmin';
+import EvaluationsAdmin from '@/features/admin/pages/EvaluationsAdmin';
 import SettingsAdmin from '@/features/admin/pages/SettingsAdmin';
 
 export default function AppRoutes() {
   return (
     <Routes>
-      <Route path="/" element={<Navigate to="/login" replace />} />
-      <Route path="/login" element={<Login />} />
+            <Route path="/login" element={<Login />} />
       <Route path="/register" element={<Register />} />
       <Route path="/forgot-password" element={<ForgotPassword />} />
 
@@ -78,6 +81,8 @@ export default function AppRoutes() {
           <Route path="profile" element={<StudentProfile />} />
           <Route path="applications" element={<StudentApplications />} />
           <Route path="internships" element={<StudentInternships />} />
+          <Route path="logbook" element={<StudentLogbook />} />
+          <Route path="settings" element={<StudentSettings />} />
           <Route path="messages" element={<Messages />} />
         </Route>
 
@@ -86,10 +91,12 @@ export default function AppRoutes() {
           <Route path="dashboard" element={<EmployerDashboard />} />
           <Route path="profile" element={<EmployerProfile />} />
           <Route path="post-internship" element={<PostInternship />} />
+          <Route path="edit-internship/:id" element={<PostInternship />} />
           <Route path="my-programs" element={<MyPrograms />} />
           <Route path="activity" element={<Activity />} />
           <Route path="applicants" element={<Applicants />} />
           <Route path="active-interns" element={<ActiveInterns />} />
+          <Route path="logbooks" element={<EmployerLogbooks />} />
           <Route path="evaluation" element={<Evaluation />} />
           <Route path="reports" element={<Reports />} />
           <Route path="messages" element={<Messages />} />
@@ -108,6 +115,7 @@ export default function AppRoutes() {
           <Route path="applications" element={<Applications />} />
           <Route path="colleges" element={<Colleges />} />
           <Route path="departments" element={<Departments />} />
+          <Route path="evaluations" element={<EvaluationsAdmin />} />
           <Route path="reports" element={<ReportsAdmin />} />
           <Route path="certificates" element={<Certificates />} />
           <Route path="analytics" element={<AnalyticsAdmin />} />

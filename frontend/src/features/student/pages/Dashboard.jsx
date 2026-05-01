@@ -259,27 +259,36 @@ export default function Dashboard() {
   };
 
   return (
-    <div className="student-dashboard space-y-6">
+    <div className="student-dashboard space-y-6 w-full">
       {loading ? <DashboardSkeleton /> : null}
       {error ? <ErrorMessage message={error} /> : null}
 
-      <motion.section initial="hidden" animate="visible" custom={0.03} variants={animated} className="student-panel rounded-[34px] border border-cyan-100 bg-[radial-gradient(circle_at_top_right,rgba(14,165,233,0.22),transparent_35%),linear-gradient(180deg,#ecfeff_0%,#ffffff_55%)] p-6 shadow-[0_24px_70px_rgba(14,116,144,0.14)] lg:p-8">
-        <div className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
-          <div className="space-y-3">
-            <p className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-700">Student command center</p>
-            <h1 className="text-4xl font-semibold tracking-tight text-slate-900 sm:text-5xl">Welcome, {displayName}</h1>
-            <p className="max-w-xl text-base leading-7 text-slate-600">Track progress, submit applications, and complete your profile from one connected dashboard.</p>
+      <section className="bg-white border-b border-slate-100 pt-12 pb-8 px-6 lg:px-10 rounded-[32px] mb-8">
+        <div className="w-full mx-auto flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6">
+          <div className="space-y-2">
+            <h1 className="text-4xl font-black text-slate-900 tracking-tight">Student Dashboard</h1>
+            <p className="text-slate-500 font-medium max-w-xl">Track progress, submit applications, and complete your profile from one connected workspace.</p>
           </div>
-          <div className="flex items-center gap-5 rounded-3xl border border-cyan-100 bg-white/90 px-5 py-4 shadow-sm">
-            <ProfileGauge value={profileCompletion} />
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">Profile completion</p>
-              <p className="mt-1 text-xl font-semibold text-slate-900">{profileCompletion}%</p>
-              <p className="mt-1 text-sm text-slate-500">Improve this score for stronger matching.</p>
-            </div>
+          <div className="flex items-center gap-3">
+             <div className="flex items-center gap-4 rounded-3xl border border-cyan-100 bg-cyan-50/30 px-5 py-3 shadow-sm mr-4">
+                <ProfileGauge value={profileCompletion} />
+                <div>
+                  <p className="text-[10px] font-black uppercase tracking-[0.2em] text-cyan-700">Profile</p>
+                  <p className="text-lg font-black text-slate-900 leading-none">{profileCompletion}%</p>
+                </div>
+              </div>
+            <span className="rounded-full border border-violet-100 bg-violet-50 px-4 py-2 text-xs font-black text-violet-700 uppercase tracking-tighter">
+              Apps: {stats.total ?? 0}
+            </span>
+            <span className="rounded-full border border-emerald-100 bg-emerald-50 px-4 py-2 text-xs font-black text-emerald-700 uppercase tracking-tighter">
+              Placed: {stats.accepted ?? 0}
+            </span>
+            <span className="rounded-full border border-sky-100 bg-sky-50 px-4 py-2 text-xs font-black text-sky-700 uppercase tracking-tighter">
+              Saved: {dashboardData?.saved ?? 0}
+            </span>
           </div>
         </div>
-      </motion.section>
+      </section>
 
       <motion.section initial="hidden" animate="visible" custom={0.08} variants={animated} className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatTile label="Total Applications" value={stats.total ?? 0} hint="Applications submitted" />
@@ -430,12 +439,26 @@ export default function Dashboard() {
         <Card title="Recommended Internships" description="Top matches generated from your profile and available roles." className="student-panel rounded-3xl border-cyan-100 bg-white">
           <div className="grid gap-4 lg:grid-cols-3">
             {recommendations.slice(0, 3).map((item) => (
-              <motion.div whileHover={{ y: -2 }} key={item._id || item.id || item.title} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                <p className="text-sm font-semibold text-slate-900">{item.title}</p>
-                <p className="mt-1 text-sm text-slate-500">{item.location || 'Location not specified'}</p>
-                <div className="mt-4 flex items-center justify-between">
-                  <span className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Match score</span>
-                  <span className="rounded-full bg-cyan-100 px-3 py-1 text-sm font-semibold text-cyan-800">{item.matchScore ?? 0}%</span>
+              <motion.div whileHover={{ y: -2 }} key={item._id || item.id || item.title} className="rounded-2xl border border-slate-200 bg-slate-50 p-5 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center gap-3 mb-3">
+                    <div className="h-10 w-10 rounded-lg bg-white border border-slate-100 flex items-center justify-center overflow-hidden">
+                      {item.companyProfile?.logo ? (
+                        <img src={item.companyProfile.logo} alt="Logo" className="h-full w-full object-cover" />
+                      ) : (
+                        <span className="text-xs font-bold text-slate-300">C</span>
+                      )}
+                    </div>
+                    <p className="text-xs font-bold text-violet-600 uppercase tracking-wider truncate">
+                      {item.companyProfile?.companyName || 'Top Company'}
+                    </p>
+                  </div>
+                  <p className="text-sm font-semibold text-slate-900 line-clamp-1">{item.title}</p>
+                  <p className="mt-1 text-xs text-slate-500">{item.location || 'Remote'}</p>
+                </div>
+                <div className="mt-5 flex items-center justify-between border-t border-slate-200/60 pt-3">
+                  <span className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">Match score</span>
+                  <span className="rounded-full bg-cyan-100 px-3 py-1 text-xs font-bold text-cyan-800">{item.matchScore ?? 0}%</span>
                 </div>
               </motion.div>
             ))}

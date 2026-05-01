@@ -10,7 +10,7 @@ const notificationSchema = new mongoose.Schema({
         enum: ['new-applicant', 'internship-started', 'deadline-reminder', 'general'],
         default: 'general'
     },
-    sourceKey: { type: String, default: '', index: true },
+    sourceKey: { type: String, index: true },
     type: { 
         type: String, 
         enum: ['info', 'success', 'warning', 'error'], 

@@ -8,6 +8,8 @@ export const employerAPI = {
   getActivityFeed: (params = {}) => api.get('/dashboard/employer/activity', { params }),
   downloadAnalyticsPdf: (params = {}) => api.get('/dashboard/employer/reports/pdf', { params, responseType: 'blob' }),
   createInternship: (payload) => api.post('/internships', payload),
+  getInternship: (id) => api.get(`/internships/${id}`),
+  updateInternship: (id, payload) => api.put(`/internships/${id}`, payload),
   getApplicants: (params = {}) => api.get('/application/employer/all', { params }),
   getActiveInterns: () => api.get('/application/employer/active'),
   getEvaluationTargets: () => api.get('/evaluation/targets'),

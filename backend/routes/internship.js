@@ -30,13 +30,28 @@ router.post('/', auth, async (req, res) => {
     try {
         const title = String(req.body.title || '').trim();
         const description = String(req.body.description || '').trim();
-        const duration = String(req.body.duration || '').trim();
+        let duration = String(req.body.duration || '').trim();
         const startDate = req.body.startDate ? new Date(req.body.startDate) : null;
         const endDate = req.body.endDate ? new Date(req.body.endDate) : null;
         const studentsNeeded = Number(req.body.studentsNeeded);
 
+        // Auto-calculate duration if missing but dates are present
+        if (!duration && startDate && endDate && !Number.isNaN(startDate.getTime()) && !Number.isNaN(endDate.getTime())) {
+            const diffMs = endDate - startDate;
+            if (diffMs >= 0) {
+                const diffDays = diffMs / (1000 * 60 * 60 * 24);
+                const months = Math.round(diffDays / 30);
+                if (months >= 1) {
+                    duration = `${months} month${months > 1 ? 's' : ''}`;
+                } else {
+                    const weeks = Math.round(diffDays / 7);
+                    duration = `${weeks} week${weeks > 1 ? 's' : ''}`;
+                }
+            }
+        }
+
         if (!title || !description || !duration || !startDate || !endDate || !Number.isInteger(studentsNeeded) || studentsNeeded < 1) {
-            return res.status(400).json({ message: 'Please provide title, description, duration, startDate, endDate and a valid studentsNeeded value.' });
+            return res.status(400).json({ message: 'Please provide title, description, duration (or start/end dates), and a valid studentsNeeded value.' });
         }
 
         if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || endDate < startDate) {
@@ -57,6 +72,13 @@ router.post('/', auth, async (req, res) => {
             deadline: req.body.deadline || endDate,
             studentsNeeded,
             requiredSkills: skills,
+            targetDepartments: req.body.targetDepartments || [],
+            targetBatch: req.body.targetBatch || 'Graduating Class',
+            workModality: req.body.workModality || 'On-site',
+            compensationType: req.body.compensationType || 'Unpaid',
+            minCgpa: Number(req.body.minCgpa) || 0,
+            interviewRequired: req.body.interviewRequired === true || req.body.interviewRequired === 'true',
+            location: req.body.location || 'Addis Ababa',
             programType: 'Internship Program',
             trainingFocus: true,
             companyId: req.user.id,
@@ -92,32 +114,136 @@ router.post('/', auth, async (req, res) => {
 });
 
 // 2. ለተማሪዎች (ክፍት የሆኑትን ብቻ)
+// 🔍 GET Dynamic Filters (Majors, Locations, Durations)
+router.get('/filters', async (req, res) => {
+    try {
+        const [departments, locations, durations] = await Promise.all([
+            Internship.distinct('targetDepartments', { status: 'Open' }),
+            Internship.distinct('location', { status: 'Open' }),
+            Internship.distinct('duration', { status: 'Open' })
+        ]);
+
+        const normalize = (list) => {
+            const normalized = list
+                .filter(Boolean)
+                .map(s => s.trim().toLowerCase())
+                .map(s => s.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' '));
+            return [...new Set(normalized)].sort();
+        };
+
+        return res.json({
+            departments: normalize(departments),
+            locations: normalize(locations),
+            durations: normalize(durations)
+        });
+    } catch (err) {
+        console.error("Filter Fetch Error:", err);
+        res.status(500).send("Error fetching filters.");
+    }
+});
+
 router.get('/', async (req, res) => {
     try {
         const q = String(req.query.q || '').trim();
         const status = String(req.query.status || 'Open').trim();
-        const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 100);
+        const location = String(req.query.location || '').trim();
+        const isPaid = req.query.isPaid;
+        const duration = String(req.query.duration || '').trim();
+        const major = String(req.query.major || '').trim();
+        const limit = Math.min(Math.max(Number(req.query.limit) || 12, 1), 100);
+        const page = Math.max(Number(req.query.page) || 1, 1);
+        const skip = (page - 1) * limit;
 
         const filter = {};
         if (status && status.toLowerCase() !== 'all') {
             filter.status = status;
         }
 
-        if (q) {
-            const pattern = new RegExp(escapeRegex(q), 'i');
-            filter.$or = [
-                { title: pattern },
-                { description: pattern },
-                { location: pattern },
-                { duration: pattern },
-                { requirements: pattern },
-                { requiredSkills: pattern }
-            ];
+        if (location && location.toLowerCase() !== 'any location') {
+            filter.location = new RegExp(escapeRegex(location), 'i');
         }
 
-        const internships = await Internship.find(filter).sort({ createdAt: -1 }).limit(limit);
-        return res.json(internships);
-    } catch (err) { res.status(500).send("Error fetching internships."); }
+        if (isPaid !== undefined && isPaid !== 'all' && isPaid !== '') {
+            filter.isPaid = isPaid === 'true';
+        }
+
+        if (duration && duration.toLowerCase() !== 'all' && duration.toLowerCase() !== 'any duration') {
+            filter.duration = new RegExp(escapeRegex(duration), 'i');
+        }
+
+        if (major) {
+            filter.targetDepartments = new RegExp(`^${escapeRegex(major)}$`, 'i');
+        }
+
+        if (q) {
+            const pattern = new RegExp(escapeRegex(q), 'i');
+            
+            // Search for company names first
+            const matchingCompanies = await User.find({
+                role: 'employer',
+                $or: [
+                    { name: pattern },
+                    { fullName: pattern }
+                ]
+            }).select('_id');
+            const companyIds = matchingCompanies.map(c => c._id);
+
+            const searchFilter = {
+                $or: [
+                    { title: pattern },
+                    { description: pattern },
+                    { location: pattern },
+                    { duration: pattern },
+                    { requiredSkills: pattern },
+                    { companyId: { $in: companyIds } }
+                ]
+            };
+
+            if (filter.$and) {
+                filter.$and.push(searchFilter);
+            } else {
+                filter.$or = searchFilter.$or;
+            }
+        }
+
+        const sortKey = String(req.query.sort || 'newest').toLowerCase();
+        let sortObj = { createdAt: -1 }; // Default: Newest
+
+        const sortMap = {
+            'newest': { createdAt: -1 },
+            'oldest': { createdAt: 1 },
+            'deadline': { deadline: 1 },
+            'alphabetical': { title: 1 },
+            'seats': { studentsNeeded: -1 }
+        };
+
+        if (sortMap[sortKey]) {
+            sortObj = sortMap[sortKey];
+        }
+
+        let query = Internship.find(filter)
+            .populate('companyId', 'name fullName profileImage')
+            .sort(sortObj);
+
+        if (sortKey === 'alphabetical') {
+            query = query.collation({ locale: 'en', strength: 2 });
+        }
+
+        const [internships, total] = await Promise.all([
+            query.skip(skip).limit(limit),
+            Internship.countDocuments(filter)
+        ]);
+
+        return res.json({
+            items: internships,
+            total,
+            page,
+            totalPages: Math.ceil(total / limit)
+        });
+    } catch (err) { 
+        console.error("Internship Fetch Error:", err);
+        res.status(500).send("Error fetching internships."); 
+    }
 });
 
 // 2.1 Search suggestions for internship titles
@@ -149,15 +275,143 @@ router.get('/suggestions', async (req, res) => {
 router.get('/my-internships', auth, async (req, res) => {
     if (String(req.user.role || '').toLowerCase() !== 'employer') return res.status(403).json({ msg: "Access Denied." });
     try {
-        const myInternships = await Internship.find({ companyId: req.user.id }).sort({ createdAt: -1 });
+        const mongoose = require('mongoose');
+        const myInternships = await Internship.aggregate([
+            { $match: { companyId: new mongoose.Types.ObjectId(req.user.id) } },
+            {
+                $lookup: {
+                    from: 'applications',
+                    localField: '_id',
+                    foreignField: 'internshipId',
+                    as: 'applicants'
+                }
+            },
+            {
+                $addFields: {
+                    applicantCount: { $size: '$applicants' }
+                }
+            },
+            { $project: { applicants: 0 } },
+            { $sort: { createdAt: -1 } }
+        ]);
         res.json(myInternships);
-    } catch (err) { res.status(500).send("Error fetching your internships."); }
+    } catch (err) {
+        console.error(err);
+        res.status(500).send("Error fetching your internships.");
+    }
+});
+
+// 3.1 Get Single Internship by ID
+router.get('/:id', async (req, res) => {
+    try {
+        const mongoose = require('mongoose');
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            return res.status(400).json({ message: 'Invalid Internship ID format.' });
+        }
+        const internship = await Internship.findById(req.params.id).populate('companyId', 'name fullName profileImage');
+        if (!internship) return res.status(404).json({ message: 'Internship not found.' });
+        res.json(internship);
+    } catch (err) {
+        res.status(500).json({ message: 'Error fetching internship details.' });
+    }
+});
+
+// 3.2 Update General Internship Details
+router.put('/:id', auth, async (req, res) => {
+    if (String(req.user.role || '').toLowerCase() !== 'employer') return res.status(403).json({ msg: "Access Denied." });
+    try {
+        const internship = await Internship.findById(req.params.id);
+        if (!internship) return res.status(404).json({ message: 'Internship not found.' });
+        if (String(internship.companyId) !== String(req.user.id)) return res.status(403).json({ message: 'Unauthorized: You can only update your own internships.' });
+
+        const title = String(req.body.title || '').trim();
+        const description = String(req.body.description || '').trim();
+        const studentsNeeded = Number(req.body.studentsNeeded);
+
+        if (!title || !description || !Number.isInteger(studentsNeeded) || studentsNeeded < 1) {
+            return res.status(400).json({ message: 'Please provide title, description, and a valid studentsNeeded value.' });
+        }
+
+        const skills = Array.isArray(req.body.requiredSkills)
+            ? req.body.requiredSkills.map((skill) => String(skill).trim()).filter(Boolean)
+            : String(req.body.requiredSkills || '').split(',').map((skill) => skill.trim()).filter(Boolean);
+
+        Object.assign(internship, {
+            ...req.body,
+            title,
+            description,
+            studentsNeeded,
+            requiredSkills: skills,
+            // Deadline might be updated, if not use current
+            deadline: req.body.deadline || internship.deadline
+        });
+
+        await internship.save();
+        await writeActivity(req, 'COMPANY_UPDATED_INTERNSHIP', `Employer=${req.user.id} Internship=${internship._id}`);
+
+        res.json(internship);
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to update internship details.' });
+    }
 });
 
 // 4. Update Status (Publish/Archive)
 router.put('/:id/status', auth, async (req, res) => {
     try {
-        const internship = await Internship.findByIdAndUpdate(req.params.id, { status: req.body.status }, { returnDocument: 'after' });
+        const { status } = req.body;
+        const internship = await Internship.findByIdAndUpdate(req.params.id, { status }, { returnDocument: 'after' }).populate('companyId', 'name fullName');
+        
+        if (status === 'Open') {
+            // 🚀 Send Email Alerts to Students
+            const { sendEmail } = require('../utils/mailer');
+            const UserPreferences = require('../models/UserPreferences');
+            
+            try {
+                const students = await User.find({ role: { $in: ['student', 'Student'] } }).select('_id email name fullName').lean();
+                const studentIds = students.map(s => s._id);
+                
+                // Filter out only those who specifically disabled emailAlerts
+                const optOutPrefs = await UserPreferences.find({ 
+                    userId: { $in: studentIds },
+                    'notifications.emailAlerts': false 
+                }).select('userId').lean();
+                
+                const optOutIds = new Set(optOutPrefs.map(p => String(p.userId)));
+                const targets = students.filter(s => !optOutIds.has(String(s._id)));
+
+                if (targets.length) {
+                    const companyName = internship.companyId?.name || internship.companyId?.fullName || 'A Partner Company';
+                    
+                    // Send emails in background
+                    targets.forEach(student => {
+                        sendEmail({
+                            to: student.email,
+                            subject: `New Opportunity: ${internship.title}`,
+                            html: `
+                                <div style="font-family: sans-serif; padding: 20px; color: #333;">
+                                    <h2 style="color: #0891b2;">New Internship Available!</h2>
+                                    <p>Hello ${student.name || student.fullName},</p>
+                                    <p>A new internship opportunity has been posted by <strong>${companyName}</strong>:</p>
+                                    <div style="background: #f0f9ff; padding: 15px; border-radius: 10px; border: 1px solid #bae6fd; margin: 20px 0;">
+                                        <h3 style="margin: 0;">${internship.title}</h3>
+                                        <p style="margin: 5px 0; font-size: 14px;">Location: ${internship.location || 'Remote'}</p>
+                                        <p style="margin: 10px 0;">${internship.description.substring(0, 150)}...</p>
+                                    </div>
+                                    <p>Log in to your dashboard to view more details and apply.</p>
+                                    <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/student/internships" 
+                                       style="display: inline-block; background: #0891b2; color: white; padding: 12px 25px; border-radius: 50px; text-decoration: none; font-weight: bold; margin-top: 10px;">
+                                        View Internship
+                                    </a>
+                                </div>
+                            `
+                        });
+                    });
+                }
+            } catch (err) {
+                console.error("Email notification fan-out failed:", err);
+            }
+        }
+
         res.json(internship);
     } catch (err) { res.status(500).send("Update failed."); }
 });

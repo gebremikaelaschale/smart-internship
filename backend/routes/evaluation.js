@@ -258,13 +258,52 @@ router.get('/student/paper', auth, async (req, res) => {
             internshipPeriod,
             internshipLocation
         });
-    } catch (error) {
-        const fallbackStudentName = req?.user?.name || 'Student';
-        return sendStudentEvaluationPdf(res, {
-            generatedAt: new Date(),
-            studentName: fallbackStudentName,
-            note: 'Some profile fields could not be loaded. This fallback paper is still valid for supervisor evaluation.'
-        });
+    } catch (err) {
+        console.error('Error generating evaluation PDF:', err);
+        res.status(500).json({ message: 'Failed to generate evaluation PDF.' });
+    }
+});
+
+// ─── Admin: Get all evaluations (with scope) ────────────────────────────────
+router.get('/admin/all', auth, async (req, res) => {
+    try {
+        const role = String(req.user?.role || req.user?.adminType || '').toLowerCase();
+        const isGovernance = ['admin', 'superadmin', 'dean', 'hod', 'collegeadmin', 'deptadmin'].includes(role);
+
+        if (!isGovernance) {
+            return res.status(403).json({ message: 'Unauthorized. Governance access required.' });
+        }
+
+        const filter = {};
+        
+        // Apply scope if not superadmin
+        if (role !== 'superadmin' && role !== 'admin') {
+            const user = await User.findById(req.user.id).select('college department').lean();
+            if (user?.college) {
+                // We need to filter evaluations by students in that college
+                const studentIds = await User.find({ college: user.college }).distinct('_id');
+                filter.studentId = { $in: studentIds };
+                
+                if (role.includes('dept') || role === 'hod') {
+                    if (user?.department) {
+                        const deptStudentIds = await User.find({ college: user.college, department: user.department }).distinct('_id');
+                        filter.studentId = { $in: deptStudentIds };
+                    }
+                }
+            }
+        }
+
+        const evaluations = await Evaluation.find(filter)
+            .populate('studentId', 'fullName name email college department')
+            .populate('supervisorId', 'fullName name')
+            .populate('internshipId', 'title companyId')
+            .sort({ createdAt: -1 })
+            .lean();
+
+        res.json(evaluations);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'Failed to load evaluations.' });
     }
 });
 

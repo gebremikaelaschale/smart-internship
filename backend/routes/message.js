@@ -4,6 +4,8 @@ const router = express.Router();
 const auth = require('../middleware/authMiddleware');
 const Message = require('../models/Message');
 const User = require('../models/User');
+const Profile = require('../models/Profile');
+const CompanyProfile = require('../models/CompanyProfile');
 const ChatRoom = require('../models/ChatRoom');
 const CallSession = require('../models/CallSession');
 const { normalizeRole } = require('../utils/governanceRoles');
@@ -36,13 +38,29 @@ async function populateMessage(messageId) {
         .lean();
 }
 
+// Lightweight online status endpoint - returns isOnline & lastSeen for given user IDs
+router.get('/online-status', auth, async (req, res) => {
+    try {
+        const ids = String(req.query.ids || '').split(',').filter(id => mongoose.Types.ObjectId.isValid(id.trim()));
+        if (!ids.length) return res.json({});
+        const users = await User.find({ _id: { $in: ids } }, 'isOnline lastSeen').lean();
+        const result = {};
+        users.forEach(u => {
+            result[String(u._id)] = { isOnline: Boolean(u.isOnline), lastSeen: u.lastSeen || null };
+        });
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to get online statuses.' });
+    }
+});
+
 router.get('/contacts', auth, async (req, res) => {
     try {
         const role = String(req.query.role || 'all').trim().toLowerCase();
         const search = String(req.query.search || '').trim();
         const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
 
-        const filter = { _id: { $ne: req.user.id } };
+        const filter = { _id: { $ne: asObjectId(req.user.id) } };
         const roleVariants = getRoleVariants(role);
         if (role !== 'all' && roleVariants.length > 0) {
             filter.role = { $in: roleVariants };
@@ -52,52 +70,97 @@ router.get('/contacts', auth, async (req, res) => {
             filter.$or = [{ name: regex }, { fullName: regex }, { email: regex }, { department: regex }, { college: regex }];
         }
 
-        const users = await User.find(filter)
-            .select('name fullName email role department college')
-            .sort({ fullName: 1, name: 1 })
-            .limit(limit)
-            .lean();
-
-        const contactIds = users.map((user) => String(user._id));
-        const recentMessages = await Message.find({
-            conversationType: 'direct',
-            $or: [
-                { senderId: req.user.id, receiverId: { $in: contactIds } },
-                { receiverId: req.user.id, senderId: { $in: contactIds } }
-            ]
-        })
-            .sort({ createdAt: -1 })
-            .lean();
-
-        const latestByContact = new Map();
-        for (const message of recentMessages) {
-            const otherId = String(message.senderId) === String(req.user.id)
-                ? String(message.receiverId)
-                : String(message.senderId);
-            if (!latestByContact.has(otherId)) {
-                latestByContact.set(otherId, message);
+        const items = await User.aggregate([
+            { $match: filter },
+            { $sort: { fullName: 1, name: 1 } },
+            { $limit: limit },
+            {
+                $lookup: {
+                    from: 'profiles',
+                    localField: '_id',
+                    foreignField: 'userId',
+                    as: 'profileData'
+                }
+            },
+            {
+                $lookup: {
+                    from: 'companyprofiles',
+                    localField: '_id',
+                    foreignField: 'user',
+                    as: 'companyData'
+                }
+            },
+            {
+                $lookup: {
+                    from: 'messages',
+                    let: { contactId: '$_id' },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ['$conversationType', 'direct'] },
+                                        { $not: { $in: [asObjectId(req.user.id), { $ifNull: ['$deletedForUsers', []] }] } },
+                                        {
+                                            $or: [
+                                                { $and: [{ $eq: ['$senderId', '$$contactId'] }, { $eq: ['$receiverId', asObjectId(req.user.id)] }] },
+                                                { $and: [{ $eq: ['$senderId', asObjectId(req.user.id)] }, { $eq: ['$receiverId', '$$contactId'] }] }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                        { $sort: { createdAt: -1 } },
+                        { $limit: 1 }
+                    ],
+                    as: 'lastMsgData'
+                }
+            },
+            {
+                $project: {
+                    _id: 1,
+                    name: 1,
+                    fullName: 1,
+                    email: 1,
+                    role: 1,
+                    department: 1,
+                    college: 1,
+                    isOnline: 1,
+                    lastSeen: 1,
+                    avatar: {
+                        $cond: [
+                            { $gt: [{ $size: '$companyData' }, 0] },
+                            { $arrayElemAt: ['$companyData.logo', 0] },
+                            {
+                                $cond: [
+                                    { $gt: [{ $size: '$profileData' }, 0] },
+                                    { $arrayElemAt: ['$profileData.profilePicUrl', 0] },
+                                    null
+                                ]
+                            }
+                        ]
+                    },
+                    lastMessage: { $arrayElemAt: ['$lastMsgData', 0] }
+                }
             }
-        }
+        ]);
 
-        const unreadCounts = await Message.aggregate([
-            { $match: { conversationType: 'direct', receiverId: asObjectId(req.user.id), isRead: false } },
-            { $group: { _id: '$senderId', count: { $sum: 1 } } }
-        ]).catch(() => []);
-        const unreadMap = new Map(unreadCounts.map((item) => [String(item._id), item.count]));
-
-        const items = users.map((user) => ({
-            id: String(user._id),
+        const result = items.map(u => ({
+            ...u,
+            id: String(u._id),
+            _id: String(u._id),
             type: 'direct',
-            name: user.fullName || user.name || user.email,
-            email: user.email,
-            role: normalizeRole(user.role),
-            department: user.department || '',
-            college: user.college || '',
-            lastMessage: latestByContact.get(String(user._id)) || null,
-            unreadCount: unreadMap.get(String(user._id)) || 0
+            role: normalizeRole(u.role),
+            lastMessage: u.lastMessage ? {
+                content: u.lastMessage.content,
+                createdAt: u.lastMessage.createdAt,
+                senderId: String(u.lastMessage.senderId)
+            } : null,
+            unreadCount: 0 
         }));
 
-        res.json(items);
+        res.json(result);
     } catch (error) {
         res.status(500).json({ message: 'Failed to load chat contacts.' });
     }
@@ -135,7 +198,8 @@ router.get('/rooms', auth, async (req, res) => {
                     roomId: { $in: roomIds },
                     senderId: { $ne: asObjectId(req.user.id) },
                     seenBy: { $nin: [asObjectId(req.user.id)] },
-                    deletedForEveryone: false
+                    deletedForEveryone: false,
+                    deletedForUsers: { $nin: [asObjectId(req.user.id)] }
                 }
             },
             { $group: { _id: '$roomId', count: { $sum: 1 } } }
@@ -284,9 +348,10 @@ router.get('/history/direct/:otherUserId', auth, async (req, res) => {
         const before = req.query.before ? new Date(req.query.before) : null;
         const query = {
             conversationType: 'direct',
+            deletedForUsers: { $nin: [asObjectId(req.user.id)] },
             $or: [
-                { senderId: req.user.id, receiverId: otherUserId },
-                { senderId: otherUserId, receiverId: req.user.id }
+                { senderId: asObjectId(req.user.id), receiverId: asObjectId(otherUserId) },
+                { senderId: asObjectId(otherUserId), receiverId: asObjectId(req.user.id) }
             ]
         };
 
@@ -321,7 +386,8 @@ router.get('/history/room/:roomId', auth, async (req, res) => {
         const before = req.query.before ? new Date(req.query.before) : null;
         const query = {
             roomId,
-            conversationType: { $in: ['group', 'channel'] }
+            conversationType: { $in: ['group', 'channel'] },
+            deletedForUsers: { $nin: [asObjectId(req.user.id)] }
         };
 
         if (before && !Number.isNaN(before.getTime())) {
@@ -388,6 +454,37 @@ router.post('/', auth, async (req, res) => {
             }
         }
 
+        // Handle reply preview creation
+        let replyPreview = null;
+        if (replyTo) {
+            const originalMessage = await Message.findById(replyTo).populate('senderId', 'fullName name');
+            if (originalMessage) {
+                replyPreview = {
+                    content: originalMessage.content.substring(0, 100) + (originalMessage.content.length > 100 ? '...' : ''),
+                    senderName: originalMessage.senderId?.fullName || originalMessage.senderId?.name || 'Unknown',
+                    attachmentType: originalMessage.attachment?.mimeType || ''
+                };
+            }
+        }
+
+        // Enhanced attachment handling
+        let processedAttachment = attachment;
+        if (attachment && typeof attachment === 'object') {
+            processedAttachment = {
+                name: String(attachment.name || '').trim(),
+                type: String(attachment.type || '').trim(),
+                mimeType: String(attachment.mimeType || '').trim(),
+                size: Number(attachment.size || 0),
+                url: String(attachment.url || '').trim(),
+                thumbnailUrl: String(attachment.thumbnailUrl || '').trim(),
+                dimensions: {
+                    width: Number(attachment.dimensions?.width || 0),
+                    height: Number(attachment.dimensions?.height || 0)
+                },
+                duration: Number(attachment.duration || 0)
+            };
+        }
+
         const payload = {
             senderId: req.user.id,
             receiverId: receiverId || req.user.id,
@@ -400,8 +497,9 @@ router.post('/', auth, async (req, res) => {
             callMedia,
             signalType,
             signalData,
-            attachment,
+            attachment: processedAttachment,
             replyTo: replyTo || undefined,
+            replyPreview,
             forwardedFrom: forwardedFrom || undefined,
             deliveredTo: [req.user.id],
             seenBy: [req.user.id],
@@ -441,20 +539,45 @@ router.patch('/:id/edit', auth, async (req, res) => {
         if (String(message.senderId) !== String(req.user.id)) return res.status(403).json({ message: 'Only sender can edit message.' });
         if (message.deletedForEveryone) return res.status(400).json({ message: 'Cannot edit deleted message.' });
 
+        // Store original content if not already stored
+        if (!message.originalContent) {
+            message.originalContent = message.content;
+        }
+        
         message.content = content;
         message.editedAt = new Date();
+        message.isEdited = true; // Add isEdited flag
         await message.save();
 
         const populated = await populateMessage(message._id);
         const io = req.app.get('io');
+        
+        // Emit enhanced edit event with full edit information
+        const editPayload = {
+            ...populated,
+            isEdited: true,
+            editEvent: {
+                editedAt: message.editedAt,
+                originalContent: message.originalContent,
+                newContent: content,
+                editedBy: String(req.user.id),
+                messageId: String(message._id)
+            }
+        };
+        
+        // Broadcast to all relevant participants
         if (message.roomId) {
-            emitSocket(io, `room:${message.roomId}`, 'message:updated', populated);
+            emitSocket(io, `room:${message.roomId}`, 'message:edited', editPayload);
         } else {
-            emitSocket(io, `user:${message.receiverId}`, 'message:updated', populated);
-            emitSocket(io, `user:${message.senderId}`, 'message:updated', populated);
+            emitSocket(io, `user:${message.receiverId}`, 'message:edited', editPayload);
+            emitSocket(io, `user:${message.senderId}`, 'message:edited', editPayload);
         }
 
-        res.json(populated);
+        res.json({
+            ...populated,
+            isEdited: true,
+            editEvent: editPayload.editEvent
+        });
     } catch (error) {
         res.status(500).json({ message: 'Failed to edit message.' });
     }
@@ -463,39 +586,46 @@ router.patch('/:id/edit', auth, async (req, res) => {
 router.delete('/:id', auth, async (req, res) => {
     try {
         const id = String(req.params.id || '').trim();
-        const forEveryone = Boolean(req.query.forEveryone === 'true');
+        const hardDelete = Boolean(req.query.hardDelete === 'true');
 
         const message = await Message.findById(id);
         if (!message) return res.status(404).json({ message: 'Message not found.' });
 
         const isSender = String(message.senderId) === String(req.user.id);
-        if (forEveryone && !isSender) return res.status(403).json({ message: 'Only sender can delete for everyone.' });
-
-        if (forEveryone) {
-            message.deletedForEveryone = true;
-            message.deletedAt = new Date();
-            message.content = 'This message was deleted.';
-            message.attachment = { name: '', type: '', size: 0, url: '' };
-            await message.save();
+        const isReceiver = String(message.receiverId) === String(req.user.id);
+        
+        if (!isSender && !isReceiver) {
+            return res.status(403).json({ message: 'You can only delete messages in your own conversations.' });
         }
 
-        const populated = await populateMessage(message._id);
+        // COMPLETELY ERASE and REMOVE logic
+        const deleteForEveryone = req.query.forEveryone === 'true';
         const io = req.app.get('io');
-        const payload = {
-            id: String(message._id),
-            forEveryone,
-            message: populated,
-            userId: String(req.user.id)
-        };
+        const payload = { id: id, messageId: id, deleteForEveryone };
 
-        if (message.roomId) {
-            emitSocket(io, `room:${message.roomId}`, 'message:deleted', payload);
+        if (deleteForEveryone) {
+            // HARD DELETE for everyone
+            await Message.findByIdAndDelete(id);
+            
+            if (message.roomId) {
+                emitSocket(io, `room:${message.roomId}`, 'message:deleted', payload);
+            } else {
+                emitSocket(io, `user:${message.receiverId}`, 'message:deleted', payload);
+                emitSocket(io, `user:${message.senderId}`, 'message:deleted', payload);
+            }
+            return res.json({ message: 'Message erased for everyone.', data: payload });
         } else {
-            emitSocket(io, `user:${message.receiverId}`, 'message:deleted', payload);
-            emitSocket(io, `user:${message.senderId}`, 'message:deleted', payload);
+            // DELETE FOR ME: Add user to deletedForUsers list
+            if (!message.deletedForUsers.includes(req.user.id)) {
+                message.deletedForUsers.push(req.user.id);
+                await message.save();
+            }
+            
+            // Only emit to the person who deleted it
+            emitSocket(io, `user:${req.user.id}`, 'message:deleted', payload);
+            
+            return res.json({ message: 'Message erased for you.', data: payload });
         }
-
-        res.json({ message: 'Message delete processed.', data: payload });
     } catch (error) {
         res.status(500).json({ message: 'Failed to delete message.' });
     }
@@ -599,8 +729,8 @@ router.put('/seen/direct/:otherUserId', auth, async (req, res) => {
         if (!otherUserId) return res.status(400).json({ message: 'otherUserId is required.' });
 
         await Message.updateMany(
-            { conversationType: 'direct', senderId: otherUserId, receiverId: req.user.id, seenBy: { $nin: [req.user.id] } },
-            { $addToSet: { seenBy: req.user.id, deliveredTo: req.user.id }, $set: { isRead: true } }
+            { conversationType: 'direct', senderId: asObjectId(otherUserId), receiverId: asObjectId(req.user.id), seenBy: { $nin: [asObjectId(req.user.id)] } },
+            { $addToSet: { seenBy: asObjectId(req.user.id), deliveredTo: asObjectId(req.user.id) }, $set: { isRead: true } }
         );
 
         const io = req.app.get('io');
@@ -616,9 +746,12 @@ router.put('/seen/room/:roomId', auth, async (req, res) => {
         const roomId = String(req.params.roomId || '').trim();
         if (!roomId) return res.status(400).json({ message: 'roomId is required.' });
 
-        await Message.updateMany(
+        const updatedMessages = await Message.updateMany(
             { roomId, conversationType: { $in: ['group', 'channel'] }, seenBy: { $nin: [req.user.id] }, senderId: { $ne: req.user.id } },
-            { $addToSet: { seenBy: req.user.id, deliveredTo: req.user.id } }
+            { 
+                $addToSet: { seenBy: req.user.id, deliveredTo: req.user.id },
+                $set: { isRead: true, status: 'read', readAt: new Date() }
+            }
         );
 
         const io = req.app.get('io');
@@ -626,6 +759,126 @@ router.put('/seen/room/:roomId', auth, async (req, res) => {
         res.json({ message: 'Room conversation marked seen.' });
     } catch (error) {
         res.status(500).json({ message: 'Failed to mark seen.' });
+    }
+});
+
+// Enhanced status update endpoints for proper read receipts
+router.put('/status/delivered/:messageId', auth, async (req, res) => {
+    try {
+        const messageId = String(req.params.messageId || '').trim();
+        if (!messageId) return res.status(400).json({ message: 'messageId is required.' });
+
+        const message = await Message.findByIdAndUpdate(
+            messageId,
+            { 
+                $addToSet: { deliveredTo: req.user.id },
+                $set: { status: 'delivered', deliveredAt: new Date() }
+            },
+            { new: true }
+        ).populate('senderId', 'name fullName email role');
+
+        if (!message) return res.status(404).json({ message: 'Message not found.' });
+
+        const io = req.app.get('io');
+        emitSocket(io, `user:${message.senderId._id}`, 'message:delivered', {
+            messageId: String(message._id),
+            status: 'delivered',
+            deliveredAt: message.deliveredAt,
+            deliveredBy: String(req.user.id)
+        });
+
+        res.json({ message: 'Message marked as delivered.', status: 'delivered' });
+    } catch (error) {
+        res.status(500).json({ message: 'Failed to mark as delivered.' });
+    }
+});
+
+router.put('/status/read/:messageId', auth, async (req, res) => {
+    try {
+        const messageId = String(req.params.messageId || '').trim();
+        if (!messageId) return res.status(400).json({ message: 'messageId is required.' });
+
+        const message = await Message.findByIdAndUpdate(
+            messageId,
+            { 
+                $addToSet: { seenBy: req.user.id, deliveredTo: req.user.id },
+                $set: { isRead: true, status: 'read', readAt: new Date() }
+            },
+            { new: true }
+        ).populate('senderId', 'name fullName email role');
+
+        if (!message) return res.status(404).json({ message: 'Message not found.' });
+
+        const io = req.app.get('io');
+        emitSocket(io, `user:${message.senderId._id}`, 'message:read', {
+            messageId: String(message._id),
+            status: 'read',
+            readAt: message.readAt,
+            readBy: String(req.user.id)
+        });
+
+        res.json({ message: 'Message marked as read.', status: 'read' });
+    } catch (error) {
+        res.status(500).json({ message: 'Failed to mark as read.' });
+    }
+});
+
+router.put('/status/batch-read', auth, async (req, res) => {
+    try {
+        const { messageIds = [], roomId = null, otherUserId = null } = req.body;
+        
+        if (!Array.isArray(messageIds) || messageIds.length === 0) {
+            return res.status(400).json({ message: 'messageIds array is required.' });
+        }
+
+        const updateQuery = {
+            _id: { $in: messageIds.map(id => asObjectId(id)) },
+            senderId: { $ne: asObjectId(req.user.id) },
+            seenBy: { $nin: [asObjectId(req.user.id)] }
+        };
+
+        if (roomId) {
+            updateQuery.roomId = asObjectId(roomId);
+        } else if (otherUserId) {
+            updateQuery.conversationType = 'direct';
+            updateQuery.receiverId = asObjectId(req.user.id);
+            updateQuery.senderId = asObjectId(otherUserId);
+        }
+
+        const updatedMessages = await Message.updateMany(
+            updateQuery,
+            { 
+                $addToSet: { seenBy: asObjectId(req.user.id), deliveredTo: asObjectId(req.user.id) },
+                $set: { isRead: true, status: 'read', readAt: new Date() }
+            }
+        );
+
+        // Get the updated messages to emit proper socket events
+        const messages = await Message.find({ _id: { $in: messageIds.map(id => asObjectId(id)) } })
+            .populate('senderId', 'name fullName email role')
+            .lean();
+
+        const io = req.app.get('io');
+        const senderIds = [...new Set(messages.map(msg => String(msg.senderId._id)))];
+        
+        senderIds.forEach(senderId => {
+            const senderMessages = messages.filter(msg => String(msg.senderId._id) === senderId);
+            emitSocket(io, `user:${senderId}`, 'message:batch-read', {
+                messageIds: senderMessages.map(msg => String(msg._id)),
+                readBy: String(req.user.id),
+                readAt: new Date(),
+                roomId,
+                otherUserId
+            });
+        });
+
+        res.json({ 
+            message: 'Messages marked as read.', 
+            updatedCount: updatedMessages.modifiedCount,
+            status: 'read'
+        });
+    } catch (error) {
+        res.status(500).json({ message: 'Failed to mark messages as read.' });
     }
 });
 

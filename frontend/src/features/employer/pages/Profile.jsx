@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import Select from 'react-select';
 import Card from '@/components/ui/Card';
 import Loader from '@/components/common/Loader';
 import ErrorMessage from '@/components/common/ErrorMessage';
@@ -9,6 +10,33 @@ import { employerAPI } from '../employerAPI';
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const ACCEPTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 
+// Resolve backend origin for serving uploaded files.
+// Priority: VITE_API_BASE_URL env → window.location-based fallback → relative path (Vite proxy)
+const BACKEND_ORIGIN = (() => {
+  const raw = import.meta.env.VITE_API_BASE_URL || '';
+  if (raw) {
+    try {
+      const u = new URL(raw);
+      return u.origin; // e.g. "http://localhost:5000"
+    } catch { /* ignore */ }
+  }
+  // Fallback: if frontend is on port 5173/3000, backend is on 5000
+  if (typeof window !== 'undefined') {
+    const { protocol, hostname } = window.location;
+    return `${protocol}//${hostname}:5000`;
+  }
+  return 'http://localhost:5000';
+})();
+
+/** Build a full URL for a server-side file path like /uploads/company_docs/doc-xxx.pdf */
+const resolveFileUrl = (serverPath) => {
+  if (!serverPath) return '';
+  if (serverPath.startsWith('data:')) return serverPath; // DataURL - already complete
+  if (serverPath.startsWith('http')) return serverPath;  // Already absolute
+  // serverPath is like /uploads/company_docs/doc-xxx.pdf → prepend backend origin
+  return `${BACKEND_ORIGIN}${serverPath}`;
+};
+
 function getInitials(name = '') {
   return name
     .split(' ')
@@ -18,10 +46,103 @@ function getInitials(name = '') {
     .join('');
 }
 
+const DEPARTMENT_OPTIONS = [
+  {
+    label: 'Engineering & Technology',
+    options: [
+      { value: 'Computer Science', label: 'Computer Science' },
+      { value: 'Software Engineering', label: 'Software Engineering' },
+      { value: 'Information Systems', label: 'Information Systems' },
+      { value: 'Information Technology (IT)', label: 'Information Technology (IT)' },
+      { value: 'Civil Engineering', label: 'Civil Engineering' },
+      { value: 'Electrical & Computer Engineering', label: 'Electrical & Computer Engineering' },
+      { value: 'Mechanical Engineering', label: 'Mechanical Engineering' },
+      { value: 'Architecture', label: 'Architecture' },
+      { value: 'Hydraulic & Water Resources Engineering', label: 'Hydraulic & Water Resources Engineering' },
+      { value: 'Construction Technology & Management', label: 'Construction Technology & Management' },
+      { value: 'Chemical Engineering', label: 'Chemical Engineering' }
+    ]
+  },
+  {
+    label: 'Business & Economics',
+    options: [
+      { value: 'Accounting & Finance', label: 'Accounting & Finance' },
+      { value: 'Business Management', label: 'Business Management' },
+      { value: 'Economics', label: 'Economics' },
+      { value: 'Marketing Management', label: 'Marketing Management' },
+      { value: 'Public Administration', label: 'Public Administration' },
+      { value: 'Logistics & Supply Chain Management', label: 'Logistics & Supply Chain Management' },
+      { value: 'Tourism & Hotel Management', label: 'Tourism & Hotel Management' }
+    ]
+  },
+  {
+    label: 'Health & Medical Sciences',
+    options: [
+      { value: 'Medicine (MD)', label: 'Medicine (MD)' },
+      { value: 'Public Health (Health Officer)', label: 'Public Health (Health Officer)' },
+      { value: 'Nursing', label: 'Nursing' },
+      { value: 'Pharmacy', label: 'Pharmacy' },
+      { value: 'Midwifery', label: 'Midwifery' },
+      { value: 'Medical Laboratory Science', label: 'Medical Laboratory Science' },
+      { value: 'Environmental Health', label: 'Environmental Health' },
+      { value: 'Anesthesia', label: 'Anesthesia' }
+    ]
+  },
+  {
+    label: 'Agriculture & Environmental Sciences',
+    options: [
+      { value: 'Plant Science', label: 'Plant Science' },
+      { value: 'Animal Science', label: 'Animal Science' },
+      { value: 'Natural Resource Management', label: 'Natural Resource Management' },
+      { value: 'Agri-Business & Value Chain Management', label: 'Agri-Business & Value Chain Management' },
+      { value: 'Veterinary Medicine', label: 'Veterinary Medicine' }
+    ]
+  },
+  {
+    label: 'Natural & Computational Sciences',
+    options: [
+      { value: 'Mathematics', label: 'Mathematics' },
+      { value: 'Statistics', label: 'Statistics' },
+      { value: 'Physics', label: 'Physics' },
+      { value: 'Chemistry', label: 'Chemistry' },
+      { value: 'Biology', label: 'Biology' },
+      { value: 'Geology', label: 'Geology' }
+    ]
+  },
+  {
+    label: 'Social Sciences & Humanities',
+    options: [
+      { value: 'Law (Jurisprudence)', label: 'Law (Jurisprudence)' },
+      { value: 'Psychology', label: 'Psychology' },
+      { value: 'Sociology', label: 'Sociology' },
+      { value: 'English Language & Literature', label: 'English Language & Literature' },
+      { value: 'Journalism & Communication', label: 'Journalism & Communication' },
+      { value: 'Political Science & International Relations', label: 'Political Science & International Relations' }
+    ]
+  }
+];
+
+const FACILITY_OPTIONS = [
+  'Pocket Money / Stipend', 'Transport Service', 'Cafeteria / Lunch', 'Training & Mentorship', 'Certificate of Completion', 'Job Opportunity'
+];
+
+const INDUSTRY_OPTIONS = [
+  'Finance & Banking', 'IT & Software', 'Manufacturing', 'Health & Medical', 'NGO / Non-Profit',
+  'Construction & Real Estate', 'Education', 'Agriculture', 'Telecommunications', 'Logistics & Transport', 'Other'
+];
+
+const LOCATION_OPTIONS = [
+  'Addis Ababa', 'Afar', 'Amhara', 'Benishangul-Gumuz', 'Dire Dawa', 'Gambela', 'Harari',
+  'Oromia', 'Sidama', 'Somali', 'South Ethiopia', 'Central Ethiopia', 'South West Ethiopia', 'Tigray'
+];
+
 export default function EmployerProfile() {
   const auth = useAuth();
   const logoInputRef = useRef(null);
   const coverInputRef = useRef(null);
+  const docInputRef = useRef(null);
+  const licenseInputRef = useRef(null); // Ref for license file input
+
   const [form, setForm] = useState({
     companyName: '',
     officialEmail: '',
@@ -36,8 +157,22 @@ export default function EmployerProfile() {
     representativePosition: '',
     logo: '',
     coverImage: '',
-    registrationDocUrl: ''
+    businessLicenseUrl: '',
+    targetDepartments: [],
+    internshipFacilities: [],
+    branches: [],
+    requiredSkills: [],
+    businessLicenseFile: null,
+    intakeCapacity: '',
+    focalName: '',
+    focalEmail: '',
+    focalPhone: '',
+    internshipPeriod: '',
+    internshipDuration: '',
+    minimumCgpa: '',
+    expectedTasks: ''
   });
+  const [selectedCollege, setSelectedCollege] = useState(null);
   const [profileCompleteness, setProfileCompleteness] = useState(0);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -45,6 +180,7 @@ export default function EmployerProfile() {
   const [message, setMessage] = useState('');
   const [isDirty, setIsDirty] = useState(false);
   const [dragTarget, setDragTarget] = useState('');
+  const [licenseFileName, setLicenseFileName] = useState('');
   const [logoCropOpen, setLogoCropOpen] = useState(false);
   const [logoCropSource, setLogoCropSource] = useState('');
   const [logoCropZoom, setLogoCropZoom] = useState(1.25);
@@ -159,30 +295,79 @@ export default function EmployerProfile() {
   };
 
   const saveProfile = async (nextForm, successText = 'Company profile updated successfully.') => {
-    const payload = {
-      companyName: nextForm.companyName,
-      logo: nextForm.logo,
-      coverImage: nextForm.coverImage,
-      officialEmail: nextForm.officialEmail,
-      phone: nextForm.phone,
-      website: nextForm.website,
-      hqLocation: nextForm.hqLocation,
-      industryType: nextForm.industryType,
-      companySize: nextForm.companySize || undefined,
-      foundedYear: nextForm.foundedYear ? Number(nextForm.foundedYear) : undefined,
-      description: nextForm.description,
-      representative: {
-        name: nextForm.representativeName,
-        position: nextForm.representativePosition
-      },
-      verification: {
-        registrationDocUrl: nextForm.registrationDocUrl
-      }
-    };
+    const formData = new FormData();
+    
+    // Basic fields
+    formData.append('companyName', nextForm.companyName);
+    formData.append('officialEmail', nextForm.officialEmail);
+    formData.append('phone', nextForm.phone);
+    formData.append('website', nextForm.website);
+    formData.append('hqLocation', nextForm.hqLocation);
+    formData.append('industryType', nextForm.industryType);
+    formData.append('companySize', nextForm.companySize || '');
+    if (nextForm.foundedYear) formData.append('foundedYear', nextForm.foundedYear);
+    formData.append('description', nextForm.description);
+    
+    // Representative fields (sent as separate fields for easy backend parsing)
+    formData.append('representativeName', nextForm.representativeName);
+    formData.append('representativePosition', nextForm.representativePosition);
+    
+    // Images (DataURLs)
+    formData.append('logo', nextForm.logo);
+    formData.append('coverImage', nextForm.coverImage);
+    
+    // File upload (The "real" connection)
+    if (nextForm.businessLicenseFile) {
+      formData.append('businessLicense', nextForm.businessLicenseFile);
+    } else {
+      formData.append('businessLicenseUrl', nextForm.businessLicenseUrl);
+    }
 
-    const { data } = await employerAPI.updateProfile(payload);
+    // Arrays (sent as comma-separated strings)
+    formData.append('targetDepartments', nextForm.targetDepartments.join(','));
+    formData.append('internshipFacilities', nextForm.internshipFacilities.join(','));
+    formData.append('branches', nextForm.branches.join(','));
+    formData.append('requiredSkills', nextForm.requiredSkills.join(','));
+
+    // AI Matching & Placement Fields
+    formData.append('intakeCapacity', nextForm.intakeCapacity || '');
+    formData.append('internshipPeriod', nextForm.internshipPeriod || '');
+    formData.append('internshipDuration', nextForm.internshipDuration || '');
+    formData.append('minimumCgpa', nextForm.minimumCgpa || '');
+    formData.append('expectedTasks', nextForm.expectedTasks || '');
+    
+    // Focal Person
+    formData.append('focalName', nextForm.focalName || '');
+    formData.append('focalEmail', nextForm.focalEmail || '');
+    formData.append('focalPhone', nextForm.focalPhone || '');
+
+    const { data } = await employerAPI.updateProfile(formData);
+    
+    // 1. Extract the permanent URL from the server response
+    const serverUrl = data?.verification?.registrationDocUrl;
+    
+    // 2. Update form state immediately with server-confirmed data
+    // This replaces the temporary DataURL (which triggers #blocked) with a clean server path
+    // 3a. Update doc filenames from server paths
+    const licenseUrl = data?.verification?.businessLicenseUrl;
+    if (licenseUrl) {
+      const parts = licenseUrl.split('/');
+      setLicenseFileName(parts[parts.length - 1] || '');
+    }
+
+    setForm(prev => ({
+      ...prev,
+      ...nextForm,
+      businessLicenseUrl: licenseUrl || prev.businessLicenseUrl,
+      businessLicenseFile: null
+    }));
+
+    // 3. Update UI indicators
     setProfileCompleteness(Number(data?.profileCompleteness || 0));
     setMessage(successText);
+    setIsDirty(false);
+    
+    // 4. Sync the global session
     syncSession(data, nextForm);
     return data;
   };
@@ -196,6 +381,9 @@ export default function EmployerProfile() {
         setError('');
         const { data } = await employerAPI.getProfile();
         if (!active) return;
+
+        console.log('[Profile] companyName =', String(data?.companyName || 'N/A'));
+        console.log('[Profile] LicenseStatus =', String(data?.verification?.status || 'N/A'));
 
         setForm({
           companyName: data?.companyName || auth?.user?.fullName || auth?.user?.name || '',
@@ -211,12 +399,42 @@ export default function EmployerProfile() {
           representativePosition: data?.representative?.position || '',
           logo: data?.logo || '',
           coverImage: data?.coverImage || '',
-          registrationDocUrl: data?.verification?.registrationDocUrl || ''
+          businessLicenseUrl: data?.verification?.businessLicenseUrl || '',
+          targetDepartments: data?.targetDepartments || [],
+          internshipFacilities: data?.internshipFacilities || [],
+          branches: data?.branches || [],
+          requiredSkills: data?.requiredSkills || [],
+          
+          // AI Matching Fields
+          intakeCapacity: data?.intakeCapacities?.[0]?.capacity || '',
+          internshipPeriod: data?.internshipPeriod || '',
+          internshipDuration: data?.internshipDuration || '',
+          minimumCgpa: data?.minimumCgpa || '',
+          expectedTasks: data?.expectedTasks || '',
+          
+          // Focal Person
+          focalName: data?.focalPerson?.name || '',
+          focalEmail: data?.focalPerson?.email || '',
+          focalPhone: data?.focalPerson?.phone || '',
+
+          businessLicenseFile: null
         });
+        
+        // Set license file name from existing URL if present
+        if (data?.verification?.businessLicenseUrl) {
+          const parts = data.verification.businessLicenseUrl.split('/');
+          setLicenseFileName(parts[parts.length - 1] || '');
+        } else {
+          setLicenseFileName('');
+        } 
+        
         setProfileCompleteness(Number(data?.profileCompleteness || 0));
         setIsDirty(false);
       } catch (requestError) {
-        if (active) setError(requestError?.response?.data?.message || 'Unable to load company profile.');
+        if (active) {
+          console.error('Profile Load Error:', requestError);
+          setError(requestError?.response?.data?.message || 'Unable to load company profile.');
+        }
       } finally {
         if (active) setLoading(false);
       }
@@ -226,7 +444,7 @@ export default function EmployerProfile() {
     return () => {
       active = false;
     };
-  }, [auth?.user?.email, auth?.user?.fullName, auth?.user?.name]);
+  }, [auth?.user?.id]); // Only reload if the user ID changes (e.g. login/logout)
 
   const handleChange = (name, value) => {
     setMessage('');
@@ -271,34 +489,69 @@ export default function EmployerProfile() {
     const file = input?.target?.files?.[0] || input;
     if (!file) return;
 
-    const validationError = validateImageFile(file);
-    if (validationError) {
-      setError(validationError);
-      if (input?.target) input.target.value = '';
-      return;
-    }
-
     try {
       setError('');
       setMessage('');
+      setSaving(true);
 
       if (key === 'logo') {
+        const validationError = validateImageFile(file);
+        if (validationError) {
+          setError(validationError);
+          setSaving(false);
+          return;
+        }
         const src = await readFileAsDataUrl(file);
         setLogoCropSource(src);
         setLogoCropZoom(1.25);
         setLogoCropOffset({ x: 0, y: 0 });
         setLogoCropOpen(true);
+        setSaving(false);
         return;
       }
 
-      setSaving(true);
+      if (key === 'businessLicenseUrl') {
+        const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
+        if (!allowedTypes.includes(file.type)) {
+          setError('Please upload a PDF or an Image (JPG/PNG).');
+          setSaving(false);
+          return;
+        }
+        
+        const MAX_DOC_SIZE = 5 * 1024 * 1024; // 5MB
+        if (file.size > MAX_DOC_SIZE) {
+          setError('File is too large. Please upload less than 5MB.');
+          setSaving(false);
+          return;
+        }
+
+        const dataUrl = await readFileAsDataUrl(file);
+        const rawName = file.name || 'license.pdf';
+        setLicenseFileName(rawName);
+        setForm((prev) => ({ ...prev, businessLicenseUrl: dataUrl, businessLicenseFile: file }));
+        
+        setMessage(`"${rawName}" selected. Click Save Company Profile to upload.`);
+        setIsDirty(true);
+        setSaving(false);
+        return;
+      }
+
+      // Default Image Handling (Cover Image, etc)
+      const validationError = validateImageFile(file);
+      if (validationError) {
+        setError(validationError);
+        setSaving(false);
+        if (input?.target) input.target.value = '';
+        return;
+      }
+
       const optimizedDataUrl = await optimizeImageFile(file);
       const nextForm = { ...form, [key]: optimizedDataUrl };
       setForm(nextForm);
       setMessage(`${label} selected. Click Save Company Profile to apply changes.`);
       setIsDirty(true);
     } catch (readError) {
-      setError(readError?.message || 'Unable to load the selected image.');
+      setError(readError?.message || 'Unable to load the selected file.');
     } finally {
       setSaving(false);
       if (input?.target) input.target.value = '';
@@ -337,6 +590,38 @@ export default function EmployerProfile() {
     setIsDirty(true);
   };
 
+  const handleToggleArrayItem = (name, value) => {
+    setMessage('');
+    setForm((prev) => {
+      const current = prev[name] || [];
+      const next = current.includes(value)
+        ? current.filter((i) => i !== value)
+        : [...current, value];
+      return { ...prev, [name]: next };
+    });
+    setIsDirty(true);
+  };
+
+  const handleAddArrayItem = (name, value) => {
+    if (!value?.trim()) return;
+    setMessage('');
+    setForm((prev) => {
+      const current = prev[name] || [];
+      if (current.includes(value.trim())) return prev;
+      return { ...prev, [name]: [...current, value.trim()] };
+    });
+    setIsDirty(true);
+  };
+
+  const handleRemoveArrayItem = (name, value) => {
+    setMessage('');
+    setForm((prev) => ({
+      ...prev,
+      [name]: (prev[name] || []).filter((i) => i !== value)
+    }));
+    setIsDirty(true);
+  };
+
   const handleSubmit = async (event) => {
     event.preventDefault();
     if (!String(form.companyName || '').trim()) {
@@ -348,9 +633,6 @@ export default function EmployerProfile() {
       setMessage('No changes to save.');
       return;
     }
-
-    const confirmed = window.confirm('Confirm save: apply all company profile changes now?');
-    if (!confirmed) return;
 
     try {
       setSaving(true);
@@ -512,12 +794,18 @@ export default function EmployerProfile() {
 
               <label className="space-y-2">
                 <span className="text-sm font-medium text-slate-600">HQ Location</span>
-                <input value={form.hqLocation} onChange={(e) => handleChange('hqLocation', e.target.value)} className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400" />
+                <select value={form.hqLocation} onChange={(e) => handleChange('hqLocation', e.target.value)} className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400">
+                  <option value="">Select Region/City</option>
+                  {LOCATION_OPTIONS.map(loc => <option key={loc} value={loc}>{loc}</option>)}
+                </select>
               </label>
 
               <label className="space-y-2">
                 <span className="text-sm font-medium text-slate-600">Industry Type</span>
-                <input value={form.industryType} onChange={(e) => handleChange('industryType', e.target.value)} className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400" />
+                <select value={form.industryType} onChange={(e) => handleChange('industryType', e.target.value)} className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400">
+                  <option value="">Select Industry</option>
+                  {INDUSTRY_OPTIONS.map(ind => <option key={ind} value={ind}>{ind}</option>)}
+                </select>
               </label>
 
               <label className="space-y-2">
@@ -551,10 +839,379 @@ export default function EmployerProfile() {
               <textarea value={form.description} onChange={(e) => handleChange('description', e.target.value)} rows={4} className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400" />
             </label>
 
-            <label className="space-y-2">
-              <span className="text-sm font-medium text-slate-600">Registration Document URL</span>
-              <input value={form.registrationDocUrl} onChange={(e) => handleChange('registrationDocUrl', e.target.value)} placeholder="https://..." className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400" />
-            </label>
+
+            {/* New Section: Internship Placement & Matching */}
+            <div className="mt-8 space-y-6 rounded-3xl border border-emerald-100 bg-emerald-50/30 p-6">
+              <div>
+                <h3 className="text-lg font-semibold text-emerald-900">Internship Placement & Matching</h3>
+                <p className="text-sm text-emerald-700/80">These details help our AI match the right students to your organization.</p>
+              </div>
+
+              <div className="grid gap-6 md:grid-cols-2">
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <span className="text-sm font-medium text-slate-700">1. Select College / Faculty</span>
+                    <Select
+                      options={DEPARTMENT_OPTIONS.map(group => ({ 
+                        value: group.label, 
+                        label: group.label,
+                        color: '#059669' // Emerald 600
+                      }))}
+                      value={selectedCollege}
+                      onChange={(opt) => setSelectedCollege(opt)}
+                      placeholder="e.g. Engineering & Technology"
+                      className="text-sm"
+                      styles={{
+                        control: (base, state) => ({
+                          ...base,
+                          borderRadius: '0.75rem',
+                          borderColor: state.isFocused ? '#10b981' : '#cbd5e1',
+                          fontWeight: '600',
+                          color: '#065f46'
+                        }),
+                        option: (base, state) => ({
+                          ...base,
+                          fontWeight: '700',
+                          color: state.isSelected ? 'white' : '#065f46',
+                          backgroundColor: state.isSelected ? '#10b981' : 'white',
+                          '&:hover': { backgroundColor: '#ecfdf5' }
+                        })
+                      }}
+                    />
+                  </div>
+
+                  {selectedCollege && (
+                    <div className="space-y-2 animate-in fade-in slide-in-from-top-2 duration-300">
+                      <span className="text-sm font-medium text-emerald-700">2. Select Departments in {selectedCollege.label}</span>
+                      <Select
+                        isMulti
+                        options={DEPARTMENT_OPTIONS.find(g => g.label === selectedCollege.value)?.options || []}
+                        value={DEPARTMENT_OPTIONS.flatMap(g => g.options).filter(opt => form.targetDepartments.includes(opt.value))}
+                        onChange={(selectedOptions) => {
+                          const selectedValues = selectedOptions ? selectedOptions.map(opt => opt.value) : [];
+                          // Note: We keep existing departments from other colleges if they were already selected
+                          const otherCollegeDepts = form.targetDepartments.filter(dept => {
+                            const group = DEPARTMENT_OPTIONS.find(g => g.options.some(o => o.value === dept));
+                            return group && group.label !== selectedCollege.value;
+                          });
+                          handleChange('targetDepartments', [...new Set([...otherCollegeDepts, ...selectedValues])]);
+                        }}
+                        placeholder="Pick departments..."
+                        className="text-sm"
+                        styles={{
+                          control: (base, state) => ({
+                            ...base,
+                            borderRadius: '0.75rem',
+                            borderColor: state.isFocused ? '#34d399' : '#cbd5e1'
+                          })
+                        }}
+                      />
+                    </div>
+                  )}
+
+                  {form.targetDepartments.length > 0 && (
+                    <div className="flex flex-wrap gap-2 pt-2">
+                      {form.targetDepartments.map(dept => (
+                        <span key={dept} className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700 border border-emerald-100">
+                          {dept}
+                          <button 
+                            type="button" 
+                            onClick={() => handleChange('targetDepartments', form.targetDepartments.filter(d => d !== dept))}
+                            className="hover:text-emerald-900"
+                          >
+                            <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <span className="text-sm font-medium text-slate-700">Available Internship Locations (Branches)</span>
+                    <div className="flex gap-2">
+                      <input
+                        placeholder="e.g. Addis Ababa"
+                        className="flex-1 rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm outline-none focus:border-emerald-400"
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleAddArrayItem('branches', e.target.value);
+                            e.target.value = '';
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          const input = e.currentTarget.previousElementSibling;
+                          handleAddArrayItem('branches', input.value);
+                          input.value = '';
+                        }}
+                        className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white"
+                      >
+                        Add
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {form.branches.map((branch) => (
+                        <span key={branch} className="flex items-center gap-1 rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-700">
+                          {branch}
+                          <button type="button" onClick={() => handleRemoveArrayItem('branches', branch)} className="hover:text-emerald-900">
+                            <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <span className="text-sm font-medium text-slate-700">Internship Facilities & Benefits</span>
+                    <div className="flex flex-wrap gap-3">
+                      {FACILITY_OPTIONS.map((facility) => (
+                        <label key={facility} className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={form.internshipFacilities.includes(facility)}
+                            onChange={() => handleToggleArrayItem('internshipFacilities', facility)}
+                            className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                          />
+                          <span className="text-sm text-slate-600">{facility}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* NEW AI MATCHING FIELDS */}
+              <div className="grid gap-6 md:grid-cols-2 border-t border-emerald-100 pt-6 mt-4">
+                <div className="space-y-4">
+                  <label className="space-y-2 block">
+                    <span className="text-sm font-medium text-slate-700">Total Internship Intake Capacity</span>
+                    <p className="text-xs text-slate-500">How many students can you accept overall?</p>
+                    <input 
+                      type="number" 
+                      min="1" 
+                      placeholder="e.g. 10"
+                      value={form.intakeCapacity} 
+                      onChange={(e) => handleChange('intakeCapacity', e.target.value)} 
+                      className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400" 
+                    />
+                  </label>
+                  
+                  <div className="grid grid-cols-2 gap-4">
+                    <label className="space-y-2 block">
+                      <span className="text-sm font-medium text-slate-700">Internship Period</span>
+                      <select 
+                        value={form.internshipPeriod} 
+                        onChange={(e) => handleChange('internshipPeriod', e.target.value)} 
+                        className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400"
+                      >
+                        <option value="">Select Period</option>
+                        <option value="Summer (Kiremt)">Summer (Kiremt)</option>
+                        <option value="Semester Break">Semester Break</option>
+                        <option value="All-Year Round">All-Year Round</option>
+                      </select>
+                    </label>
+
+                    <label className="space-y-2 block">
+                      <span className="text-sm font-medium text-slate-700">Duration</span>
+                      <select 
+                        value={form.internshipDuration} 
+                        onChange={(e) => handleChange('internshipDuration', e.target.value)} 
+                        className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400"
+                      >
+                        <option value="">Select Duration</option>
+                        <option value="1 Month">1 Month</option>
+                        <option value="2 Months">2 Months</option>
+                        <option value="3 Months">3 Months</option>
+                        <option value="4 Months">4 Months</option>
+                        <option value="6+ Months">6+ Months</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <label className="space-y-2 block">
+                    <span className="text-sm font-medium text-slate-700">Minimum CGPA Requirement (Optional)</span>
+                    <p className="text-xs text-slate-500">Leave blank if no strict CGPA cutoff</p>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      min="2.00"
+                      max="4.00"
+                      placeholder="e.g. 3.00"
+                      value={form.minimumCgpa} 
+                      onChange={(e) => handleChange('minimumCgpa', e.target.value)} 
+                      className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 outline-none transition focus:border-emerald-400" 
+                    />
+                  </label>
+                </div>
+
+                <div className="space-y-4">
+                  <div className="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+                    <h4 className="text-sm font-semibold text-slate-800">Internship Focal Person</h4>
+                    <p className="text-xs text-slate-500">The direct supervisor or HR person students will report to.</p>
+                    
+                    <input 
+                      placeholder="Full Name"
+                      value={form.focalName} 
+                      onChange={(e) => handleChange('focalName', e.target.value)} 
+                      className="w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm outline-none transition focus:border-emerald-400 focus:bg-white" 
+                    />
+                    <input 
+                      type="email"
+                      placeholder="Email Address"
+                      value={form.focalEmail} 
+                      onChange={(e) => handleChange('focalEmail', e.target.value)} 
+                      className="w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm outline-none transition focus:border-emerald-400 focus:bg-white" 
+                    />
+                    <input 
+                      placeholder="Phone Number"
+                      value={form.focalPhone} 
+                      onChange={(e) => handleChange('focalPhone', e.target.value)} 
+                      className="w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm outline-none transition focus:border-emerald-400 focus:bg-white" 
+                    />
+                  </div>
+
+                  <label className="space-y-2 block">
+                    <span className="text-sm font-medium text-slate-700">Expected Projects / Tasks</span>
+                    <p className="text-xs text-slate-500">What will the interns actually be doing?</p>
+                    <textarea 
+                      rows={3}
+                      placeholder="e.g. Network installation, developing a React dashboard..."
+                      value={form.expectedTasks} 
+                      onChange={(e) => handleChange('expectedTasks', e.target.value)} 
+                      className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm outline-none transition focus:border-emerald-400" 
+                    />
+                  </label>
+                </div>
+              </div>
+
+              <div className="space-y-2 border-t border-emerald-100 pt-6 mt-2">
+                <span className="text-sm font-medium text-slate-700">Required Skills / Tech Stack</span>
+                <p className="text-xs text-slate-500">List skills you expect from interns (e.g. Python, Networking, Peachtree, Excel). Press Enter to add.</p>
+                <div className="flex gap-2">
+                  <input
+                    placeholder="e.g. Python"
+                    className="flex-1 rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm outline-none focus:border-emerald-400"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleAddArrayItem('requiredSkills', e.target.value);
+                        e.target.value = '';
+                      }
+                    }}
+                  />
+                </div>
+                <div className="flex flex-wrap gap-2 mt-2">
+                  {form.requiredSkills.map((skill) => (
+                    <span key={skill} className="flex items-center gap-1 rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-700 border border-slate-200">
+                      {skill}
+                      <button type="button" onClick={() => handleRemoveArrayItem('requiredSkills', skill)} className="hover:text-slate-900">
+                        <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Legal & Verification Documents Section */}
+            <div className="mt-8 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+              <div className="mb-6 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h3 className="text-xl font-semibold text-slate-900">Company Verification</h3>
+                  <p className="mt-1 text-sm text-slate-500">Upload your Business License or TIN Certificate (Max 5MB). PDF, JPG, or PNG.</p>
+                </div>
+                <div className={`rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wider ${
+                  form.businessLicenseUrl ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
+                }`}>
+                  {form.businessLicenseUrl ? 'Document Provided' : 'Verification Required'}
+                </div>
+              </div>
+
+              <div 
+                className={`relative flex min-h-[260px] flex-col items-center justify-center rounded-3xl border-2 border-dashed p-8 transition-all duration-300 ${
+                  dragTarget === 'licenseDoc' ? 'border-emerald-400 bg-emerald-50 scale-[1.01]' : 'border-slate-200 hover:border-emerald-300 bg-slate-50/50'
+                }`}
+                onDragOver={(e) => { e.preventDefault(); setDragTarget('licenseDoc'); }}
+                onDragLeave={() => setDragTarget('')}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setDragTarget('');
+                  const file = e.dataTransfer.files[0];
+                  handleImageFileChange(file, 'businessLicenseUrl', 'Business License');
+                }}
+              >
+                <div className="flex flex-col items-center justify-center">
+                  <div className={`mb-4 rounded-2xl p-4 shadow-sm transition-colors duration-300 ${form.businessLicenseUrl ? 'bg-emerald-100 text-emerald-600' : 'bg-white text-slate-400'}`}>
+                    <svg className="h-10 w-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                  </div>
+                  <h4 className="text-lg font-semibold text-slate-800">Business License / TIN</h4>
+                  <p className="mt-2 text-sm text-slate-500 text-center max-w-sm">Drag and drop your document here, or click to browse files from your computer.</p>
+                </div>
+
+                {licenseFileName && (
+                  <div className="mt-6 flex w-full max-w-lg items-center justify-between rounded-2xl bg-white p-4 shadow-lg border border-emerald-100 animate-in fade-in slide-in-from-bottom-2 duration-500">
+                    <div className="flex items-center gap-4 overflow-hidden">
+                      <div className="rounded-xl bg-emerald-100 p-2.5 text-emerald-700 shadow-inner">
+                        <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                      </div>
+                      <div className="flex flex-col overflow-hidden">
+                        <span className="truncate text-sm font-bold text-slate-800">{licenseFileName}</span>
+                        <span className="text-[10px] uppercase tracking-wider text-emerald-600 font-bold">Document Ready</span>
+                      </div>
+                    </div>
+                    
+                    <div className="flex items-center gap-2 ml-4">
+                      {form.businessLicenseUrl && (
+                        <a 
+                          href={resolveFileUrl(form.businessLicenseUrl)} 
+                          target="_blank" 
+                          rel="noreferrer" 
+                          onClick={(e) => e.stopPropagation()}
+                          className="relative z-10 flex items-center gap-1.5 rounded-xl bg-blue-50 px-3 py-2 text-xs font-bold text-blue-700 transition hover:bg-blue-100 active:scale-95"
+                        >
+                          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                          </svg>
+                          View
+                        </a>
+                      )}
+                      <button 
+                        type="button" 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setLicenseFileName('');
+                          setForm(prev => ({ ...prev, businessLicenseUrl: '', businessLicenseFile: null }));
+                          setIsDirty(true);
+                          setMessage('Document removed. Click Save Company Profile to apply changes.');
+                        }} 
+                        className="relative z-10 flex items-center gap-1.5 rounded-xl bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700 transition hover:bg-rose-100 active:scale-95"
+                      >
+                        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <input 
+                  type="file" 
+                  className={`absolute inset-0 cursor-pointer opacity-0 ${licenseFileName ? 'pointer-events-none' : ''}`} 
+                  onChange={(e) => handleImageFileChange(e.target.files[0], 'businessLicenseUrl', 'Business License')} 
+                />
+              </div>
+            </div>
 
             <button type="submit" disabled={saving} className="rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 px-6 py-2.5 text-sm font-semibold text-white transition hover:brightness-105 disabled:opacity-60">
               {saving ? 'Saving...' : 'Save Company Profile'}

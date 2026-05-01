@@ -42,8 +42,9 @@ app.use(cors({
     },
     credentials: true
 }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Database Connection
 const dbURI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/smart_internship_program";
@@ -70,6 +71,8 @@ app.use('/api/notification', require('./routes/notification'));
 app.use('/api/notifications', require('./routes/notification'));
 app.use('/api/employer-profile', require('./routes/employerProfile'));
 app.use('/api/evaluation', require('./routes/evaluation'));
+app.use('/api/logbook', require('./routes/logbook'));
+app.use('/api/user-preferences', require('./routes/userPreferences'));
 
 const io = new Server(server, {
     cors: {

@@ -114,7 +114,7 @@ router.get('/student', authMiddleware, async (req, res) => {
         
         // 2. Fetch Application Stats
         const totalApps = await Application.countDocuments({ studentId });
-        const pendingApps = await Application.countDocuments({ studentId, status: { $in: ['Pending', 'Under Review'] } });
+        const pendingApps = await Application.countDocuments({ studentId, status: { $in: ['Pending', 'Seen', 'Shortlisted', 'Interview'] } });
         const acceptedApps = await Application.countDocuments({ studentId, status: 'Accepted' });
         const rejectedApps = await Application.countDocuments({ studentId, status: 'Rejected' });
 
@@ -136,7 +136,13 @@ router.get('/student', authMiddleware, async (req, res) => {
         const studentTasks = pendingTasks.filter(task => task.application !== null);
 
         // 5. Smart Recommendations (AI Matching)
-        const allInternships = await Internship.find({ status: 'Open' }).limit(10);
+        const allInternships = await Internship.find({ status: 'Open' }).limit(10).lean();
+        
+        const companyIds = [...new Set(allInternships.map(i => i.companyId).filter(Boolean))];
+        const companyProfiles = await CompanyProfile.find({ user: { $in: companyIds } }).lean();
+        const compMap = {};
+        companyProfiles.forEach(cp => { compMap[String(cp.user)] = cp; });
+
         let recommendations = [];
 
         if (profile && profile.academicInfo && profile.academicInfo.skills) {
@@ -145,22 +151,37 @@ router.get('/student', authMiddleware, async (req, res) => {
             recommendations = allInternships.map(internship => {
                 const reqSkillsArray = internship.requiredSkills || [];
                 const requiredSkills = reqSkillsArray.filter(Boolean).map(s => s.toLowerCase().trim());
-                let matchedCount = 0;
                 
-                requiredSkills.forEach(reqS => {
-                    studentSkills.forEach(stuS => {
-                        if (reqS && stuS && natural.JaroWinklerDistance(reqS, stuS) > 0.85) matchedCount++;
+                let calculatedScore = 0;
+                if (requiredSkills.length > 0) {
+                    let matchedCount = 0;
+                    requiredSkills.forEach(req => {
+                        if (studentSkills.some(stu => stu.includes(req) || req.includes(stu))) {
+                            matchedCount++;
+                        }
                     });
-                });
+                    calculatedScore = Math.round((matchedCount / requiredSkills.length) * 100);
+                    
+                    const sDept = String(profile?.personalInfo?.department || '').toLowerCase().trim();
+                    const iDept = String(internship?.department || '').toLowerCase().trim();
+                    if (sDept && iDept && (sDept.includes(iDept) || iDept.includes(sDept))) {
+                        calculatedScore = Math.max(calculatedScore, 95);
+                    }
+                }
 
-                const score = Math.round((matchedCount / (requiredSkills.length || 1)) * 100);
+                const score = Math.min(100, calculatedScore);
                 return {
-                    ...internship.toObject(),
-                    matchScore: score > 100 ? 100 : score
+                    ...internship,
+                    companyProfile: compMap[String(internship.companyId)] || null,
+                    matchScore: score
                 };
             }).sort((a, b) => b.matchScore - a.matchScore).slice(0, 3);
         } else {
-            recommendations = allInternships.slice(0, 3).map(i => ({ ...i.toObject(), matchScore: 0 }));
+            recommendations = allInternships.slice(0, 3).map(i => ({ 
+                ...i, 
+                companyProfile: compMap[String(i.companyId)] || null,
+                matchScore: 0 
+            }));
         }
 
         // 6. Fetch Calendar Events
