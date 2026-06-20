@@ -4,6 +4,7 @@ import Card from '@/components/ui/Card';
 import Button from '@/components/ui/Button';
 import { employerAPI } from '../employerAPI';
 import ProgramSubNav from '../components/ProgramSubNav';
+import useCompanyVerificationSync from '@/hooks/useCompanyVerificationSync';
 
 const PAGE_SIZE = 6;
 
@@ -14,6 +15,7 @@ function formatDate(value) {
 }
 
 export default function MyPrograms() {
+  const [companyProfile, setCompanyProfile] = useState(null);
   const [programs, setPrograms] = useState([]);
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
@@ -55,7 +57,12 @@ export default function MyPrograms() {
 
   useEffect(() => {
     loadPrograms();
+    employerAPI.getProfile().then(({ data }) => setCompanyProfile(data)).catch(() => {});
   }, []);
+
+  useCompanyVerificationSync(() => {
+    employerAPI.getProfile().then(({ data }) => setCompanyProfile(data)).catch(() => {});
+  });
 
   useEffect(() => {
     setPage(1);
@@ -150,7 +157,19 @@ export default function MyPrograms() {
 
   return (
     <div className="space-y-6">
-      <ProgramSubNav />
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <ProgramSubNav />
+        {companyProfile && String(companyProfile?.verification?.status || '').toLowerCase() !== 'verified' ? (
+          <button disabled className="inline-flex items-center justify-center rounded-full bg-emerald-600/60 px-8 py-3 font-black text-white text-base shadow-lg shadow-emerald-100 cursor-not-allowed" title="Awaiting Super Admin verification">+ Post Internship</button>
+        ) : (
+          <Link
+            to="/employer/post-internship"
+            className="inline-flex items-center justify-center rounded-full bg-emerald-600 px-8 py-3 font-black text-white text-base shadow-lg shadow-emerald-100 hover:bg-emerald-700 transition-all focus:outline-none focus:ring-2 focus:ring-emerald-400"
+          >
+            + Post Internship
+          </Link>
+        )}
+      </div>
 
       <Card title="My Programs" description="Manage internship programs posted by your organization.">
         {error ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p> : null}
@@ -344,17 +363,29 @@ export default function MyPrograms() {
 
         {!loading && filteredPrograms.length > PAGE_SIZE ? (
           <div className="mt-5 flex items-center justify-between gap-3">
-            <p className="text-sm text-slate-500">
+            <p className="text-base font-extrabold text-emerald-700">
               Showing {pageStart + 1}-{Math.min(pageStart + PAGE_SIZE, filteredPrograms.length)} of {filteredPrograms.length}
             </p>
             <div className="flex items-center gap-2">
-              <Button type="button" variant="outline" disabled={safePage <= 1} onClick={() => setPage((prev) => Math.max(1, prev - 1))}>
+              <button
+                type="button"
+                disabled={safePage <= 1}
+                onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+                className={`rounded-2xl border px-6 py-2 text-base font-extrabold transition disabled:opacity-50 disabled:cursor-not-allowed 
+                  ${safePage <= 1 ? 'border-emerald-200 bg-emerald-50 text-emerald-400' : 'border-emerald-600 bg-emerald-500 text-white hover:bg-emerald-600 hover:text-white'}`}
+              >
                 Previous
-              </Button>
-              <span className="text-sm font-medium text-slate-700">Page {safePage} of {totalPages}</span>
-              <Button type="button" variant="outline" disabled={safePage >= totalPages} onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}>
+              </button>
+              <span className="text-base font-extrabold text-emerald-700">Page {safePage} of {totalPages}</span>
+              <button
+                type="button"
+                disabled={safePage >= totalPages}
+                onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+                className={`rounded-2xl border px-6 py-2 text-base font-extrabold transition disabled:opacity-50 disabled:cursor-not-allowed 
+                  ${safePage >= totalPages ? 'border-emerald-200 bg-emerald-50 text-emerald-400' : 'border-emerald-600 bg-emerald-500 text-white hover:bg-emerald-600 hover:text-white'}`}
+              >
                 Next
-              </Button>
+              </button>
             </div>
           </div>
         ) : null}

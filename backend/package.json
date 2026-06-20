@@ -10,7 +10,8 @@
     "seed:students": "node seed_students_registry.js",
     "smoke:governance": "node scripts/smoke_governance_flow.js",
     "smoke:university": "node scripts/smoke_university_spec.js",
-    "smoke:college-actions": "node scripts/smoke_college_actions.js"
+    "smoke:college-actions": "node scripts/smoke_college_actions.js",
+    "backfill:match-scores": "node scripts/backfill_application_match_scores.js --recompute-missing"
   },
   "keywords": [],
   "author": "",
@@ -31,5 +32,8 @@
     "pdfkit": "^0.17.2",
     "socket.io": "^4.8.3",
     "twilio": "^5.13.1"
+  },
+  "devDependencies": {
+    "supertest": "^7.2.2"
   }
 }

@@ -1,30 +1,24 @@
 import React, { useEffect, useState } from 'react';
-import Modal from '@/components/common/Modal';
 import { adminAPI } from '../adminAPI';
+import DepartmentFormModal from '../components/DepartmentFormModal';
 
 export default function DeanHodManagement() {
   const [departments, setDepartments] = useState([]);
-  const [candidates, setCandidates] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [savingDepartmentId, setSavingDepartmentId] = useState('');
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
 
   const [assignOpen, setAssignOpen] = useState(false);
-  const [selectedDepartmentId, setSelectedDepartmentId] = useState('');
-  const [selectedHeadId, setSelectedHeadId] = useState('');
+  const [selectedDepartment, setSelectedDepartment] = useState(null);
 
   const loadData = async () => {
     try {
       setLoading(true);
       setError('');
-      const [departmentsRes, headsRes] = await Promise.all([
-        adminAPI.getDepartments(),
-        adminAPI.getDepartmentHeadCandidates()
-      ]);
+      const departmentsRes = await adminAPI.getDepartments();
 
       setDepartments(Array.isArray(departmentsRes?.data) ? departmentsRes.data : []);
-      setCandidates(Array.isArray(headsRes?.data) ? headsRes.data : []);
     } catch (requestError) {
       setError(requestError?.response?.data?.message || 'Failed to load HOD management data.');
     } finally {
@@ -36,51 +30,58 @@ export default function DeanHodManagement() {
     loadData();
   }, []);
 
-  const openAssignModal = (department, currentHeadId = '') => {
-    setSelectedDepartmentId(String(department?._id || ''));
-    setSelectedHeadId(String(currentHeadId || ''));
+  const openAssignModal = (department) => {
+    if (!department?._id) {
+      setError('Please choose a department from the table first.');
+      return;
+    }
+    setSelectedDepartment(department);
     setAssignOpen(true);
   };
 
   const closeAssignModal = () => {
     setAssignOpen(false);
-    setSelectedDepartmentId('');
-    setSelectedHeadId('');
+    setSelectedDepartment(null);
   };
 
-  const assignHead = async () => {
-    if (!selectedDepartmentId || !selectedHeadId) {
-      setError('Please choose both department and HOD.');
+  const saveDepartmentHod = async (formData) => {
+    if (!selectedDepartment?._id) {
+      setError('Please choose a department first.');
+      return;
+    }
+
+    const name = String(formData?.name || '').trim();
+    const headName = String(formData?.head?.name || '').trim();
+    const headEmail = String(formData?.head?.email || '').trim();
+    const headPhone = String(formData?.head?.phone || '').trim();
+
+    if (!name || !headName || !headEmail || !headPhone) {
+      setError('Please provide department name and full HOD contact details.');
       return;
     }
 
     try {
-      setSavingDepartmentId(selectedDepartmentId);
+      setSaving(true);
       setError('');
       setMessage('');
-      await adminAPI.assignDepartmentHead(selectedDepartmentId, { headId: selectedHeadId });
-      setMessage('HOD assigned successfully.');
+
+      await adminAPI.updateDepartmentHod(selectedDepartment._id, {
+        name,
+        collegeId: formData?.collegeId,
+        head: {
+          name: headName,
+          email: headEmail,
+          phone: headPhone
+        }
+      });
+      setMessage(selectedDepartment?.head?._id ? 'HOD replaced successfully.' : 'HOD assigned successfully.');
+
       closeAssignModal();
       await loadData();
     } catch (requestError) {
       setError(requestError?.response?.data?.message || 'Failed to assign HOD.');
     } finally {
-      setSavingDepartmentId('');
-    }
-  };
-
-  const removeHead = async (departmentId) => {
-    try {
-      setSavingDepartmentId(String(departmentId || ''));
-      setError('');
-      setMessage('');
-      await adminAPI.assignDepartmentHead(departmentId, { headId: undefined });
-      setMessage('HOD removed successfully.');
-      await loadData();
-    } catch (requestError) {
-      setError(requestError?.response?.data?.message || 'Failed to remove HOD.');
-    } finally {
-      setSavingDepartmentId('');
+      setSaving(false);
     }
   };
 
@@ -91,13 +92,7 @@ export default function DeanHodManagement() {
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">HOD Management</p>
           <h2 className="mt-1 text-xl font-bold text-slate-900">Heads of Departments</h2>
         </div>
-        <button
-          type="button"
-          onClick={() => openAssignModal(null, '')}
-          className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white"
-        >
-          Assign New HOD
-        </button>
+        {/* Assign New HOD button removed to avoid confusion; use table row actions instead */}
       </div>
 
       {error ? <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p> : null}
@@ -109,6 +104,7 @@ export default function DeanHodManagement() {
             <thead className="bg-slate-50">
               <tr>
                 <th className="px-4 py-3 text-left font-semibold text-slate-700">Name</th>
+                <th className="px-4 py-3 text-left font-semibold text-slate-700">Phone Number</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-700">Department</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-700">Email</th>
                 <th className="px-4 py-3 text-left font-semibold text-slate-700">Actions</th>
@@ -120,11 +116,11 @@ export default function DeanHodManagement() {
                 const headName = department?.head?.fullName || department?.head?.name || 'Not assigned';
                 const headEmail = department?.head?.email || 'Not assigned';
                 const departmentId = String(department?._id || '');
-                const isSaving = savingDepartmentId === departmentId;
 
                 return (
                   <tr key={departmentId}>
                     <td className="px-4 py-3 font-medium text-slate-900">{headName}</td>
+                    <td className="px-4 py-3 text-slate-700">{department?.head?.phone || 'Not assigned'}</td>
                     <td className="px-4 py-3 text-slate-700">{department?.name || 'Unnamed department'}</td>
                     <td className="px-4 py-3 text-slate-700">{headEmail}</td>
                     <td className="px-4 py-3">
@@ -132,7 +128,7 @@ export default function DeanHodManagement() {
                         {!hasHead ? (
                           <button
                             type="button"
-                            onClick={() => openAssignModal(department, '')}
+                            onClick={() => openAssignModal(department)}
                             className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-700"
                           >
                             Assign to department
@@ -142,23 +138,14 @@ export default function DeanHodManagement() {
                         {hasHead ? (
                           <button
                             type="button"
-                            onClick={() => openAssignModal(department, String(department?.head?._id || ''))}
-                            className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-700"
+                            onClick={() => openAssignModal(department)}
+                            className="rounded-lg bg-cyan-700 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-cyan-600"
                           >
                             Replace HOD
                           </button>
                         ) : null}
 
-                        {hasHead ? (
-                          <button
-                            type="button"
-                            onClick={() => removeHead(departmentId)}
-                            disabled={isSaving}
-                            className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700 disabled:opacity-60"
-                          >
-                            {isSaving ? 'Removing...' : 'Remove'}
-                          </button>
-                        ) : null}
+                        {/* Remove action intentionally hidden */}
                       </div>
                     </td>
                   </tr>
@@ -172,55 +159,16 @@ export default function DeanHodManagement() {
       {loading ? <p className="text-sm text-slate-500">Loading HOD management from database...</p> : null}
       {!loading && departments.length === 0 ? <p className="text-sm text-slate-500">No departments found for your scope.</p> : null}
 
-      <Modal open={assignOpen} title="Assign HOD" onClose={closeAssignModal}>
-        <div className="space-y-4">
-          <div>
-            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Department</label>
-            <select
-              value={selectedDepartmentId}
-              onChange={(event) => setSelectedDepartmentId(event.target.value)}
-              className="w-full rounded-xl border border-slate-200 px-4 py-3 text-sm"
-            >
-              <option value="">Select department</option>
-              {departments.map((department) => (
-                <option key={String(department?._id || '')} value={department?._id || ''}>
-                  {department?.name || 'Unnamed department'}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">HOD</label>
-            <select
-              value={selectedHeadId}
-              onChange={(event) => setSelectedHeadId(event.target.value)}
-              className="w-full rounded-xl border border-slate-200 px-4 py-3 text-sm"
-            >
-              <option value="">Select HOD</option>
-              {candidates.map((candidate) => (
-                <option key={String(candidate?._id || '')} value={candidate?._id || ''}>
-                  {(candidate?.fullName || candidate?.name || 'Unnamed user')} - {candidate?.email || 'no email'}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="flex justify-end gap-2">
-            <button type="button" onClick={closeAssignModal} className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700">
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={assignHead}
-              disabled={savingDepartmentId === selectedDepartmentId}
-              className="rounded-lg bg-slate-900 px-3 py-2 text-sm font-semibold text-white disabled:opacity-60"
-            >
-              {savingDepartmentId === selectedDepartmentId ? 'Saving...' : 'Save'}
-            </button>
-          </div>
-        </div>
-      </Modal>
+      <DepartmentFormModal
+        open={assignOpen}
+        editData={selectedDepartment}
+        collegeName={selectedDepartment?.college?.name || ''}
+        collegeId={selectedDepartment?.college?._id || ''}
+        saving={saving}
+        error={error}
+        onClose={closeAssignModal}
+        onSubmit={saveDepartmentHod}
+      />
     </div>
   );
 }

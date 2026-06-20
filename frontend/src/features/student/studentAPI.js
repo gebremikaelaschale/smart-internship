@@ -3,10 +3,13 @@ import api from '@/services/api';
 export const studentAPI = {
   getDashboard: () => api.get('/dashboard/student'),
   getProfile: () => api.get('/student/profile'),
+  getStructure: () => api.get('/student/structure'),
   updateProfile: (payload) => api.put('/student/profile', payload),
   getApplications: () => api.get('/application/my'),
   getInternships: (params = {}) => api.get('/internships', { params }),
+  getDashboardStats: () => api.get('/student/stats'),
   getFilters: () => api.get('/internships/filters'),
+  getAcademicSuggestions: ({ field, q }) => api.get('/student/structure/suggestions', { params: { field, q } }),
   downloadEvaluationPaper: () => api.get('/evaluation/student/paper', { responseType: 'blob' }),
   getInternshipSuggestions: (q) => api.get('/internships/suggestions', { params: { q } }),
   applyForInternship: (payload) => api.post('/application/apply', payload),

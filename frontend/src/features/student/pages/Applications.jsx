@@ -4,12 +4,86 @@ import Loader from '@/components/common/Loader';
 import ErrorMessage from '@/components/common/ErrorMessage';
 import { studentAPI } from '../studentAPI';
 import { motion, AnimatePresence } from 'framer-motion';
+import { getStepIndex, getFinalLabel, STEP_LABELS } from '@/utils/applicationStatusMapping';
+import { io } from 'socket.io-client';
+
+const TYPO_FIXES = [
+  [/\bract\b/gi, 'React'],
+  [/\bclaud\b/gi, 'Cloud']
+];
+
+function cleanDisplayText(value = '') {
+  let text = String(value || '').trim();
+  TYPO_FIXES.forEach(([pattern, replacement]) => {
+    text = text.replace(pattern, replacement);
+  });
+  return text;
+}
+
+function collectTechnicalSkills(internship = {}) {
+  const sources = [
+    internship?.requiredSkills,
+    internship?.structuredRequirements?.coreTechnicalSkills,
+    internship?.structuredRequirements?.preferredSkills,
+    internship?.structuredRequirements?.softSkills,
+    String(internship?.internship_requirements || internship?.description || '').split(/[\n,;/]|\band\b/gi)
+  ];
+
+  return [...new Set(
+    sources
+      .flatMap((source) => (Array.isArray(source) ? source : [source]))
+      .map((item) => cleanDisplayText(item))
+      .map((item) => item.replace(/[\-•]+/g, ' ').trim())
+      .filter(Boolean)
+      .filter((item) => item.length >= 2)
+      .slice(0, 10)
+  )];
+}
 
 function getTracking(status) {
   const normalized = String(status || 'Pending').toLowerCase();
   const seen = !['pending'].includes(normalized);
   const shortlisted = ['shortlisted', 'interview', 'accepted', 'offered', 'placed'].includes(normalized);
   return { seen, shortlisted };
+}
+
+function getRejectedStepIndex(application = {}) {
+  const timeline = Array.isArray(application.timeline) ? application.timeline : [];
+  const rejectedIndex = timeline
+    .filter(entry => String(entry.status || '').trim().toUpperCase() !== 'REJECTED')
+    .map(entry => getStepIndex(entry.status))
+    .filter((idx) => typeof idx === 'number' && idx >= 0)
+    .reduce((max, idx) => Math.max(max, idx), 0);
+  return Number.isFinite(rejectedIndex) ? rejectedIndex : 0;
+}
+
+function statusBadge(status) {
+  const key = String(status || 'Pending').toLowerCase();
+  if (key === 'hod_assigned') return 'bg-purple-100 text-purple-700';
+  if (key === 'accepted' || key === 'placed') return 'bg-emerald-100 text-emerald-700';
+  if (key === 'rejected') return 'bg-rose-100 text-rose-700';
+  if (key === 'withdrawn') return 'bg-slate-100 text-slate-600';
+  if (key === 'pending' || key === 'applied') return 'bg-amber-100 text-amber-700';
+  if (key === 'shortlisted') return 'bg-violet-100 text-violet-700';
+  if (key === 'interview') return 'bg-indigo-100 text-indigo-700';
+  return 'bg-slate-100 text-slate-600';
+}
+
+function getApplicationFeedback(application = {}) {
+  return String(
+    application?.rejection_reason_by_company
+    || application?.rejectionReason
+    || application?.rejection_reason
+    || ''
+  ).trim();
+}
+
+function getHodRecommendation(application = {}) {
+  return String(application?.hod_assignment_note || application?.hod_note || '').trim();
+}
+
+function getCompanyName(application = {}) {
+  return String(application?.internshipId?.companyProfile?.companyName || 'Company').trim();
 }
 
 export default function Applications() {
@@ -34,6 +108,42 @@ export default function Applications() {
     isOpen: false,
     application: null
   });
+
+  const [feedbackModal, setFeedbackModal] = useState({
+    isOpen: false,
+    application: null
+  });
+
+  // Socket.io setup for real-time application updates
+  useEffect(() => {
+    const socket = io(undefined, {
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      reconnectionAttempts: 5
+    });
+
+    // Listen for real-time application status updates
+    const updateApplicationStatus = (data) => {
+      const applicationId = data?.applicationId || data?.id;
+      if (!applicationId) return;
+
+      setApplications(prev => 
+        prev.map(app => 
+          app._id === applicationId 
+            ? { ...app, status: data.status, updatedAt: new Date() }
+            : app
+        )
+      );
+    };
+
+    socket.on('application:status-updated', updateApplicationStatus);
+    socket.on('application:updated', updateApplicationStatus);
+
+    return () => {
+      socket.disconnect();
+    };
+  }, []);
 
   const fetchApplications = async () => {
     try {
@@ -242,9 +352,13 @@ export default function Applications() {
             <div className="space-y-4">
               {filteredApplications.map((application) => {
                 const statusStr = String(application.status || 'Pending').toLowerCase();
+                const isUniversityPlacement = statusStr === 'hod_assigned' || String(application?.placement_source || '').toUpperCase() === 'HOD_ASSIGNED' || String(application?.source || '').toLowerCase() === 'hod';
                 const isRejected = statusStr === 'rejected';
                 const isWithdrawn = statusStr === 'withdrawn';
                 const isPlaced = statusStr === 'placed';
+                const hodRecommendation = getHodRecommendation(application);
+                const feedbackText = getApplicationFeedback(application);
+                const statusLabel = isUniversityPlacement ? 'UNIVERSITY PLACEMENT' : String(application.status || 'Pending').toUpperCase();
 
                 return (
                   <Card key={application._id} className="rounded-[28px] border-slate-100 bg-white p-5 shadow-[0_15px_40px_rgba(15,23,42,0.03)] hover:shadow-[0_20px_50px_rgba(15,23,42,0.06)] transition-all flex flex-col lg:flex-row lg:items-center gap-6">
@@ -258,7 +372,38 @@ export default function Applications() {
                         )}
                       </div>
                       <div>
-                        <h3 className="text-base font-black text-slate-900 line-clamp-1">{application?.internshipId?.title || 'Internship'}</h3>
+                        <div className="flex flex-wrap items-center gap-2 mb-2">
+                          <h3 className="text-base font-black text-slate-900 line-clamp-1">{application?.internshipId?.title || 'Internship'}</h3>
+                          <span className={`rounded-full px-3 py-1 text-[10px] font-black uppercase tracking-widest ${statusBadge(application.status || 'Pending')}`}>
+                            {statusLabel}
+                          </span>
+                          {isUniversityPlacement && hodRecommendation && (
+                            <button
+                              type="button"
+                              onClick={() => setFeedbackModal({ isOpen: true, application })}
+                              className="inline-flex items-center gap-1 rounded-full border border-purple-200 bg-purple-50 px-3 py-1 text-[10px] font-black uppercase tracking-widest text-purple-700 transition hover:bg-purple-100"
+                              title="View university recommendation"
+                            >
+                              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              </svg>
+                              View Recommendation
+                            </button>
+                          )}
+                          {isRejected && feedbackText && !isUniversityPlacement && (
+                            <button
+                              type="button"
+                              onClick={() => setFeedbackModal({ isOpen: true, application })}
+                              className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-[10px] font-black uppercase tracking-widest text-rose-700 transition hover:bg-rose-100"
+                              title="View feedback from the company"
+                            >
+                              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              </svg>
+                              View Feedback
+                            </button>
+                          )}
+                        </div>
                         <p className="text-xs font-bold text-cyan-600 mt-0.5 line-clamp-1">{application?.internshipId?.companyProfile?.companyName || 'Company'}</p>
                         <p className="text-[10px] font-medium text-slate-400 mt-1 uppercase tracking-tighter">Applied: {new Date(application.createdAt).toLocaleDateString()}</p>
                       </div>
@@ -274,46 +419,61 @@ export default function Applications() {
 
                       <div className="relative py-2">
                         {(() => {
-                          const steps = ['pending', 'seen', 'shortlisted', 'interview', 'offered'];
-                          const labels = ['APPLIED', 'SEEN', 'SHORTLISTED', 'INTERVIEW', 'STATUS'];
-                          let stepIndex = steps.findIndex(s => s === statusStr);
-                          if (isPlaced) stepIndex = 4;
-                          if (stepIndex === -1 && (isRejected || isWithdrawn)) stepIndex = 4;
-                          if (stepIndex === -1) stepIndex = 0;
+                          const stepIndex = getStepIndex(application.status);
+                          const isRejected = statusStr === 'rejected';
+                          const isWithdrawn = statusStr === 'withdrawn';
+                          const isAccepted = statusStr === 'accepted' || statusStr === 'placed';
+                          const finalLabel = getFinalLabel(application.status, isUniversityPlacement);
+                          const rejectionStepIndex = isRejected ? getRejectedStepIndex(application) : 0;
+                          const progressWidth = isRejected
+                            ? ((rejectionStepIndex ?? 0) / 4) * 90
+                            : (stepIndex / 4) * 90;
 
-                          const finalLabel = isRejected ? 'REJECTED' : isWithdrawn ? 'WITHDRAWN' : isPlaced ? 'PLACED' : (statusStr === 'accepted' ? 'ACCEPTED' : 'OFFERED');
-                          
                           return (
                             <div className="relative flex justify-between w-full px-2">
                               <div className="absolute left-4 right-4 top-[9px] h-[2px] bg-slate-100 z-0"></div>
-                              {!isRejected && !isWithdrawn && (
-                                <div className={`absolute left-4 top-[9px] h-[2px] z-0 transition-all duration-500 ${isPlaced ? 'bg-emerald-400' : 'bg-cyan-400'}`} style={{ width: `${(stepIndex / 4) * 90}%` }}></div>
-                              )}
-                              {isRejected && <div className="absolute left-4 right-4 top-[9px] h-[2px] bg-rose-400 z-0"></div>}
-                              
-                              {labels.map((label, idx) => {
-                                const isActive = !isRejected && !isWithdrawn && (idx <= stepIndex || isPlaced);
-                                const isCurrent = !isRejected && !isWithdrawn && !isPlaced && idx === stepIndex;
+                              <div
+                                className={`absolute left-4 top-[9px] h-[2px] z-0 transition-all duration-500 ${
+                                  isRejected ? 'bg-rose-400' : isAccepted ? 'bg-emerald-400' : 'bg-cyan-400'
+                                }`}
+                                style={{ width: `${progressWidth}%` }}
+                              ></div>
+
+                              {STEP_LABELS.map((label, idx) => {
                                 const isFinalNode = idx === 4;
+                                const rejectionNode = isRejected && rejectionStepIndex === idx;
+                                const completedBeforeRejection = isRejected && idx < rejectionStepIndex;
+                                const isActive = !isRejected && !isWithdrawn && idx <= stepIndex;
+                                const isCurrent = !isRejected && !isWithdrawn && !isAccepted && !isUniversityPlacement && idx === stepIndex;
+                                const showActive = completedBeforeRejection || isActive || (isAccepted && idx <= stepIndex) || (isUniversityPlacement && idx <= stepIndex);
                                 const actualLabel = isFinalNode ? finalLabel : label;
 
                                 return (
                                   <div key={idx} className="flex flex-col items-center gap-2.5 z-10">
                                     <div className={`h-[18px] w-[18px] rounded-full border-2 bg-white flex items-center justify-center transition-all ${
-                                      (isFinalNode && isRejected) ? 'border-rose-500 bg-rose-50' :
-                                      (isFinalNode && isPlaced) ? 'border-emerald-500 bg-emerald-50' :
+                                      isFinalNode && isUniversityPlacement ? 'border-purple-500 bg-purple-50' :
+                                      isFinalNode && isRejected ? 'border-rose-500 bg-rose-50' :
+                                      isFinalNode && isAccepted ? 'border-emerald-500 bg-emerald-50' :
+                                      rejectionNode ? 'border-rose-500 bg-rose-50' :
                                       isCurrent ? 'border-cyan-500 ring-4 ring-cyan-50' :
-                                      isActive ? 'border-cyan-500 bg-cyan-50' : 'border-slate-200'
+                                      showActive ? 'border-cyan-500 bg-cyan-50' : 'border-slate-200'
                                     }`}>
-                                      {isActive && !isCurrent && !isFinalNode && <div className="h-1.5 w-1.5 rounded-full bg-cyan-500" />}
-                                      {isCurrent && <div className="h-2 w-2 rounded-full bg-cyan-500" />}
-                                      {isFinalNode && isPlaced && <svg className="h-2.5 w-2.5 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={4} d="M5 13l4 4L19 7" /></svg>}
-                                      {isFinalNode && isRejected && <div className="h-1.5 w-1.5 rounded-full bg-rose-500" />}
+                                      {isFinalNode && isAccepted ? (
+                                        <svg className="h-2.5 w-2.5 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={4} d="M5 13l4 4L19 7" /></svg>
+                                      ) : rejectionNode ? (
+                                        <div className="h-1.5 w-1.5 rounded-full bg-rose-500" />
+                                      ) : isCurrent ? (
+                                        <div className="h-2 w-2 rounded-full bg-cyan-500" />
+                                      ) : showActive ? (
+                                        <div className="h-1.5 w-1.5 rounded-full bg-cyan-500" />
+                                      ) : null}
                                     </div>
                                     <span className={`text-[8px] font-black tracking-widest ${
-                                      (isFinalNode && isRejected) ? 'text-rose-500' :
-                                      (isFinalNode && isPlaced) ? 'text-emerald-600' :
-                                      isActive ? 'text-slate-600' : 'text-slate-300'
+                                      isFinalNode && isUniversityPlacement ? 'text-purple-600' :
+                                      isFinalNode && isRejected ? 'text-rose-500' :
+                                      isFinalNode && isAccepted ? 'text-emerald-600' :
+                                      rejectionNode ? 'text-rose-500' :
+                                      showActive ? 'text-slate-600' : 'text-slate-300'
                                     }`}>{actualLabel}</span>
                                   </div>
                                 );
@@ -328,7 +488,11 @@ export default function Applications() {
                     <div className="flex flex-row lg:flex-col items-center lg:items-end justify-between lg:justify-center gap-4 lg:w-[20%]">
                       <div className="flex items-center gap-1.5 rounded-full bg-sky-50 px-3 py-1 border border-sky-100">
                         <svg className="h-3 w-3 text-sky-500" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" /></svg>
-                        <span className="text-[10px] font-black text-sky-700">{application?.matchingScore || 0}% Match</span>
+                        {(() => {
+                          const score = Number(application?.match_score ?? application?.matchScore ?? application?.matchingScore ?? application?.internshipId?.matchScore ?? application?.internshipId?.aiMatchScore ?? application?.internshipId?.matchingScore ?? 0);
+                          const colorClass = score > 0 ? 'text-sky-700' : 'text-rose-600';
+                          return <span className={`text-[10px] font-black ${colorClass}`}>{score}% Match</span>;
+                        })()}
                       </div>
                       <button 
                         onClick={() => handleViewDetails(application)}
@@ -396,6 +560,65 @@ export default function Applications() {
                     }`}
                   >
                     {confirmModal.confirmText}
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Company Feedback Modal */}
+      <AnimatePresence>
+        {feedbackModal.isOpen && feedbackModal.application && (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 sm:p-6">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setFeedbackModal({ isOpen: false, application: null })}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-md"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96, y: 16 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.96, y: 16 }}
+              className="relative w-full max-w-xl overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-slate-200"
+            >
+              <div className="border-b border-slate-100 p-6 sm:px-8">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-[10px] font-black uppercase tracking-[0.22em] text-rose-500">Application Feedback</p>
+                    <h3 className="mt-2 text-2xl font-black text-slate-900">
+                      Feedback from {getCompanyName(feedbackModal.application)}
+                    </h3>
+                  </div>
+                  <button
+                    onClick={() => setFeedbackModal({ isOpen: false, application: null })}
+                    className="rounded-full p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                  >
+                    <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 sm:p-8">
+                <div className="rounded-[24px] border border-rose-100 bg-rose-50/60 p-6">
+                  <p className="text-sm leading-7 text-slate-700 whitespace-pre-wrap">
+                    {String(feedbackModal.application?.status || '').toLowerCase() === 'hod_assigned'
+                      ? getHodRecommendation(feedbackModal.application) || 'University recommendation note not provided.'
+                      : getApplicationFeedback(feedbackModal.application)}
+                  </p>
+                </div>
+
+                <div className="mt-6 flex justify-end">
+                  <button
+                    onClick={() => setFeedbackModal({ isOpen: false, application: null })}
+                    className="rounded-xl bg-slate-900 px-6 py-3 text-sm font-bold text-white transition hover:bg-slate-800"
+                  >
+                    Close
                   </button>
                 </div>
               </div>
@@ -497,51 +720,42 @@ export default function Applications() {
                   </div>
                   <div className="rounded-2xl bg-slate-50 p-5">
                     <p className="text-sm leading-relaxed text-slate-600 whitespace-pre-wrap">
-                      {detailsModal.application.internshipId?.description || 'No description provided for this internship.'}
+                      {cleanDisplayText(detailsModal.application.internshipId?.description || '') || 'No description provided by the organization.'}
                     </p>
                   </div>
                 </section>
 
-                {/* 2. Requirements & Skills */}
-                {(detailsModal.application.internshipId?.requirements?.length > 0 || detailsModal.application.internshipId?.requiredSkills?.length > 0) && (
-                  <section>
-                    <div className="flex items-center gap-4 mb-4">
-                      <div className="h-12 w-12 rounded-xl bg-sky-50 text-sky-600 flex items-center justify-center">
-                        <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
-                      </div>
-                      <h4 className="text-lg font-bold text-slate-800">Requirements & Skills</h4>
+                <section>
+                  <div className="flex items-center gap-4 mb-4">
+                    <div className="h-12 w-12 rounded-xl bg-sky-50 text-sky-600 flex items-center justify-center">
+                      <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
                     </div>
-                    
-                    <div className="space-y-4">
-                      {detailsModal.application.internshipId.requiredSkills?.length > 0 && (
-                        <div>
-                          <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Technical Skills</p>
-                          <div className="flex flex-wrap gap-2">
-                            {detailsModal.application.internshipId.requiredSkills.map((skill, i) => (
-                              <span key={i} className="rounded-lg bg-sky-50 px-3 py-1 text-xs font-semibold text-sky-700 ring-1 ring-sky-100">
-                                {skill}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                      
-                      {detailsModal.application.internshipId.requirements?.length > 0 && (
-                        <div>
-                          <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">General Requirements</p>
-                          <ul className="grid grid-cols-1 gap-2">
-                            {detailsModal.application.internshipId.requirements.map((req, i) => (
-                              <li key={i} className="flex items-start gap-2 text-sm text-slate-600 bg-white border border-slate-100 rounded-xl p-3">
-                                <svg className="h-4 w-4 text-sky-500 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>
-                                {req}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
+                    <h4 className="text-lg font-bold text-slate-800">Detailed Requirements</h4>
+                  </div>
+                  <div className="rounded-2xl bg-slate-50 p-5 border border-slate-100">
+                    <p className="text-sm leading-relaxed text-slate-600 whitespace-pre-wrap">
+                      {cleanDisplayText(detailsModal.application.internshipId?.internship_requirements || detailsModal.application.internshipId?.description || '') || 'No additional requirements specified by the organization.'}
+                    </p>
+                  </div>
+                </section>
+
+                <section>
+                  <div className="flex items-center gap-4 mb-4">
+                    <div className="h-12 w-12 rounded-xl bg-sky-50 text-sky-600 flex items-center justify-center">
+                      <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
                     </div>
-                  </section>
-                )}
+                    <h4 className="text-lg font-bold text-slate-800">Technical Skills</h4>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {collectTechnicalSkills(detailsModal.application.internshipId).length > 0 ? collectTechnicalSkills(detailsModal.application.internshipId).map((skill, i) => (
+                      <span key={`${skill}-${i}`} className="rounded-lg bg-sky-50 px-3 py-1 text-xs font-semibold text-sky-700 ring-1 ring-sky-100">
+                        {skill}
+                      </span>
+                    )) : (
+                      <p className="text-sm text-slate-400 italic">No additional requirements specified by the organization.</p>
+                    )}
+                  </div>
+                </section>
 
                 {/* 3. Cover Letter */}
                 <section>

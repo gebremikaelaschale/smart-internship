@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const auth = require('../middleware/authMiddleware');
+const mongoose = require('mongoose');
 const Application = require('../models/Application');
 const Report = require('../models/Report');
 const Profile = require('../models/Profile');
@@ -9,6 +10,54 @@ const Notification = require('../models/Notification');
 const Task = require('../models/Task');
 const User = require('../models/User');
 const ActivityLog = require('../models/ActivityLog');
+const { getCalculatedMatch, isDepartmentCompatible } = require('../utils/internshipMatching');
+const { emitHodDashboardRefresh } = require('../utils/hodDashboardSync');
+
+function resolveStoredMatchScore(application = {}) {
+    const camel = Number(application?.matchingScore);
+    const snake = Number(application?.match_score);
+    const camelValue = Number.isFinite(camel) ? camel : 0;
+    const snakeValue = Number.isFinite(snake) ? snake : 0;
+    return Math.max(camelValue, snakeValue);
+}
+
+function emitNotification(req, notification) {
+    const io = req.app.get('io');
+    if (io && notification?.userId) {
+        io.to(`user:${notification.userId}`).emit('notification:new', notification);
+    }
+}
+
+async function upsertNotificationSafely(payload) {
+    try {
+        return await Notification.upsertBySourceKey(payload);
+    } catch (error) {
+        console.error('Notification upsert failed:', error);
+        return null;
+    }
+}
+
+async function getStudentAccessContext(studentId) {
+    const [student, profile] = await Promise.all([
+        User.findById(studentId).select('role department college isVerified verificationStatus status internshipStatus').lean(),
+        Profile.findOne({ userId: studentId }).lean()
+    ]);
+
+    const verificationStatus = String(student?.verificationStatus || '').toLowerCase();
+    const isVerified = Boolean(student?.isVerified) && verificationStatus === 'verified';
+    const studentDepartment = String(profile?.personalInfo?.department || student?.department || '').trim().toLowerCase();
+    const studentCollege = String(student?.college || '').trim().toLowerCase();
+
+    return { student, profile, isVerified, studentDepartment, studentCollege };
+}
+
+function internshipMatchesStudent(internship, context) {
+    return isDepartmentCompatible(
+        context.studentDepartment,
+        internship?.department || '',
+        internship?.targetDepartments || []
+    );
+}
 
 async function writeActivity(req, action, details) {
     try {
@@ -31,9 +80,17 @@ router.post('/apply', auth, async (req, res) => {
             return res.status(403).json({ message: 'Only students can apply for internships.' });
         }
 
+        if (!req.user?.id || !mongoose.Types.ObjectId.isValid(String(req.user.id))) {
+            return res.status(401).json({ message: 'Invalid or missing student session.' });
+        }
+
         const { internshipId, matchScore, resumeUrl, coverLetter } = req.body;
         if (!internshipId) {
             return res.status(400).json({ message: 'internshipId is required.' });
+        }
+
+        if (!mongoose.Types.ObjectId.isValid(String(internshipId))) {
+            return res.status(400).json({ message: 'internshipId is invalid.' });
         }
 
         const existing = await Application.findOne({ studentId: req.user.id, internshipId });
@@ -41,51 +98,43 @@ router.post('/apply', auth, async (req, res) => {
             return res.status(409).json({ message: 'You already applied to this internship.' });
         }
 
-        const isAlreadyPlaced = await Application.findOne({ studentId: req.user.id, status: 'Placed' });
-        if (isAlreadyPlaced) {
-            return res.status(403).json({ message: 'You are already placed in an internship and cannot apply for another one.' });
-        }
-
-        const [profile, internship] = await Promise.all([
-            Profile.findOne({ userId: req.user.id }).lean(),
+        const [accessContext, internship] = await Promise.all([
+            getStudentAccessContext(req.user.id),
             Internship.findById(internshipId).lean()
         ]);
+
+        const alreadyPlacedApp = await Application.findOne({ studentId: req.user.id, status: { $in: ['Accepted', 'Placed'] } });
+        const studentAlreadyPlaced = ['placed'].includes(String(accessContext.student?.status || accessContext.student?.internshipStatus || '').toLowerCase());
+        if (alreadyPlacedApp || studentAlreadyPlaced) {
+            return res.status(403).json({ message: 'You are already placed in an internship and cannot apply for another one.' });
+        }
 
         if (!internship) {
             return res.status(404).json({ message: 'Internship not found.' });
         }
 
-        let calculatedScore = 0;
-        const studentSkills = (profile?.academicInfo?.skills || []).map(s => String(s).toLowerCase().trim());
-        const requiredSkills = (internship?.requiredSkills || []).map(s => String(s).toLowerCase().trim());
-
-        if (requiredSkills.length > 0) {
-            let matchedCount = 0;
-            requiredSkills.forEach(req => {
-                if (studentSkills.some(stu => stu.includes(req) || req.includes(stu))) {
-                    matchedCount++;
-                }
-            });
-            calculatedScore = Math.round((matchedCount / requiredSkills.length) * 100);
-            
-            const sDept = String(profile?.personalInfo?.department || '').toLowerCase().trim();
-            const iDept = String(internship?.department || '').toLowerCase().trim();
-            if (sDept && iDept && (sDept.includes(iDept) || iDept.includes(sDept))) {
-                calculatedScore = Math.max(calculatedScore, 95);
-            }
+        if (!accessContext.isVerified) {
+            return res.status(403).json({ message: 'You must complete your profile and wait for HOD verification before applying.' });
         }
-        
-        calculatedScore = Math.min(100, calculatedScore);
+
+        if (!internshipMatchesStudent(internship, accessContext)) {
+            return res.status(403).json({ message: 'This internship is not available to your department or college.' });
+        }
+
+        const profile = accessContext.profile;
+
+        const matchResult = await getCalculatedMatch(req.user.id, internshipId);
+        const fallbackScore = Number(matchScore);
+        const calculatedScore = Number.isFinite(fallbackScore)
+            ? fallbackScore
+            : Number(matchResult?.score || 0);
 
         const finalResumeUrl = String(resumeUrl || profile?.resumeUrl || '').trim();
         if (!finalResumeUrl) {
             return res.status(400).json({ message: 'Please add your resume URL in profile before applying.' });
         }
 
-        // Workflow Differentiation based on Interview Requirement
-        // interviewRequired: false => Direct Placement ('Placed')
-        // interviewRequired: true  => Screening Needed ('Shortlisted')
-        const initialStatus = internship?.interviewRequired ? 'Shortlisted' : 'Placed';
+        const initialStatus = 'Pending';
 
         const newApp = new Application({
             studentId: req.user.id,
@@ -93,16 +142,18 @@ router.post('/apply', auth, async (req, res) => {
             resumeUrl: finalResumeUrl,
             coverLetter: String(coverLetter || '').trim(),
             matchingScore: calculatedScore,
+            match_score: calculatedScore,
             status: initialStatus,
+            source: 'student',
             timeline: [{
                 status: initialStatus,
                 date: new Date(),
-                comment: internship?.interviewRequired 
-                    ? 'Screening required. Waiting for employer interview.' 
-                    : 'Direct placement successful. You can now access your placement letter.'
+                comment: 'Your application has been submitted and is awaiting employer review.'
             }]
         });
         await newApp.save();
+
+        // Application creation should never auto-place a student. Placement happens only after employer acceptance.
 
         await writeActivity(
             req,
@@ -111,46 +162,63 @@ router.post('/apply', auth, async (req, res) => {
         );
 
         try {
-            const [internship, student] = await Promise.all([
+            const [internshipSummary, student] = await Promise.all([
                 Internship.findById(internshipId).select('title companyId').lean(),
                 User.findById(req.user.id).select('fullName name email').lean()
             ]);
 
-            const internshipTitle = internship?.title || 'this internship';
-            await Notification.create({
+            const internshipTitle = internshipSummary?.title || 'this internship';
+            const studentNotification = await Notification.create({
                 userId: req.user.id,
+                receiverRole: 'student',
+                senderId: internshipSummary?.companyId || null,
+                senderRole: 'employer',
                 title: 'Application Submitted',
                 message: `Your application for ${internshipTitle} was submitted successfully.`,
                 type: 'success',
                 targetRoute: '/student/applications'
             });
+            emitNotification(req, studentNotification?.toObject ? studentNotification.toObject() : studentNotification);
 
-            if (internship?.companyId) {
+            if (internshipSummary?.companyId) {
                 const applicantName = student?.fullName || student?.name || student?.email || 'A student';
-                await Notification.findOneAndUpdate(
-                    { userId: internship.companyId, sourceKey: `new-applicant:${newApp._id}` },
-                    {
-                        $setOnInsert: {
-                            userId: internship.companyId,
-                            title: 'New applicant',
-                            message: `${applicantName} applied for ${internshipTitle}.`,
-                            type: 'info',
-                            targetRoute: '/employer/applicants',
-                            category: 'new-applicant',
-                            sourceKey: `new-applicant:${newApp._id}`,
-                            isRead: false,
-                            createdAt: new Date()
-                        }
-                    },
-                    { upsert: true, returnDocument: 'before' }
-                );
+                const employerNotification = await Notification.create({
+                    userId: internshipSummary.companyId,
+                    receiverRole: 'employer',
+                    senderId: req.user.id,
+                    senderRole: 'student',
+                    title: 'New Internship Application',
+                    message: `A new student ${applicantName} has applied for your internship position.`,
+                    type: 'info',
+                    targetRoute: '/employer/applicants',
+                    category: 'new-applicant',
+                    metadata: {
+                        kind: 'application-submitted',
+                        applicationId: newApp._id,
+                        internshipId: internshipSummary._id,
+                        studentId: req.user.id
+                    }
+                });
+                emitNotification(req, employerNotification?.toObject ? employerNotification.toObject() : employerNotification);
+
+                const io = req.app.get('io');
+                if (io && internshipSummary.companyId) {
+                    io.to(`user:${String(internshipSummary.companyId)}`).emit('contacts:refresh', {
+                        reason: 'new-application',
+                        internshipId: String(internshipSummary._id || internshipId),
+                        studentId: String(req.user.id || '')
+                    });
+                }
             }
         } catch {
             // Keep the main application flow successful even if notification write fails.
         }
 
         res.status(201).json({ message: 'Application submitted successfully.', application: newApp });
-    } catch (err) { res.status(500).send("Application error."); }
+    } catch (err) {
+        console.error('Error in /application/apply:', err);
+        res.status(500).json({ message: err?.message || 'Application error.' });
+    }
 });
 
 // 1.1 ተማሪው የላካቸውን ማመልከቻዎች ለማየት (My Applications)
@@ -161,7 +229,7 @@ router.get('/my', auth, async (req, res) => {
         }
 
         const apps = await Application.find({ studentId: req.user.id })
-            .populate('internshipId', 'title location type status companyId duration startDate description requirements requiredSkills programType department endDate isPaid stipend studentsNeeded trainingFocus')
+            .populate('internshipId', 'title location type status companyId duration startDate description internship_requirements requirements requiredSkills structuredRequirements programType department endDate isPaid stipend studentsNeeded trainingFocus')
             .sort({ createdAt: -1 })
             .lean();
 
@@ -177,45 +245,49 @@ router.get('/my', auth, async (req, res) => {
         const profile = await Profile.findOne({ userId: req.user.id }).lean();
         const studentSkills = (profile?.academicInfo?.skills || []).filter(Boolean).map(s => String(s).toLowerCase().trim());
 
-        const enrichedApps = apps.map(app => {
+        const enrichedApps = await Promise.all(apps.map(async app => {
             const internship = app.internshipId;
             if (internship) {
                 internship.companyProfile = profileMap[String(internship.companyId)] || null;
-                
-                const reqSkillsArray = internship.requiredSkills || [];
-                const requiredSkills = reqSkillsArray.filter(Boolean).map(s => String(s).toLowerCase().trim());
-                
-                let calculatedScore = 0;
-                if (requiredSkills.length > 0) {
-                    let matchedCount = 0;
-                    requiredSkills.forEach(req => {
-                        if (studentSkills.some(stu => stu.includes(req) || req.includes(stu))) {
-                            matchedCount++;
-                        }
-                    });
-                    
-                    // Skill-based score (100% scale)
-                    calculatedScore = Math.round((matchedCount / requiredSkills.length) * 100);
-                    
-                    // Department Boost: If department matches, ensure it's at least high or give a +10 bonus
-                    const sDept = String(profile?.personalInfo?.department || '').toLowerCase().trim();
-                    const iDept = String(internship.department || '').toLowerCase().trim();
-                    if (sDept && iDept && (sDept.includes(iDept) || iDept.includes(sDept))) {
-                        calculatedScore = Math.max(calculatedScore, 95); // Ensure at least 95% if departments align
-                    }
+                let finalScore = resolveStoredMatchScore(app);
+
+                if (!finalScore || finalScore === 0) {
+                     const matchResult = await getCalculatedMatch(req.user.id, internship._id);
+                     finalScore = matchResult ? matchResult.score : 0;
+                     if (finalScore > 0) {
+                         await Application.updateOne(
+                             { _id: app._id },
+                             { $set: { matchingScore: finalScore, match_score: finalScore } }
+                         );
+                     }
                 }
-                
-                const finalScore = Math.min(100, calculatedScore);
+
                 app.matchingScore = finalScore;
-                
-                // Persist asynchronously
-                Application.updateOne({ _id: app._id }, { matchingScore: finalScore }).catch(() => {});
+                app.matchScore = finalScore;
+                app.match_score = finalScore;
+                internship.matchScore = finalScore;
+                internship.aiMatchScore = finalScore;
+                internship.matchingScore = finalScore;
             }
+
+            // Hide HOD-only rejection reasons from students
+            try {
+                if (String(app.rejectionVisibleTo || '').toUpperCase() === 'HOD') {
+                    app.rejectionReason = '';
+                    app.rejection_reason_by_company = '';
+                }
+            } catch (e) {
+                // ignore
+            }
+
             return app;
-        });
+        }));
 
         res.json(enrichedApps);
-    } catch (err) { res.status(500).send("Fetching error."); }
+    } catch (err) {
+        console.error("Error in /application/my:", err);
+        res.status(500).json({ message: err?.message || 'Fetching error.' });
+    }
 });
 
 // 2. ለአድሚን/ኮርዲኔተር ሁሉንም ማመልከቻዎች ለማሳየት
@@ -224,20 +296,37 @@ router.get('/admin/all', auth, async (req, res) => {
         const apps = await Application.find()
             .populate('studentId', 'fullName email')
             .populate('internshipId', 'title');
-        res.json(apps);
+        // Ensure snake_case field is present for consumers expecting match_score
+        const normalized = apps.map((a) => {
+            const app = a.toObject ? a.toObject() : a;
+            const finalScore = resolveStoredMatchScore(app);
+            app.matchingScore = finalScore;
+            app.matchScore = finalScore;
+            app.match_score = finalScore;
+            return app;
+        });
+        res.json(normalized);
     } catch (err) { res.status(500).send("Database sync error."); }
 });
 
-// 2.1 ለአንድ ድርጅት የተላኩ ማመልከቻዎችን ለማሳየት (Industry Partner Matrix)
+
 router.get('/employer/all', auth, async (req, res) => {
     if (String(req.user?.role || '').toLowerCase() !== 'employer') return res.status(403).send("No Permission.");
     try {
-        // መጀመሪያ የድርጅቱን ኢንተርንሺፖች ማግኘት
+        
         const myPrograms = await Internship.find({ companyId: req.user.id });
         const programIds = myPrograms.map(p => p._id);
 
-        const apps = await Application.find({ internshipId: { $in: programIds } })
-            .populate('studentId', 'fullName email profilePicUrl department')
+        const sortOrder = String(req.query.sortOrder || 'desc').toLowerCase() === 'asc' ? 1 : -1;
+        const minMatchScore = Number(req.query.minMatchScore);
+        const query = { internshipId: { $in: programIds } };
+        if (Number.isFinite(minMatchScore) && minMatchScore >= 0) {
+            query.match_score = { $gte: minMatchScore };
+        }
+
+        const apps = await Application.find(query)
+            .sort({ match_score: sortOrder, createdAt: -1 })
+            .populate('studentId', 'fullName email profileImage department college phone')
             .populate('internshipId', 'title location');
 
         const studentIds = [...new Set(
@@ -247,7 +336,7 @@ router.get('/employer/all', auth, async (req, res) => {
         )];
 
         const profiles = await Profile.find({ userId: { $in: studentIds } })
-            .select('userId personalInfo.department academicInfo.skills resumeUrl')
+            .select('userId personalInfo academicInfo portfolioLinks resumeUrl profilePicUrl')
             .lean();
 
         const profileByUserId = new Map(
@@ -258,13 +347,33 @@ router.get('/employer/all', auth, async (req, res) => {
             const appObject = app.toObject();
             const studentId = String(appObject?.studentId?._id || '');
             const profile = profileByUserId.get(studentId);
+            const finalScore = resolveStoredMatchScore(appObject);
+
+            // Comprehensive mapping to ensure "really fetch everything"
             return {
                 ...appObject,
+                matchingScore: finalScore,
+                matchScore: finalScore,
+                match_score: finalScore,
                 studentProfile: {
                     department: String(profile?.personalInfo?.department || appObject?.studentId?.department || '').trim(),
+                    yearOfStudy: String(profile?.personalInfo?.yearOfStudy || '').trim(),
+                    phone: String(profile?.personalInfo?.phone || appObject?.studentId?.phone || '').trim(),
+                    bio: String(profile?.personalInfo?.bio || '').trim(),
+                    address: String(profile?.personalInfo?.address || '').trim(),
+                    gpa: profile?.academicInfo?.gpa || null,
+                    courses: Array.isArray(profile?.academicInfo?.courses) ? profile.academicInfo.courses : [],
                     skills: Array.isArray(profile?.academicInfo?.skills) ? profile.academicInfo.skills : [],
-                    resumeUrl: String(profile?.resumeUrl || appObject?.resumeUrl || '').trim()
-                }
+                    portfolioLinks: profile?.portfolioLinks || {},
+                    resumeUrl: String(profile?.resumeUrl || appObject?.resumeUrl || '').trim(),
+                    profilePicUrl: String(profile?.profilePicUrl || appObject?.studentId?.profileImage || '').trim(),
+                    college: String(appObject?.studentId?.college || '').trim()
+                },
+                placement_source: appObject?.placement_source || 'STUDENT_APPLIED',
+                source: appObject?.source || 'student',
+                hod_note: appObject?.hod_note || '',
+                hod_assignment_note: appObject?.hod_assignment_note || '',
+                assignedBy: appObject?.assignedBy || ''
             };
         });
 
@@ -278,15 +387,17 @@ router.get('/employer/active', auth, async (req, res) => {
     try {
         const myPrograms = await Internship.find({ companyId: req.user.id }).select('_id title status').lean();
         const programIds = myPrograms.map((program) => program._id);
+        console.log(`[ActiveInterns] Found ${programIds.length} programs for employer ${req.user.id}`);
         const internshipById = new Map(myPrograms.map((program) => [String(program._id), program]));
 
         const acceptedApps = await Application.find({
             internshipId: { $in: programIds },
-            status: 'Accepted'
+            status: { $in: ['Accepted', 'Placed'] }
         })
             .populate('studentId', 'fullName email department')
             .populate('internshipId', 'title status')
             .lean();
+        console.log(`[ActiveInterns] Found ${acceptedApps.length} accepted/placed applications`);
 
         const appIds = acceptedApps.map((app) => app._id);
         const tasks = await Task.find({ application: { $in: appIds } }).select('application status').lean();
@@ -332,9 +443,17 @@ router.get('/employer/active', auth, async (req, res) => {
                     id: internship?._id,
                     title: internship?.title || 'Unknown Internship'
                 },
+                // expose the stored match score for employer/HOD views
+                match_score: resolveStoredMatchScore(app),
+                matchScore: resolveStoredMatchScore(app),
                 progress,
                 status: String(internship?.status || '').toLowerCase() === 'closed' ? 'Closed' : 'Active',
-                tasks: taskStats
+                tasks: taskStats,
+                placement_source: app?.placement_source || 'STUDENT_APPLIED',
+                source: app?.source || 'student',
+                hod_note: app?.hod_note || '',
+                hod_assignment_note: app?.hod_assignment_note || '',
+                assignedBy: app?.assignedBy || ''
             };
         });
 
@@ -378,27 +497,26 @@ router.put('/status/:id', auth, async (req, res) => {
                 return res.status(403).json({ message: 'You can only update applicants for your own internships.' });
             }
 
-            const employerAllowed = new Set(['Under Review', 'Interview', 'Accepted', 'Rejected']);
+            const employerAllowed = new Set(['Pending', 'Under Review', 'Interview', 'Accepted', 'Rejected', 'Placed']);
             if (!employerAllowed.has(String(status || '').trim())) {
                 return res.status(400).json({ message: 'Invalid status transition for employer.' });
             }
         }
 
-        // Workflow Automation: If an employer accepts a student, finalize as 'Placed'
-        const finalStatus = (role === 'employer' && status === 'Accepted') ? 'Placed' : status;
+        const finalStatus = String(status || '').trim();
 
         const updatedApp = await Application.findByIdAndUpdate(
-            req.params.id, 
+            req.params.id,
             {
                 $set: { status: finalStatus, remarks: normalizedRemarks, updatedAt: Date.now() },
                 $push: {
                     timeline: {
                         status: finalStatus,
                         date: new Date(),
-                        comment: normalizedRemarks || (finalStatus === 'Placed' ? 'Congratulations! You have been accepted and placed for this internship.' : '')
+                        comment: normalizedRemarks || (finalStatus === 'Accepted' ? 'Employer accepted this application.' : '')
                     }
                 }
-            }, 
+            },
             { returnDocument: 'after' }
         );
 
@@ -420,19 +538,148 @@ router.put('/status/:id', auth, async (req, res) => {
             );
         }
 
+        // Smart rejection routing for employers: route reason to HOD or Student depending on placement_source
         if (updatedApp?.studentId) {
             try {
-                await Notification.create({
-                    userId: updatedApp.studentId,
-                    title: 'Application Status Updated',
-                    message: `Your application status is now ${status || updatedApp.status}.`,
-                    type: 'info',
-                    targetRoute: '/student/applications'
-                });
-            } catch {
-                // Status updates should not fail if notification write fails.
+                const actorRole = String(req.user.role || 'employer').toLowerCase();
+                const studentId = updatedApp.studentId;
+                const companyUserId = currentApp?.internshipId?.companyId || updatedApp.companyId || null;
+                const companyUser = companyUserId ? await User.findById(companyUserId).select('fullName name companyName').lean() : null;
+                const companyName = companyUser?.companyName || companyUser?.fullName || companyUser?.name || 'Company';
+                const makeSourceKey = (scope) => `application-status:${updatedApp._id}:${scope}`;
+
+                // Extract a rejection reason if provided
+                const rejectReason = String(req.body?.reason || req.body?.rejectionReason || req.body?.remarks || '').trim();
+
+                if (actorRole === 'employer' && String(updatedApp.status || '').trim() === 'Rejected') {
+                    // store rejection reason and visibility
+                    const visibleTo = String(updatedApp.placement_source || '').toUpperCase() === 'HOD_ASSIGNED' ? 'HOD' : 'STUDENT';
+                    updatedApp.rejectionReason = rejectReason;
+                    updatedApp.rejection_reason_by_company = rejectReason;
+                    updatedApp.rejectionVisibleTo = visibleTo;
+                    await updatedApp.save();
+
+                    if (visibleTo === 'HOD') {
+                        // Notify HOD(s) in student's department with reason
+                        const studentUser = await User.findById(studentId).select('fullName department departmentId').lean();
+                        let hod = await User.findOne({ role: { $in: ['hod', 'deptadmin'] }, $or: [{ departmentId: studentUser?.departmentId }, { department: studentUser?.department }] }).select('_id fullName').lean();
+                        if (hod && hod._id) {
+                            const hodNotification = await upsertNotificationSafely({
+                                userId: hod._id,
+                                receiverRole: 'hod',
+                                senderId: req.user.id,
+                                senderRole: 'employer',
+                                type: 'warning',
+                                title: `Company ${companyName} rejected assigned student`,
+                                message: `Company ${companyName} has rejected the assigned student ${studentUser?.fullName || 'Student'}. Reason: ${rejectReason}`,
+                                targetRoute: '/hod/dashboard',
+                                sourceKey: makeSourceKey('hod-rejection'),
+                                metadata: { applicationId: updatedApp._id, reason: rejectReason, visible_to: 'HOD' }
+                            });
+                            emitNotification(req, hodNotification?.toObject ? hodNotification.toObject() : hodNotification);
+                        }
+
+                        // Inform the student of rejection but do NOT include the specific reason
+                        const studentNotification = await upsertNotificationSafely({
+                            userId: studentId,
+                            receiverRole: 'student',
+                            senderId: req.user.id,
+                            senderRole: 'employer',
+                            type: 'info',
+                            title: 'Application Rejected',
+                            message: `Your application to ${companyName} was not successful.`,
+                            targetRoute: '/student/applications',
+                            sourceKey: makeSourceKey('student-rejection-hidden'),
+                            metadata: { applicationId: updatedApp._id, visible_to: 'HOD' }
+                        });
+                        emitNotification(req, studentNotification?.toObject ? studentNotification.toObject() : studentNotification);
+                    } else {
+                        // Visible to student (direct applicant) — send reason to student
+                        const studentNotification = await upsertNotificationSafely({
+                            userId: studentId,
+                            receiverRole: 'student',
+                            senderId: req.user.id,
+                            senderRole: 'employer',
+                            type: 'warning',
+                            title: 'Application Feedback Available',
+                            message: `Industry Partner ${companyName} has provided feedback on your application. Click to view details.`,
+                            targetRoute: '/student/applications',
+                            sourceKey: makeSourceKey('student-rejection-visible'),
+                            metadata: { applicationId: updatedApp._id, companyName, reason: rejectReason, rejectionReason: rejectReason, visible_to: 'STUDENT' }
+                        });
+                        emitNotification(req, studentNotification?.toObject ? studentNotification.toObject() : studentNotification);
+
+                        // Also notify HOD that the student was rejected (no reason detail required)
+                        const studentUser = await User.findById(studentId).select('fullName department departmentId').lean();
+                        let hod = await User.findOne({ role: { $in: ['hod', 'deptadmin'] }, $or: [{ departmentId: studentUser?.departmentId }, { department: studentUser?.department }] }).select('_id fullName').lean();
+                        if (hod && hod._id) {
+                            const hodNotification = await upsertNotificationSafely({
+                                userId: hod._id,
+                                receiverRole: 'hod',
+                                senderId: req.user.id,
+                                senderRole: 'employer',
+                                type: 'info',
+                                title: `Company ${companyName} rejected ${studentUser?.fullName || 'a student'}`,
+                                message: `Company ${companyName} has rejected ${studentUser?.fullName || 'a student'} for their internship application.`,
+                                targetRoute: '/hod/dashboard',
+                                sourceKey: makeSourceKey('hod-rejection-visible'),
+                                metadata: { applicationId: updatedApp._id, visible_to: 'STUDENT' }
+                            });
+                            emitNotification(req, hodNotification?.toObject ? hodNotification.toObject() : hodNotification);
+                        }
+                    }
+                } else {
+                    // Non-employer actor or non-rejection: default notification to student about status
+                    const notification = await upsertNotificationSafely({
+                        userId: updatedApp.studentId,
+                        receiverRole: 'student',
+                        senderId: req.user.id,
+                        senderRole: actorRole,
+                        title: 'Application Status Updated',
+                        message: `Your application status is now ${status || updatedApp.status}.`,
+                        type: 'info',
+                        targetRoute: '/student/applications',
+                        sourceKey: makeSourceKey('status-updated')
+                    });
+                    emitNotification(req, notification?.toObject ? notification.toObject() : notification);
+                }
+            } catch (notifyErr) {
+                // don't block main flow on notification errors
+                console.error('Notification routing error:', notifyErr);
             }
         }
+
+        // Only update student placement status when the application is actually marked Placed.
+        try {
+            const finalPlaced = ['placed', 'PLACED'].includes(String(updatedApp?.status || '').toLowerCase());
+            if (finalPlaced && updatedApp?.studentId) {
+                await User.findByIdAndUpdate(updatedApp.studentId, {
+                    internshipStatus: 'Placed',
+                    status: 'PLACED'
+                }).catch(() => {});
+            }
+        } catch (e) {
+            // non-critical
+        }
+
+        const io = req.app.get('io');
+        if (io && updatedApp?.studentId) {
+            io.to(`user:${String(updatedApp.studentId)}`).emit('application:status-updated', {
+                applicationId: String(updatedApp._id || ''),
+                status: String(updatedApp.status || '').trim()
+            });
+            io.to(`user:${String(updatedApp.studentId)}`).emit('application:updated', {
+                id: String(updatedApp._id || ''),
+                status: String(updatedApp.status || '').trim()
+            });
+        }
+
+        emitHodDashboardRefresh(req, {
+            reason: 'application-status-updated',
+            applicationId: String(updatedApp._id || ''),
+            studentId: String(updatedApp.studentId || ''),
+            internshipId: String(updatedApp.internshipId || '')
+        });
 
         res.json(updatedApp);
     } catch (err) { res.status(500).send("Status update failed."); }
@@ -442,14 +689,15 @@ router.put('/status/:id', auth, async (req, res) => {
 router.put('/withdraw/:id', auth, async (req, res) => {
     try {
         if (String(req.user?.role || '').toLowerCase() !== 'student') return res.status(403).send("Unauthorized.");
-        
+
         const app = await Application.findOne({ _id: req.params.id, studentId: req.user.id });
         if (!app) return res.status(404).send("Application not found.");
-        
+
         app.status = 'Withdrawn';
         await app.save();
-        
+
         await writeActivity(req, 'STUDENT_WITHDREW_APPLICATION', `AppId=${app._id}`);
+        emitHodDashboardRefresh(req, { reason: 'application-withdrawn', applicationId: String(app._id || '') });
         res.json({ message: "Application withdrawn successfully.", application: app });
     } catch (err) { res.status(500).send("Withdrawal failed."); }
 });
@@ -459,18 +707,67 @@ router.put('/respond/:id', auth, async (req, res) => {
     try {
         if (String(req.user?.role || '').toLowerCase() !== 'student') return res.status(403).send("Unauthorized.");
         const { status } = req.body; // 'Accepted' or 'Rejected'
-        
+
         if (!['Accepted', 'Rejected'].includes(status)) return res.status(400).send("Invalid status.");
-        
+
         const app = await Application.findOne({ _id: req.params.id, studentId: req.user.id });
         if (!app) return res.status(404).send("Application not found.");
-        
+
         app.status = status === 'Accepted' ? 'Placed' : 'Rejected';
         await app.save();
-        
+
         await writeActivity(req, 'STUDENT_RESPONDED_TO_OFFER', `AppId=${app._id} Status=${status}`);
+        emitHodDashboardRefresh(req, {
+            reason: 'offer-response-updated',
+            applicationId: String(app._id || ''),
+            responseStatus: status
+        });
+        // When a student accepts an offer and status becomes Placed, update their User record
+        try {
+            if (String(app.status || '').toLowerCase() === 'placed') {
+                await User.findByIdAndUpdate(app.studentId, { internshipStatus: 'Placed', status: 'PLACED' }).catch(() => {});
+            }
+        } catch (e) {
+            // ignore
+        }
         res.json({ message: `Offer ${status.toLowerCase()} successfully.`, application: app });
     } catch (err) { res.status(500).send("Response failed."); }
+});
+
+// 7. ማመልከቻን ለመሰረዝ (Delete Application)
+router.delete('/:id', auth, async (req, res) => {
+    try {
+        const role = String(req.user?.role || '').toLowerCase();
+        if (!['admin', 'employer'].includes(role)) {
+            return res.status(403).json({ message: 'No permission to delete applications.' });
+        }
+
+        const app = await Application.findById(req.params.id);
+        if (!app) return res.status(404).json({ message: 'Application not found.' });
+
+        // If employer, check ownership
+        if (role === 'employer') {
+            const internship = await Internship.findById(app.internshipId);
+            const ownerId = String(internship?.companyId || '');
+            if (ownerId !== String(req.user.id)) {
+                return res.status(403).json({ message: 'You can only delete applicants for your own internships.' });
+            }
+        }
+
+        // Clean up related data if necessary (Tasks, Reports, Notifications)
+        await Promise.all([
+            Application.findByIdAndDelete(req.params.id),
+            Task.deleteMany({ application: req.params.id }),
+            Report.deleteMany({ application: req.params.id }),
+            Notification.deleteMany({ sourceKey: `new-applicant:${req.params.id}` })
+        ]);
+
+        await writeActivity(req, 'APPLICATION_DELETED', `AppId=${req.params.id} DeletedBy=${req.user.id}`);
+        res.json({ success: true, message: "Application and related data deleted successfully." });
+    } catch (err) { 
+        console.error("Delete error:", err);
+        res.status(500).json({ message: "Deletion failed due to a server error." }); 
+    }
 });
 
 module.exports = router;

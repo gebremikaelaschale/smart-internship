@@ -3,6 +3,15 @@ import { useSearchParams } from 'react-router-dom';
 import Loader from '@/components/common/Loader';
 import ErrorMessage from '@/components/common/ErrorMessage';
 import { studentAPI } from '../studentAPI';
+import useCompanyStatusSync from '@/hooks/useCompanyStatusSync';
+import MatchScoreBadge from '@/features/student/components/MatchScoreBadge';
+import {
+  STUDENT_PROFILE_UPDATED_EVENT,
+  STUDENT_PROFILE_UPDATED_STORAGE_KEY,
+  STUDENT_STATS_REFRESH_EVENT,
+  STUDENT_STATS_REFRESH_STORAGE_KEY,
+  notifyStudentStatsRefresh
+} from '@/utils/profileSync';
 
 function mapApiError(error) {
   return error?.response?.data?.message || 'Unable to load internships.';
@@ -14,6 +23,40 @@ const getImageUrl = (url) => {
   const baseUrl = import.meta.env.VITE_API_BASE_URL ? import.meta.env.VITE_API_BASE_URL.replace('/api', '') : 'http://localhost:5000';
   return `${baseUrl}${url.startsWith('/') ? '' : '/'}${url}`;
 };
+
+const TYPO_FIXES = [
+  [/\bract\b/gi, 'React'],
+  [/\bclaud\b/gi, 'Cloud']
+];
+
+function cleanDisplayText(value = '') {
+  let text = String(value || '').trim();
+  TYPO_FIXES.forEach(([pattern, replacement]) => {
+    text = text.replace(pattern, replacement);
+  });
+  return text;
+}
+
+function collectTechnicalSkills(internship = {}) {
+  const sources = [
+    internship?.requiredSkills,
+    internship?.structuredRequirements?.coreTechnicalSkills,
+    internship?.structuredRequirements?.preferredSkills,
+    internship?.structuredRequirements?.softSkills,
+    String(internship?.internship_requirements || internship?.description || '')
+      .split(/[\n,;/]|\band\b/gi)
+  ];
+
+  return [...new Set(
+    sources
+      .flatMap((source) => (Array.isArray(source) ? source : [source]))
+      .map((item) => cleanDisplayText(item))
+      .map((item) => item.replace(/[\-•]+/g, ' ').trim())
+      .filter(Boolean)
+      .filter((item) => item.length >= 2)
+      .slice(0, 10)
+  )];
+}
 
 function CompanyLogo({ company, className = "w-full h-full" }) {
   const [error, setError] = useState(false);
@@ -39,6 +82,152 @@ function CompanyLogo({ company, className = "w-full h-full" }) {
   );
 }
 
+function resolveCompanyForInternship(internship = {}) {
+  const logoUrl = internship.company_logo_url || internship.companyId?.profileImage || internship.companyId?.logo;
+  const companyName = internship.company_name || internship.companyId?.name || internship.companyId?.fullName || 'Real World Partner';
+  return {
+    name: companyName,
+    fullName: companyName,
+    profileImage: logoUrl,
+    logo: logoUrl
+  };
+}
+
+function DynamicDeadlineCountdown({ deadline, compensationType, isPaid }) {
+  const [timeLeft, setTimeLeft] = React.useState(null);
+
+  React.useEffect(() => {
+    if (!deadline) return;
+
+    const calculateTimeLeft = () => {
+      const now = new Date().getTime();
+      const target = new Date(deadline).getTime();
+      const difference = target - now;
+
+      if (difference <= 0) {
+        return { expired: true, days: 0, hours: 0, minutes: 0, seconds: 0 };
+      }
+
+      const days = Math.floor(difference / (1000 * 60 * 60 * 24));
+      const hours = Math.floor((difference % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+      const minutes = Math.floor((difference % (1000 * 60 * 60)) / (1000 * 60));
+      const seconds = Math.floor((difference % (1000 * 60)) / 1000);
+
+      return { expired: false, days, hours, minutes, seconds };
+    };
+
+    setTimeLeft(calculateTimeLeft());
+
+    const timer = setInterval(() => {
+      setTimeLeft(calculateTimeLeft());
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [deadline]);
+
+  const compensationLabel = compensationType === 'Allowance' 
+    ? 'Covers Allowance' 
+    : (compensationType || (isPaid ? 'Paid' : 'Unpaid'));
+
+  const compBadgeClass = compensationType === 'Paid' 
+    ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' 
+    : compensationType === 'Allowance' 
+    ? 'bg-sky-100 text-sky-800 border border-sky-200' 
+    : 'bg-slate-100 text-slate-600 border border-slate-200';
+
+  if (!deadline) {
+    return (
+      <div className="mb-6 flex items-center justify-between p-4 rounded-3xl bg-emerald-50/50 border border-emerald-100/50 shadow-sm shadow-emerald-50/10">
+        <div className="flex items-center gap-2">
+          <div className="h-2 w-2 rounded-full bg-emerald-500" />
+          <span className="text-[10px] font-black uppercase tracking-widest text-emerald-600">
+            No Deadline
+          </span>
+        </div>
+        <span className={`px-3 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest ${compBadgeClass}`}>
+          {compensationLabel}
+        </span>
+      </div>
+    );
+  }
+
+  if (!timeLeft) return null;
+
+  if (timeLeft.expired) {
+    return (
+      <div className="mb-6 flex items-center justify-between p-4 rounded-3xl bg-slate-50 border border-slate-200/50 shadow-inner">
+        <div className="flex items-center gap-2">
+          <div className="h-2 w-2 rounded-full bg-slate-300" />
+          <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+            Application Closed
+          </span>
+        </div>
+        <span className={`px-3 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest ${compBadgeClass}`}>
+          {compensationLabel}
+        </span>
+      </div>
+    );
+  }
+
+  const isUrgent = timeLeft.days < 3;
+
+  return (
+    <div className={`mb-6 flex flex-col p-5 rounded-[2rem] border transition-all ${
+      isUrgent 
+        ? 'bg-gradient-to-br from-rose-50/80 to-rose-50/40 border-rose-200 shadow-lg shadow-rose-50/50' 
+        : 'bg-gradient-to-br from-cyan-50/50 to-cyan-50/20 border-cyan-150 shadow-lg shadow-cyan-50/50'
+    }`}>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <div className={`h-2.5 w-2.5 rounded-full ${isUrgent ? 'bg-rose-600 animate-ping' : 'bg-cyan-600 animate-pulse'}`} />
+          <span className={`text-[10px] font-black uppercase tracking-widest ${isUrgent ? 'text-rose-700' : 'text-cyan-700'}`}>
+            {isUrgent ? '⚠️ Closing Soon!' : '⏳ Application Countdown'}
+          </span>
+        </div>
+        <span className={`px-3 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-sm ${compBadgeClass}`}>
+          {compensationLabel}
+        </span>
+      </div>
+
+      <div className="flex items-center gap-4 mt-2">
+        <div className="relative h-11 w-11 shrink-0 flex items-center justify-center rounded-full bg-white shadow-md border border-slate-100 overflow-hidden">
+          <div className="absolute inset-0 bg-gradient-to-tr from-cyan-500 via-pink-500 to-amber-400 animate-spin opacity-90" />
+          <div className="absolute inset-[3px] rounded-full bg-white flex items-center justify-center z-10 shadow-inner">
+            <span className="text-base font-black text-slate-800">⏳</span>
+          </div>
+        </div>
+
+        <div className="flex items-baseline gap-1">
+          {timeLeft.days > 0 && (
+            <>
+              <span className={`text-2xl font-black tracking-tight leading-none ${isUrgent ? 'text-rose-700' : 'text-slate-900'}`}>
+                {timeLeft.days}
+              </span>
+              <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest mr-2">
+                {timeLeft.days === 1 ? 'day' : 'days'}
+              </span>
+            </>
+          )}
+          <span className={`text-2xl font-black tracking-tight leading-none ${isUrgent ? 'text-rose-700' : 'text-slate-900'}`}>
+            {String(timeLeft.hours).padStart(2, '0')}
+          </span>
+          <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest mr-2">h</span>
+
+          <span className={`text-2xl font-black tracking-tight leading-none ${isUrgent ? 'text-rose-700' : 'text-slate-900'}`}>
+            {String(timeLeft.minutes).padStart(2, '0')}
+          </span>
+          <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest mr-2">m</span>
+
+          <span className={`text-2xl font-black tracking-tight leading-none ${isUrgent ? 'text-rose-600 animate-pulse' : 'text-cyan-600'}`}>
+            {String(timeLeft.seconds).padStart(2, '0')}
+          </span>
+          <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">s</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Internships() {
   const SAVED_KEY = 'student.savedInternships';
   const [searchParams] = useSearchParams();
@@ -47,6 +236,8 @@ export default function Internships() {
   const [applications, setApplications] = useState([]);
   const [profile, setProfile] = useState({ department: '', skills: [] });
   const [savedIds, setSavedIds] = useState([]);
+  const [savedCount, setSavedCount] = useState(0);
+  const [applicationCount, setApplicationCount] = useState(0);
   const [showSavedOnly, setShowSavedOnly] = useState(false);
   const [departmentOnly, setDepartmentOnly] = useState(false);
   const [query, setQuery] = useState(initialQuery);
@@ -60,6 +251,7 @@ export default function Internships() {
   const [selectedInternship, setSelectedInternship] = useState(null);
   const [filters, setFilters] = useState({ location: '', isPaid: 'all', duration: 'all', sort: 'newest', major: '' });
   const [page, setPage] = useState(1);
+  const [refreshKey, setRefreshKey] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
   const [totalItems, setTotalItems] = useState(0);
   const [dynamicFilters, setDynamicFilters] = useState({ departments: [], locations: [], durations: [] });
@@ -74,6 +266,54 @@ export default function Internships() {
       }
     };
     loadFilters();
+  }, []);
+
+  const refreshStudentCounts = async (shouldUpdate = () => true) => {
+    try {
+      const [statsRes, savedRes] = await Promise.all([
+        studentAPI.getDashboardStats(),
+        studentAPI.getSavedInternships()
+      ]);
+
+      if (!shouldUpdate()) return;
+      setApplicationCount(statsRes.data?.totalApplications || 0);
+      setSavedCount(statsRes.data?.totalSaved || 0);
+
+      const savedItems = Array.isArray(savedRes.data) ? savedRes.data : [];
+      const savedIdsFromServer = savedItems
+        .map((item) => {
+          if (!item) return '';
+          if (typeof item === 'string' || typeof item === 'number') return String(item);
+          if (item._id) return String(item._id);
+          if (item.internshipId) return String(item.internshipId._id || item.internshipId);
+          return '';
+        })
+        .filter(Boolean);
+
+      if (!shouldUpdate()) return;
+      setSavedIds(savedIdsFromServer);
+    } catch (err) {
+      console.warn('Failed to refresh student internship counts', err);
+    }
+  };
+
+  useEffect(() => {
+    let active = true;
+    const shouldUpdate = () => active;
+    const loadCounts = async () => {
+      if (!active) return;
+      await refreshStudentCounts(shouldUpdate);
+    };
+    loadCounts();
+    const handleStatsRefresh = () => {
+      if (!active) return;
+      refreshStudentCounts(shouldUpdate);
+    };
+    window.addEventListener(STUDENT_STATS_REFRESH_EVENT, handleStatsRefresh);
+    return () => {
+      active = false;
+      window.removeEventListener(STUDENT_STATS_REFRESH_EVENT, handleStatsRefresh);
+    };
   }, []);
 
   useEffect(() => {
@@ -128,7 +368,32 @@ export default function Internships() {
     };
     fetchInternships();
     return () => { active = false; };
-  }, [debouncedQuery, filters, page]);
+  }, [debouncedQuery, filters, page, refreshKey]);
+
+  // Listen for company status changes and refresh listing when they happen
+  useCompanyStatusSync(() => {
+    setRefreshKey((k) => k + 1);
+  });
+
+  useEffect(() => {
+    const handleProfileUpdate = () => {
+      setRefreshKey((k) => k + 1);
+    };
+
+    const handleStorageUpdate = (event) => {
+      if (event.key === STUDENT_PROFILE_UPDATED_STORAGE_KEY) {
+        handleProfileUpdate();
+      }
+      if (event.key === STUDENT_STATS_REFRESH_STORAGE_KEY) {
+        refreshStudentCounts(() => true);
+      }
+    };
+
+    return () => {
+      window.removeEventListener(STUDENT_PROFILE_UPDATED_EVENT, handleProfileUpdate);
+      window.removeEventListener('storage', handleStorageUpdate);
+    };
+  }, []);
 
   // Reset page when filters or query change
   useEffect(() => {
@@ -136,29 +401,62 @@ export default function Internships() {
   }, [debouncedQuery, filters]);
 
   useEffect(() => {
-    if (debouncedQuery.length > 1) {
-      const match = internships
-        .map((i) => i.title)
-        .filter((t) => t.toLowerCase().includes(debouncedQuery.toLowerCase()))
-        .slice(0, 5);
-      setSuggestions([...new Set(match)]);
-      setShowSuggestions(true);
-    } else {
-      setSuggestions([]);
-      setShowSuggestions(false);
-    }
-  }, [debouncedQuery, internships]);
+    let active = true;
+
+    const loadSuggestions = async () => {
+      if (debouncedQuery.length <= 1) {
+        if (active) {
+          setSuggestions([]);
+          setShowSuggestions(false);
+        }
+        return;
+      }
+
+      try {
+        const { data } = await studentAPI.getInternshipSuggestions(debouncedQuery);
+        if (!active) return;
+
+        setSuggestions(
+          Array.isArray(data)
+            ? [...new Set(data.map((item) => item?.title).filter(Boolean))].slice(0, 5)
+            : []
+        );
+        setShowSuggestions(true);
+      } catch {
+        if (active) {
+          setSuggestions([]);
+          setShowSuggestions(false);
+        }
+      }
+    };
+
+    loadSuggestions();
+
+    return () => {
+      active = false;
+    };
+  }, [debouncedQuery]);
 
   const savedSet = useMemo(() => new Set(savedIds), [savedIds]);
   const appliedSet = useMemo(() => new Set(applications.map((app) => String(app.internshipId?._id || app.internshipId))), [applications]);
 
+  const scoredInternships = useMemo(() => {
+    return internships.map((internship) => ({
+      internship,
+      match: {
+        score: Number(internship?.matchScore || internship?.aiMatchScore || internship?.matchingScore || 0),
+        reasoning: internship?.matchReasoning || internship?.reasoning || ''
+      }
+    }));
+  }, [internships]);
+
   const departmentFilter = String(profile.department || '').trim().toLowerCase();
   const filteredInternships = useMemo(() => {
-    let result = internships;
+    let result = scoredInternships;
 
     // 💾 Show Saved Only Filter
     if (showSavedOnly) {
-       result = result.filter(item => savedSet.has(String(item._id)));
+       result = result.filter(({ internship }) => savedSet.has(String(internship._id)));
     }
 
     // 🏢 Backend now handles Major/Department filtering via the 'major' parameter in the API call.
@@ -166,100 +464,26 @@ export default function Internships() {
 
     // 🚀 Smart Sorting: Best Match (Client-Side Logic based on Skills)
     if (filters.sort === 'best-match') {
-      const studentSkills = (profile.skills || []).map((value) => String(value).trim().toLowerCase()).filter(Boolean);
-      const studentDept = String(profile.department || '').trim().toLowerCase();
-
-      return [...result].sort((a, b) => {
-        const calcScore = (internship) => {
-          const required = (internship.requiredSkills || []).map((s) => String(s).trim().toLowerCase());
-          let score = 0;
-          
-          // Skills Match (up to 40 points)
-          studentSkills.forEach(skill => {
-            if (required.some(req => req.includes(skill) || skill.includes(req))) score += 20;
-          });
-          score = Math.min(score, 40);
-
-          // Department Match (up to 40 points)
-          const targetDepts = (internship.targetDepartments || []).map(d => d.toLowerCase());
-          if (studentDept && targetDepts.includes(studentDept)) {
-            score += 40;
-          } else {
-            const text = [internship.title, internship.description].join(' ').toLowerCase();
-            if (studentDept && text.includes(studentDept)) score += 20;
-          }
-
-          // CGPA Filter (If student CGPA < Min CGPA, penalize score)
-          const studentCgpa = Number(profile.cgpa) || 0;
-          const minCgpa = Number(internship.minCgpa) || 0;
-          if (minCgpa > 0 && studentCgpa < minCgpa) {
-            score -= 50; // Heavily penalize if CGPA doesn't meet requirements
-          }
-
-          return score;
-        };
-        return calcScore(b) - calcScore(a);
-      });
+      return [...result].sort((a, b) => b.match.score - a.match.score);
     }
 
     return result;
-  }, [departmentOnly, departmentFilter, internships, showSavedOnly, savedSet, filters.sort, profile.skills, profile.department]);
+  }, [departmentOnly, departmentFilter, scoredInternships, showSavedOnly, savedSet, filters.sort]);
 
   const recommendationList = useMemo(() => {
-    const studentSkills = (profile.skills || []).map((value) => String(value).trim().toLowerCase()).filter(Boolean);
-    const studentDept = String(profile.department || '').trim().toLowerCase();
-
-    // If no skills and no department are set, we cannot provide accurate recommendations.
-    if (studentSkills.length === 0 && !studentDept) return [];
-
-    return internships
-      .map((internship) => {
-        const required = (internship.requiredSkills || []).map((s) => String(s).trim().toLowerCase());
-        
-        let matchCount = 0;
-        
-        // Flexible skill matching
-        if (required.length > 0) {
-           required.forEach(reqSkill => {
-              const isMatch = studentSkills.some(stuSkill => stuSkill.includes(reqSkill) || reqSkill.includes(stuSkill));
-              if (isMatch) matchCount += 1;
-           });
-        }
-
-        // Department matching
-        let deptMatch = false;
-        if (studentDept) {
-           const internText = [
-             internship.title,
-             internship.description,
-             internship.department
-           ].join(' ').toLowerCase();
-           if (internText.includes(studentDept)) deptMatch = true;
-        }
-
-        let score = 0;
-        if (required.length > 0) {
-           score = Math.round((matchCount / required.length) * 100);
-        } else if (deptMatch) {
-           score = 80; 
-        }
-
-        if (deptMatch && score > 0 && score < 100) {
-           score = Math.min(100, score + 20);
-        }
-
-        return { internship, matchScore: score };
-      })
-      // Only return accurate matches (50% or above)
-      .filter((item) => item.matchScore >= 50)
-      .sort((a, b) => b.matchScore - a.matchScore)
+    return scoredInternships
+      .filter((item) => item.match.score >= 50)
+      .sort((a, b) => b.match.score - a.match.score)
       .slice(0, 3);
-  }, [internships, profile.skills, profile.department]);
+  }, [scoredInternships]);
 
   const toggleSave = async (internshipId) => {
     try {
       const { data } = await studentAPI.toggleSavedInternship(internshipId);
-      setSavedIds(Array.isArray(data.savedIds) ? data.savedIds.map(String) : []);
+      notifyStudentStatsRefresh();
+      const ids = Array.isArray(data.savedIds) ? data.savedIds.map(String) : [];
+      setSavedIds(ids);
+      setSavedCount(ids.length);
       setActionMessage(data.message);
       setTimeout(() => setActionMessage(''), 3000);
     } catch (err) {
@@ -274,16 +498,26 @@ export default function Internships() {
       
       // Pass the match score to the backend if found
       const rec = recommendationList.find(r => String(r.internship._id) === String(internshipId));
-      const matchScore = rec ? rec.matchScore : 0;
+      const matchScore = rec ? rec.score : 0;
 
-      await studentAPI.applyForInternship({ internshipId, matchScore });
-      
-      const appRes = await studentAPI.getApplications();
-      setApplications(appRes.data || []);
-      setActionMessage('Application submitted successfully!');
+      const { data } = await studentAPI.applyForInternship({ internshipId, matchScore });
+      notifyStudentStatsRefresh();
+      await refreshStudentCounts();
+
+      const submittedApplication = data?.application || null;
+      if (submittedApplication) {
+        setApplications((current) => {
+          const nextApplications = Array.isArray(current) ? current.filter((app) => String(app?._id || '') !== String(submittedApplication._id || '')) : [];
+          return [submittedApplication, ...nextApplications];
+        });
+      }
+
+      setActionMessage(data?.message || 'Application submitted successfully!');
       setTimeout(() => setActionMessage(''), 3000);
     } catch (err) {
-      setError(err?.response?.data?.message || 'Failed to submit application.');
+      const responseMessage = err?.response?.data?.message;
+      const rawResponse = typeof err?.response?.data === 'string' ? err.response.data : '';
+      setError(responseMessage || rawResponse || err?.message || 'Failed to submit application.');
     } finally {
       setApplyingId('');
     }
@@ -310,13 +544,13 @@ export default function Internships() {
               </div>
               <div className="flex flex-wrap items-center gap-3">
                 <span className="rounded-full bg-white px-5 py-2 text-[11px] font-black text-slate-600 shadow-sm border border-slate-100">
-                  Applications: <span className="text-cyan-600">{applications.length}</span>
+                  Applications: <span className="text-cyan-600">{applicationCount}</span>
                 </span>
                 <button 
                   onClick={() => setShowSavedOnly(!showSavedOnly)}
                   className={`rounded-full px-5 py-2 text-[11px] font-black uppercase shadow-sm border transition-all flex items-center gap-2 ${showSavedOnly ? 'bg-cyan-600 border-cyan-600 text-white' : 'bg-white border-slate-100 text-slate-600 hover:border-cyan-200'}`}
                 >
-                  Saved Items: {savedIds.length}
+                  Saved Items: {savedCount}
                 </button>
               </div>
             </div>
@@ -439,11 +673,11 @@ export default function Internships() {
           </div>
 
           <div className="grid gap-4 lg:grid-cols-3 relative z-10">
-            {recommendationList.map(({ internship, matchScore }) => (
+            {recommendationList.map(({ internship, match }) => (
               <div key={`rec-${internship._id}`} className="rounded-3xl border border-slate-50 bg-slate-50/50 p-5 hover:bg-white hover:shadow-xl hover:shadow-cyan-100/50 transition-all cursor-pointer group">
                 <div className="flex justify-between items-start mb-3">
                    <p className="text-sm font-black text-slate-900 line-clamp-1 group-hover:text-cyan-700 transition-colors">{internship.title}</p>
-                   <span className="text-[10px] font-black text-cyan-600 bg-cyan-50 px-2 py-0.5 rounded-lg">{matchScore}%</span>
+                   <span className="text-[10px] font-black text-cyan-600 bg-cyan-50 px-2 py-0.5 rounded-lg">{match.score}%</span>
                 </div>
                 
                 <p className="text-[10px] font-bold text-slate-400 uppercase tracking-tight mb-4">
@@ -451,7 +685,7 @@ export default function Internships() {
                 </p>
 
                 <div className="w-full h-1 bg-slate-200 rounded-full overflow-hidden">
-                   <div className="h-full bg-cyan-500 transition-all duration-1000" style={{ width: `${matchScore}%` }} />
+                   <div className="h-full bg-cyan-500 transition-all duration-1000" style={{ width: `${match.score}%` }} />
                 </div>
               </div>
             ))}
@@ -481,7 +715,7 @@ export default function Internships() {
         <div className="w-full mx-auto mt-12 px-4 lg:px-0">
           <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
         {filteredInternships.length > 0 ? (
-          filteredInternships.map((internship) => {
+          filteredInternships.map(({ internship, match }) => {
           const internshipId = String(internship._id);
           const alreadyApplied = appliedSet.has(internshipId);
           const isSaved = savedSet.has(internshipId);
@@ -547,15 +781,19 @@ export default function Internships() {
               {/* 🏢 Header: Logo & Title */}
               <div className="flex items-start gap-4 mb-6 relative z-10">
                 <div className="w-14 h-14 bg-slate-50 rounded-2xl flex items-center justify-center text-2xl shadow-sm border border-slate-100 group-hover:border-cyan-200 transition-colors shrink-0 overflow-hidden">
-                   <CompanyLogo company={internship.companyId} />
+                   <CompanyLogo company={resolveCompanyForInternship(internship)} />
                 </div>
                 <div className="flex-1 min-w-0">
-                   <h3 className="text-lg font-black leading-tight text-slate-900 group-hover:text-cyan-700 transition-colors truncate">{internship.title}</h3>
+                   <h3 className="text-lg font-black leading-tight text-slate-900 group-hover:text-cyan-700 transition-colors truncate">{internship.internship_title || internship.title}</h3>
                    <p className="text-xs font-bold text-slate-400 uppercase tracking-widest truncate mt-1">
-                      {internship.companyId?.name || internship.companyId?.fullName || 'Real World Partner'}
+                      {internship.company_name || internship.companyId?.name || internship.companyId?.fullName || 'Real World Partner'}
                    </p>
                 </div>
               </div>
+
+                <div className="relative z-10 mb-6">
+                 <MatchScoreBadge score={match.score} reasoning={match.reasoning} />
+                </div>
 
               {/* 🏷️ Skill Tags */}
               <div className="flex flex-wrap gap-2 mb-6 relative z-10">
@@ -577,7 +815,7 @@ export default function Internships() {
                  </div>
                  <div>
                     <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Modality</p>
-                    <p className="text-sm font-black text-blue-600">{internship.workModality || 'On-site'}</p>
+                    <p className="text-sm font-black text-blue-600">{internship.modality || internship.workModality || 'On-site'}</p>
                  </div>
                  <div>
                     <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Location</p>
@@ -601,24 +839,21 @@ export default function Internships() {
               </div>
 
               {/* ⏳ Real-Time Deadline Alert (Enhanced Warning) */}
-              <div className={`mb-6 flex items-center justify-between p-3 rounded-2xl transition-colors ${deadlineBgClass}`}>
-                 <div className="flex items-center gap-2">
-                    <div className={`w-2 h-2 rounded-full ${dotColor} ${!isExpired && daysLeft <= 1 ? 'animate-pulse' : ''}`} />
-                    <span className={`text-[10px] font-black uppercase tracking-widest ${deadlineColor}`}>
-                       {deadlineText}
-                    </span>
-                 </div>
-                  <span className={`px-2 py-0.5 rounded-lg text-[8px] font-black uppercase tracking-tighter ${internship.compensationType === 'Paid' ? 'bg-emerald-100 text-emerald-800' : internship.compensationType === 'Allowance' ? 'bg-sky-100 text-sky-800' : 'bg-slate-200 text-slate-600'}`}>
-                     {internship.compensationType === 'Allowance' ? 'Covers Allowance' : (internship.compensationType || (internship.isPaid ? 'Paid' : 'Unpaid'))}
-                  </span>
-              </div>
+              <DynamicDeadlineCountdown 
+                deadline={internship.deadline} 
+                compensationType={internship.compensationType} 
+                isPaid={internship.isPaid} 
+              />
 
               <div className="mt-auto flex items-center gap-3 relative z-10">
                 <button
                   type="button"
                   onClick={(e) => { e.stopPropagation(); handleApply(internshipId); }}
                   disabled={alreadyApplied || applyingId === internshipId || isExpired}
-                  className={`flex-1 rounded-2xl py-4 text-xs font-black uppercase tracking-widest transition-all ${alreadyApplied || isExpired ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'bg-slate-900 text-white hover:bg-cyan-700 shadow-lg shadow-slate-200'}`}
+                  className={`flex-1 rounded-2xl py-4 text-xs font-black uppercase tracking-widest transition-all ${alreadyApplied || isExpired
+                    ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                    : 'bg-cyan-600 text-white hover:bg-emerald-500 shadow-lg shadow-cyan-200'}
+                  `}
                 >
                   {isExpired ? 'Closed' : alreadyApplied ? 'Applied' : applyingId === internshipId ? 'Applying...' : 'Apply Now'}
                 </button>
@@ -643,7 +878,7 @@ export default function Internships() {
               {showSavedOnly ? "You haven't saved any internships yet." : "Try adjusting your search or filters to find more roles."}
            </p>
            <button 
-             onClick={() => { setShowSavedOnly(false); setQuery(''); setFilters({ location: '', isPaid: 'all', duration: 'all' }); }}
+             onClick={() => { setShowSavedOnly(false); setQuery(''); setDebouncedQuery(''); setFilters({ location: '', isPaid: 'all', duration: 'all', sort: 'newest', major: '' }); }}
              className="px-8 py-3 bg-slate-900 text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-cyan-700 transition-all shadow-lg"
            >
               View All Internships
@@ -693,9 +928,7 @@ export default function Internships() {
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7"/></svg>
                 </button>
               </div>
-              <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">
-                Showing Page {page} of {totalPages} ({totalItems} Opportunities)
-              </p>
+              {/* Removed 'Showing Page x of y (z Opportunities)' text */}
             </div>
           )}
         </div>
@@ -707,17 +940,17 @@ export default function Internships() {
             className="absolute inset-0 bg-slate-900/60 backdrop-blur-md animate-in fade-in duration-300"
             onClick={() => setSelectedInternship(null)}
           />
-          <div className="relative w-full max-w-3xl max-h-[90vh] overflow-hidden rounded-[2.5rem] bg-white shadow-2xl animate-in zoom-in-95 slide-in-from-bottom-4 duration-300">
+          <div className="relative flex h-[80vh] w-full max-w-3xl flex-col overflow-hidden rounded-[2.5rem] bg-white shadow-2xl animate-in zoom-in-95 slide-in-from-bottom-4 duration-300">
             {/* Modal Header */}
-            <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-100 bg-white/80 px-8 py-6 backdrop-blur-md">
+            <div className="shrink-0 sticky top-0 z-20 flex items-center justify-between border-b border-slate-100 bg-white/90 px-8 py-6 backdrop-blur-md">
               <div className="flex items-center gap-4">
                 <div className="w-14 h-14 bg-slate-50 rounded-2xl flex items-center justify-center text-2xl border border-slate-100 overflow-hidden">
-                  <CompanyLogo company={selectedInternship.companyId} />
+                  <CompanyLogo company={resolveCompanyForInternship(selectedInternship)} />
                 </div>
                 <div>
-                  <h2 className="text-2xl font-black tracking-tight text-slate-900">{selectedInternship.title}</h2>
+                  <h2 className="text-2xl font-black tracking-tight text-slate-900">{selectedInternship.internship_title || selectedInternship.title}</h2>
                   <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">
-                    {selectedInternship.companyId?.name || selectedInternship.companyId?.fullName || 'Partner Company'}
+                    {selectedInternship.company_name || selectedInternship.companyId?.name || selectedInternship.companyId?.fullName || 'Partner Company'}
                   </p>
                 </div>
               </div>
@@ -730,13 +963,23 @@ export default function Internships() {
             </div>
 
             {/* Modal Body */}
-            <div className="overflow-y-auto p-8 no-scrollbar" style={{ maxHeight: 'calc(90vh - 180px)' }}>
+            <div
+              className="min-h-0 flex-1 overflow-y-auto px-8 py-8 pb-24 [scrollbar-width:thin] [scrollbar-color:#0ea5e9_#e2e8f0]"
+              style={{ maxHeight: 'calc(80vh - 176px)' }}
+            >
               <div className="grid gap-8">
+                {/* 🕒 Real-Time Countdown Banner */}
+                <DynamicDeadlineCountdown 
+                  deadline={selectedInternship.deadline} 
+                  compensationType={selectedInternship.compensationType} 
+                  isPaid={selectedInternship.isPaid} 
+                />
+
                 {/* Description */}
                 <section>
                   <h4 className="mb-3 text-[11px] font-black uppercase tracking-[0.2em] text-cyan-600">Internship Overview</h4>
                   <p className="text-base leading-relaxed text-slate-600 whitespace-pre-wrap">
-                    {selectedInternship.description}
+                    {cleanDisplayText(selectedInternship.description) || 'No description provided by the organization.'}
                   </p>
                 </section>
 
@@ -769,28 +1012,25 @@ export default function Internships() {
                 </div>
 
                 {/* Requirements & Skills */}
-                <div className="grid sm:grid-cols-2 gap-8">
+                <div className="grid gap-8 sm:grid-cols-2 pb-6">
                   <section>
-                    <h4 className="mb-4 text-[11px] font-black uppercase tracking-[0.2em] text-cyan-600">Requirements</h4>
-                    <ul className="space-y-2">
-                      {(selectedInternship.requirements || []).length > 0 ? selectedInternship.requirements.map((req, i) => (
-                        <li key={i} className="flex items-start gap-2 text-sm text-slate-600 font-medium">
-                          <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-cyan-500 shrink-0" />
-                          {req}
-                        </li>
-                      )) : (
-                        <li className="text-sm text-slate-400 italic">No specific requirements listed.</li>
-                      )}
-                    </ul>
+                    <h4 className="mb-4 text-[11px] font-black uppercase tracking-[0.2em] text-cyan-600">Detailed Requirements</h4>
+                    <div className="rounded-3xl border border-slate-100 bg-slate-50 p-5">
+                      <p className="text-sm leading-7 text-slate-600 whitespace-pre-wrap">
+                        {cleanDisplayText(selectedInternship.internship_requirements || selectedInternship.description || '') || 'No additional requirements specified by the organization.'}
+                      </p>
+                    </div>
                   </section>
                   <section>
                     <h4 className="mb-4 text-[11px] font-black uppercase tracking-[0.2em] text-cyan-600">Technical Skills</h4>
-                    <div className="flex flex-wrap gap-2">
-                      {selectedInternship.requiredSkills?.map((skill, i) => (
-                        <span key={i} className="px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs font-black text-slate-700 uppercase tracking-tighter">
+                    <div className="flex flex-wrap gap-2 rounded-3xl border border-slate-100 bg-white p-4">
+                      {collectTechnicalSkills(selectedInternship).length > 0 ? collectTechnicalSkills(selectedInternship).map((skill, i) => (
+                        <span key={`${skill}-${i}`} className="px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs font-black text-slate-700 uppercase tracking-tighter">
                           {skill}
                         </span>
-                      ))}
+                      )) : (
+                        <p className="text-sm text-slate-400 italic">No additional requirements specified by the organization.</p>
+                      )}
                     </div>
                   </section>
                 </div>
@@ -798,7 +1038,7 @@ export default function Internships() {
             </div>
 
             {/* Modal Footer */}
-            <div className="sticky bottom-0 flex items-center gap-4 border-t border-slate-100 bg-white px-8 py-6">
+            <div className="shrink-0 sticky bottom-0 z-20 flex items-center gap-4 border-t border-slate-100 bg-gradient-to-t from-white via-white to-white/90 px-8 py-6 backdrop-blur-sm">
               <button
                 onClick={() => setSelectedInternship(null)}
                 className="px-6 py-4 text-xs font-black uppercase tracking-widest text-slate-400 hover:text-slate-900 transition-colors"

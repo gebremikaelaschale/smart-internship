@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const { normalizeRole } = require('../utils/governanceRoles');
+const { normalizeRole, normalizeAdminType } = require('../utils/governanceRoles');
 
 module.exports = function authMiddleware(req, res, next) {
     const headerToken = req.header('x-auth-token');
@@ -14,10 +14,16 @@ module.exports = function authMiddleware(req, res, next) {
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         const role = normalizeRole(decoded.role);
+        const adminType = normalizeAdminType(decoded.adminType || decoded.role || '');
 
         req.user = {
             ...decoded,
+            // normalized role used across the app
             role,
+            // explicit admin type (e.g., 'superadmin', 'collegeadmin', 'deptadmin')
+            adminType,
+            // preserve original raw role value from token so middleware can perform strict checks
+            rawRole: String(decoded.role || '').trim(),
             id: decoded.userId || decoded.studentId || decoded.id || decoded._id || null,
             userId: decoded.userId || decoded.id || decoded._id || null
         };

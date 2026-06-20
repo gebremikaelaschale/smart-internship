@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import useAuth from '@/hooks/useAuth';
 import { Link } from 'react-router-dom';
 import { messagingAPI } from '../messagingAPI';
@@ -13,6 +13,22 @@ import {
   getUserTimeZone,
   processMessagesForRendering
 } from '@/utils/messageUtils';
+
+const sortContacts = (contacts) => {
+  return [...(contacts || [])].sort((a, b) => {
+    const aUnread = Number(a?.unreadCount || 0);
+    const bUnread = Number(b?.unreadCount || 0);
+    if (bUnread !== aUnread) return bUnread - aUnread;
+
+    const aTime = new Date(a?.lastMessage?.createdAt || 0).getTime();
+    const bTime = new Date(b?.lastMessage?.createdAt || 0).getTime();
+    if (bTime !== aTime) return bTime - aTime;
+
+    const aName = getContactDisplayName(a).toLowerCase();
+    const bName = getContactDisplayName(b).toLowerCase();
+    return aName.localeCompare(bName);
+  });
+};
 
 // Telegram-style Avatar Component
 const Avatar = ({ name, avatarUrl, size = 'w-10 h-10' }) => {
@@ -272,6 +288,122 @@ const handleDownloadFile = async (attachment) => {
   }
 };
 
+const ROLE_BADGE_STYLES = {
+  student: 'bg-sky-50 text-sky-700 border-sky-200',
+  hod: 'bg-violet-50 text-violet-700 border-violet-200',
+  dean: 'bg-amber-50 text-amber-700 border-amber-200',
+  admin: 'bg-slate-900 text-white border-slate-900',
+  employer: 'bg-emerald-50 text-emerald-700 border-emerald-200'
+};
+
+const getRoleBadgeLabel = (role) => {
+  const normalized = String(role || '').trim().toLowerCase();
+  if (normalized === 'student') return 'STUDENT';
+  if (normalized === 'hod' || normalized === 'deptadmin') return 'HOD';
+  if (normalized === 'dean' || normalized === 'collegeadmin') return 'DEAN';
+  if (normalized === 'admin' || normalized === 'superadmin' || normalized === 'super_admin') return 'ADMIN';
+  if (normalized === 'employer' || normalized === 'industry partner') return 'PARTNER';
+  return String(role || 'USER').toUpperCase();
+};
+
+const getRoleBadgeClass = (role) => ROLE_BADGE_STYLES[String(role || '').trim().toLowerCase()] || 'bg-slate-50 text-slate-700 border-slate-200';
+
+const getContactDisplayName = (contact) => String(
+  contact?.displayName
+  || contact?.fullName
+  || contact?.name
+  || contact?.companyName
+  || contact?.email
+  || 'Unknown'
+).trim();
+
+const getContactSecondaryLabel = (contact) => {
+  const role = String(contact?.role || '').trim().toLowerCase();
+  if (role === 'employer' || role === 'industry partner') {
+    return String(contact?.representativeName || contact?.focalPersonName || contact?.email || '').trim();
+  }
+  return String(contact?.department || contact?.college || contact?.email || '').trim();
+};
+
+const ContactListItem = React.memo(function ContactListItem({
+  contact,
+  isSelected,
+  isDisabled,
+  onSelect,
+  formatAvatar,
+  onlineStatus,
+  myId,
+  getRoleBadgeClass,
+  getRoleBadgeLabel,
+  formatTime
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(contact)}
+      disabled={isDisabled}
+      className={`w-full text-left p-4 transition-colors flex items-center gap-3 ${
+        isDisabled ? 'cursor-not-allowed opacity-70' : 'cursor-pointer hover:bg-white'
+      } ${isSelected ? 'bg-white border-l-4 border-l-blue-600 shadow-sm' : 'hover:bg-white/80'}`}
+    >
+      <div className="relative">
+        <Avatar
+          name={getContactDisplayName(contact)}
+          avatarUrl={formatAvatar(contact.avatar)}
+        />
+        <div
+          className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-white ${
+            (onlineStatus[String(contact._id)]?.isOnline ?? contact.isOnline)
+              ? 'bg-green-500'
+              : 'bg-gray-400'
+          }`}
+          title={(onlineStatus[String(contact._id)]?.isOnline ?? contact.isOnline) ? 'Online' : 'Offline'}
+        />
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="font-semibold text-sm text-slate-900 truncate">{getContactDisplayName(contact)}</div>
+            {getContactSecondaryLabel(contact) && (
+              <div className="text-[11px] text-slate-500 truncate mt-0.5">{getContactSecondaryLabel(contact)}</div>
+            )}
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {contact.lastMessage && (
+              <span className="text-[10px] text-slate-400">
+                {formatTime(contact.lastMessage.createdAt)}
+              </span>
+            )}
+            {Number(contact.unreadCount || 0) > 0 && (
+              <span className="inline-flex min-w-[18px] h-5 items-center justify-center rounded-full bg-red-500 border border-white px-1.5 text-[10px] font-semibold text-white shadow-sm">
+                {contact.unreadCount > 9 ? '9+' : contact.unreadCount}
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5 mt-1">
+          <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.14em] ${getRoleBadgeClass(contact.role)}`}>
+            {getRoleBadgeLabel(contact.role)}
+          </span>
+        </div>
+        {contact.lastMessage && (() => {
+          const msg = contact.lastMessage;
+          const content = String(msg.content || '').toLowerCase();
+          const isDeleted = msg.deletedForEveryone || content.includes('message was deleted') || content === 'deleted';
+          if (isDeleted) return null;
+
+          return (
+            <div className="text-xs text-slate-400 truncate mt-1">
+              {String(msg.senderId) === String(myId) ? 'You: ' : ''}
+              {msg.content}
+            </div>
+          );
+        })()}
+      </div>
+    </button>
+  );
+});
+
 // Telegram-style Message Bubble Component with Enhanced Timestamping, Context Menu, and Selection
 const MessageBubble = ({ message, isMine, showSenderInfo = false, isConsecutive = false, messageSelection, socket, setReplyingTo, textareaRef, setContextMenu }) => {
   const messageStatus = message.status || (message.isRead ? 'read' : 'sent');
@@ -323,7 +455,7 @@ const MessageBubble = ({ message, isMine, showSenderInfo = false, isConsecutive 
               <div className={`text-xs font-semibold mb-1 ${
                 isMine ? 'text-blue-200' : 'text-gray-600'
               }`}>
-                {message.replyTo?.senderName || message.replyPreview?.senderName || 'Unknown'}
+                {message.replyTo?.senderName || message.replyPreview?.senderName || message.senderId?.displayName || message.senderId?.fullName || message.senderId?.name || 'Unknown'}
               </div>
               <div className={`text-xs truncate ${
                 isMine ? 'text-blue-100 opacity-80' : 'text-gray-600 opacity-80'
@@ -337,7 +469,7 @@ const MessageBubble = ({ message, isMine, showSenderInfo = false, isConsecutive 
           {/* Show sender info for group messages or when appropriate */}
           {showSenderInfo && !isMine && (
             <div className="text-[11px] font-semibold text-blue-600 mb-1 opacity-80">
-              {message.senderId?.fullName || message.senderId?.name || 'Unknown'}
+              {message.senderId?.displayName || message.senderId?.fullName || message.senderId?.name || 'Unknown'}
             </div>
           )}
           
@@ -531,10 +663,11 @@ const MessageBubble = ({ message, isMine, showSenderInfo = false, isConsecutive 
 export default function Messages() {
   const auth = useAuth();
   const [contacts, setContacts] = useState([]);
-  const [selectedContact, setSelectedContact] = useState(null);
+  const [selectedContactId, setSelectedContactId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [processedMessages, setProcessedMessages] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [isChatLoading, setIsChatLoading] = useState(false);
   const [draft, setDraft] = useState('');
   const [attachment, setAttachment] = useState(null);
   const [showInfo, setShowInfo] = useState(false);
@@ -555,7 +688,13 @@ export default function Messages() {
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
   const textareaRef = useRef(null);
+  const refreshContactsRef = useRef(() => {});
+  const selectedContactIdRef = useRef(null);
   const myId = auth?.user?.id || auth?.user?._id;
+  const sortedContacts = useMemo(() => sortContacts(contacts), [contacts]);
+  const selectedContact = useMemo(() => (
+    sortedContacts.find(contact => String(contact._id) === String(selectedContactId)) || null
+  ), [sortedContacts, selectedContactId]);
   
   // Message selection handler
   const messageSelection = useMessageSelection();
@@ -715,13 +854,35 @@ export default function Messages() {
     }
 
     const filtered = contacts.filter(contact => 
-      (contact.fullName && contact.fullName.toLowerCase().includes(query.toLowerCase())) ||
-      (contact.name && contact.name.toLowerCase().includes(query.toLowerCase())) ||
+      getContactDisplayName(contact).toLowerCase().includes(query.toLowerCase()) ||
+      String(contact.representativeName || contact.focalPersonName || '').toLowerCase().includes(query.toLowerCase()) ||
       (contact.email && contact.email.toLowerCase().includes(query.toLowerCase()))
     );
     
     setContactSearchResults(filtered);
   };
+
+  const handleSelectContact = useCallback((contact) => {
+    const nextId = String(contact?._id || '');
+    const prevId = String(selectedContactIdRef.current || '');
+    if (!nextId || prevId === nextId || isChatLoading) return;
+
+    setIsChatLoading(true);
+    setSelectedContactId(nextId);
+    setContacts(prev => sortContacts(prev.map(c => (
+      String(c._id) === String(contact._id)
+        ? { ...c, unreadCount: 0 }
+        : c
+    ))));
+
+    if (Number(contact.unreadCount || 0) > 0) {
+      messagingAPI.markConversationAsRead({ otherUserId: contact._id }).catch(() => {});
+    }
+  }, [isChatLoading]);
+
+  useEffect(() => {
+    selectedContactIdRef.current = selectedContactId;
+  }, [selectedContactId]);
 
   // Message Search functionality (for chat header)
   useEffect(() => {
@@ -754,23 +915,51 @@ export default function Messages() {
     
     // Listen for new messages
     s.on('message:new', (msg) => {
-      const otherId = String(msg.senderId?._id || msg.senderId) === String(myId) 
-        ? String(msg.receiverId?._id || msg.receiverId) 
-        : String(msg.senderId?._id || msg.senderId);
-      
-      if (selectedContact && String(otherId) === String(selectedContact._id)) {
+      const senderId = String(msg.senderId?._id || msg.senderId);
+      const receiverId = String(msg.receiverId?._id || msg.receiverId);
+      const otherId = senderId === String(myId) ? receiverId : senderId;
+      const isIncoming = senderId !== String(myId);
+
+      if (selectedContactIdRef.current && String(otherId) === String(selectedContactIdRef.current)) {
         setMessages(prev => [...prev, msg]);
-        
+        setContacts(prev => sortContacts(prev.map(contact => {
+          if (String(contact._id) !== String(otherId)) return contact;
+          return {
+            ...contact,
+            unreadCount: 0,
+            lastMessage: {
+              content: msg.content,
+              createdAt: msg.createdAt,
+              senderId: senderId
+            }
+          };
+        })));
+
         // Auto-mark as delivered when received
-        if (String(msg.senderId?._id || msg.senderId) !== String(myId)) {
+        if (isIncoming) {
           messagingAPI.markMessageDelivered(msg._id);
         }
+
+        return;
       }
+
+      setContacts(prev => sortContacts(prev.map(contact => {
+        if (String(contact._id) !== String(otherId)) return contact;
+        return {
+          ...contact,
+          unreadCount: Number(contact.unreadCount || 0) + (isIncoming ? 1 : 0),
+          lastMessage: {
+            content: msg.content,
+            createdAt: msg.createdAt,
+            senderId: senderId
+          }
+        };
+      })));
     });
 
     // Listen for message seen events
     s.on('message:seen', (data) => {
-      if (selectedContact && String(data.byUserId) === String(selectedContact._id)) {
+      if (selectedContactIdRef.current && String(data.byUserId) === String(selectedContactIdRef.current)) {
         setMessages(prev => prev.map(m => ({ ...m, isRead: true, status: 'read' })));
       }
     });
@@ -812,7 +1001,7 @@ export default function Messages() {
 
     // Listen for typing indicators
     s.on('user:typing', (data) => {
-      if (selectedContact && String(data.userId) === String(selectedContact._id)) {
+      if (selectedContactIdRef.current && String(data.userId) === String(selectedContactIdRef.current)) {
         setTypingUsers(prev => new Set(prev).add(String(data.userId)));
       }
     });
@@ -846,6 +1035,16 @@ export default function Messages() {
       setMessages(prev => prev.filter(m => String(m._id) !== String(data.messageId || data.id)));
     });
 
+    s.on('contacts:refresh', () => {
+      refreshContactsRef.current?.();
+    });
+
+    s.on('notification:new', (notification) => {
+      if (String(auth?.user?.role || '').toLowerCase() === 'employer' && String(notification?.receiverRole || '').toLowerCase() === 'employer') {
+        refreshContactsRef.current?.();
+      }
+    });
+
     // Emit user online status
     s.emit('user:online', { userId: myId });
 
@@ -853,28 +1052,18 @@ export default function Messages() {
       s.emit('user:offline', { userId: myId });
       s.disconnect();
     };
-  }, [auth?.token]);
+  }, [auth?.token, myId]);
 
-  const loadData = async (query = '') => {
+  const loadData = useCallback(async (query = '') => {
     try {
       const { data } = await messagingAPI.getContacts({ search: query });
-      // Filter contacts to only show Companies and Admin for Students, etc.
-      const filtered = data.filter(u => {
-        const role = String(u.role).toLowerCase();
-        if (auth.user.role === 'student') {
-           return role === 'employer' || role === 'admin' || role === 'superadmin';
-        }
-        if (auth.user.role === 'employer') {
-           return role === 'student' || role === 'admin' || role === 'superadmin';
-        }
-        return true; // Admin sees everyone
-      });
-      setContacts(filtered);
+      const sorted = sortContacts(data);
+      setContacts(sorted);
       
       // Seed onlineStatus from API data — only if we don't already have a live socket value
       setOnlineStatus(prev => {
         const merged = { ...prev };
-        filtered.forEach(u => {
+        sorted.forEach(u => {
           const id = String(u._id);
           // Only seed if we have no live socket data for this user yet
           if (!merged[id]) {
@@ -887,23 +1076,40 @@ export default function Messages() {
         return merged;
       });
       
-      if (!selectedContact && filtered.length > 0) {
-        setSelectedContact(filtered[0]);
-      } else if (selectedContact) {
-        // Refresh selected contact data if it exists in the new list
-        const updated = filtered.find(c => String(c._id) === String(selectedContact._id));
-        if (updated) setSelectedContact(updated);
+      const activeId = String(selectedContactIdRef.current || '');
+      if (!activeId && sorted.length > 0) {
+        setSelectedContactId(String(sorted[0]._id));
+      } else if (activeId) {
+        const exists = sorted.some(c => String(c._id) === activeId);
+        if (!exists) {
+          setSelectedContactId(sorted[0] ? String(sorted[0]._id) : null);
+        }
       }
     } catch (err) {
       console.error(err);
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    refreshContactsRef.current = () => loadData(contactSearchQuery);
+  }, [loadData, contactSearchQuery]);
 
   useEffect(() => {
     loadData();
-  }, []);
+  }, [loadData]);
+
+  useEffect(() => {
+    const refreshContacts = () => loadData(contactSearchQuery);
+    const interval = window.setInterval(refreshContacts, 15000);
+    window.addEventListener('focus', refreshContacts);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refreshContacts);
+    };
+  }, [loadData, contactSearchQuery]);
 
   // Poll online status every 10 seconds (reliable fallback that doesn't depend on sockets)
   useEffect(() => {
@@ -935,27 +1141,49 @@ export default function Messages() {
       loadData(contactSearchQuery);
     }, 400);
     return () => clearTimeout(timer);
-  }, [contactSearchQuery]);
+  }, [contactSearchQuery, loadData]);
+
+  // Add tracking ref to prevent duplicate fetches for the same ID
+  const lastFetchedContactIdRef = useRef(null);
 
   useEffect(() => {
-    if (!selectedContact) return;
+    if (!selectedContactId) return;
+    // Prevent re-fetching if we are already showing this chat
+    if (lastFetchedContactIdRef.current === selectedContactId && !isChatLoading) {
+      return;
+    }
+    
+    lastFetchedContactIdRef.current = selectedContactId;
+    
+    let isMounted = true;
     const fetchHistory = async () => {
       try {
-        const { data } = await messagingAPI.getDirectHistory(selectedContact._id);
-        setMessages(data);
-        
-        // Mark unread messages as read using batch API
-        const unreadMessageIds = data
-          .filter(msg => String(msg.senderId?._id || msg.senderId) !== String(myId) && !msg.isRead)
-          .map(msg => String(msg._id));
-        
-        if (unreadMessageIds.length > 0) {
-          await messagingAPI.markMessagesRead(unreadMessageIds, null, selectedContact._id);
+        const { data } = await messagingAPI.getDirectHistory(selectedContactId);
+        if (isMounted) {
+          setMessages(data);
+          
+          // Mark unread messages as read using batch API
+          const unreadMessageIds = data
+            .filter(msg => String(msg.senderId?._id || msg.senderId) !== String(myId) && !msg.isRead)
+            .map(msg => String(msg._id));
+          
+          if (unreadMessageIds.length > 0) {
+            await messagingAPI.markMessagesRead(unreadMessageIds, null, selectedContactId);
+            setContacts(prev => sortContacts(prev.map(contact => String(contact._id) === String(selectedContactId) ? { ...contact, unreadCount: 0 } : contact)));
+          }
         }
-      } catch (err) { console.error(err); }
+      } catch (err) { 
+        console.error(err); 
+      } finally {
+        if (isMounted) setIsChatLoading(false);
+      }
     };
     fetchHistory();
-  }, [selectedContact?._id]);
+    
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedContactId, myId]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1053,7 +1281,7 @@ export default function Messages() {
   if (loading) return <div className="p-8 text-center">Loading Messages...</div>;
 
   return (
-    <div className="flex h-[calc(100vh-140px)] bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm relative">
+    <div className="flex h-[calc(100vh-80px)] overflow-hidden min-h-0 bg-white border border-slate-200 rounded-xl shadow-sm relative">
       {/* Selection Toolbar */}
       <MessageSelection
         messages={messages} // Include all messages for proper selection counting
@@ -1068,7 +1296,7 @@ export default function Messages() {
       />
 
       {/* Contact Sidebar */}
-      <div className="w-80 border-r border-slate-100 flex flex-col bg-slate-50/30 h-full">
+      <div className="w-[30%] max-w-[380px] min-w-[280px] border-r border-slate-100 flex flex-col bg-slate-50/30 h-full">
         <div className="p-5 border-b border-slate-100 bg-white flex-shrink-0">
           <h2 className="font-bold text-slate-800 text-lg">Inbox</h2>
           <div className="mt-3 relative">
@@ -1090,59 +1318,19 @@ export default function Messages() {
           {contacts.length > 0 ? (
             <div className="divide-y divide-slate-100">
               {contacts.map(c => (
-                <div 
-                  key={c._id} 
-                  onClick={() => setSelectedContact(c)}
-                  className={`p-4 cursor-pointer hover:bg-white transition-colors flex items-center gap-3 ${
-                    selectedContact?._id === c._id 
-                      ? 'bg-white border-l-4 border-l-blue-600 shadow-sm' 
-                      : 'hover:bg-white/80'
-                  }`}
-                >
-                  <div className="relative">
-                    <Avatar 
-                      name={c.fullName || c.name} 
-                      avatarUrl={formatAvatar(c.avatar)} 
-                    />
-                    {/* Online/Offline Status Indicator */}
-                    <div 
-                      className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-white ${
-                        (onlineStatus[String(c._id)]?.isOnline ?? c.isOnline)
-                          ? 'bg-green-500' 
-                          : 'bg-gray-400'
-                      }`}
-                      title={(onlineStatus[String(c._id)]?.isOnline ?? c.isOnline) ? 'Online' : 'Offline'}
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between">
-                      <div className="font-semibold text-sm text-slate-900 truncate">{c.fullName || c.name}</div>
-                      {c.lastMessage && (
-                        <span className="text-[10px] text-slate-400 shrink-0">
-                          {formatTime(c.lastMessage.createdAt)}
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-1.5 mt-1">
-                      <span className="text-[10px] text-blue-600 font-bold uppercase tracking-tighter opacity-70">
-                        {String(c.role).toUpperCase()}
-                      </span>
-                    </div>
-                    {c.lastMessage && (() => {
-                      const msg = c.lastMessage;
-                      const content = String(msg.content || '').toLowerCase();
-                      const isDeleted = msg.deletedForEveryone || content.includes('message was deleted') || content === 'deleted';
-                      if (isDeleted) return null;
-                      
-                      return (
-                        <div className="text-xs text-slate-400 truncate mt-1">
-                          {String(msg.senderId) === String(myId) ? 'You: ' : ''}
-                          {msg.content}
-                        </div>
-                      );
-                    })()}
-                  </div>
-                </div>
+                <ContactListItem
+                  key={c._id}
+                  contact={c}
+                  isSelected={selectedContactId === String(c._id)}
+                  isDisabled={isChatLoading}
+                  onSelect={handleSelectContact}
+                  formatAvatar={formatAvatar}
+                  onlineStatus={onlineStatus}
+                  myId={myId}
+                  getRoleBadgeClass={getRoleBadgeClass}
+                  getRoleBadgeLabel={getRoleBadgeLabel}
+                  formatTime={formatTime}
+                />
               ))}
             </div>
           ) : (
@@ -1159,19 +1347,22 @@ export default function Messages() {
       </div>
 
       {/* Chat Area */}
-      <div className="flex-1 flex overflow-hidden min-w-0">
+      <div className="flex-1 flex overflow-hidden min-w-0 min-h-0">
         <div className="flex-1 flex flex-col bg-white h-full">
           {selectedContact ? (
             <>
-              <div className="p-4 border-b border-slate-100 bg-white z-10 flex-shrink-0">
+              <div className="p-4 border-b border-slate-100 bg-white flex-shrink-0">
                 <div className="flex items-center justify-between mb-3">
                   <div className="flex items-center gap-3">
                     <Avatar 
-                      name={selectedContact.fullName || selectedContact.name} 
+                      name={getContactDisplayName(selectedContact)} 
                       avatarUrl={formatAvatar(selectedContact.avatar)} 
                     />
                     <div>
-                      <div className="font-semibold text-slate-900">{selectedContact.fullName || selectedContact.name}</div>
+                      <div className="font-semibold text-slate-900">{getContactDisplayName(selectedContact)}</div>
+                      {getContactSecondaryLabel(selectedContact) && (
+                        <div className="text-xs text-slate-500 mt-0.5">{getContactSecondaryLabel(selectedContact)}</div>
+                      )}
                       <div className={`text-xs ${(onlineStatus[String(selectedContact._id)]?.isOnline ?? selectedContact.isOnline) ? 'text-green-600' : 'text-gray-500'}`}>
                         {(onlineStatus[String(selectedContact._id)]?.isOnline ?? selectedContact.isOnline) 
                           ? '🟢 Online' 
@@ -1236,43 +1427,51 @@ export default function Messages() {
 
               <div className="flex-1 overflow-y-auto p-6 bg-slate-50/10 min-h-0">
 
-              
-              {/* Typing Indicator */}
-              {typingUsers.has(String(selectedContact?._id)) && (
-                <div className="flex items-center gap-2 px-4 py-2 text-sm text-gray-500 italic">
-                  <div className="flex gap-1">
-                    <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
-                    <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
-                    <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
-                  </div>
-                  {selectedContact?.fullName || selectedContact?.name || 'Someone'} is typing...
+              {isChatLoading ? (
+                <div className="flex-1 flex flex-col items-center justify-center h-full min-h-[300px]">
+                  <div className="w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                  <p className="mt-4 text-sm text-slate-500 font-medium animate-pulse">Loading conversation...</p>
                 </div>
+              ) : (
+                <>
+                  {/* Typing Indicator */}
+                  {typingUsers.has(String(selectedContact?._id)) && (
+                    <div className="flex items-center gap-2 px-4 py-2 text-sm text-gray-500 italic">
+                      <div className="flex gap-1">
+                        <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                        <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                        <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                      </div>
+                      {getContactDisplayName(selectedContact) || 'Someone'} is typing...
+                    </div>
+                  )}
+                  
+                  {(messageSearchQuery ? messageSearchResults.map(msg => ({ type: 'message', key: msg._id, message: msg })) : processedMessages).map((item) => {
+                    if (item.type === 'date-divider') {
+                      return <DateDivider key={item.key} label={item.label} date={item.date} />;
+                    }
+                    
+                    const msg = item.message || item;
+                    const isMine = String(msg.senderId?._id || msg.senderId) === String(myId);
+                    return (
+                      <div key={item.key} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
+                        <MessageBubble 
+                          message={msg} 
+                          isMine={isMine} 
+                          showSenderInfo={item.showSenderInfo}
+                          isConsecutive={item.isConsecutive}
+                          messageSelection={messageSelection}
+                          socket={socket}
+                          setReplyingTo={setReplyingTo}
+                          textareaRef={textareaRef}
+                          setContextMenu={setContextMenu}
+                        />
+                      </div>
+                    );
+                  })}
+                  <div ref={messagesEndRef} />
+                </>
               )}
-              
-              {(messageSearchQuery ? messageSearchResults.map(msg => ({ type: 'message', key: msg._id, message: msg })) : processedMessages).map((item) => {
-                if (item.type === 'date-divider') {
-                  return <DateDivider key={item.key} label={item.label} date={item.date} />;
-                }
-                
-                const msg = item.message || item;
-                const isMine = String(msg.senderId?._id || msg.senderId) === String(myId);
-                return (
-                  <div key={item.key} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
-                    <MessageBubble 
-                      message={msg} 
-                      isMine={isMine} 
-                      showSenderInfo={item.showSenderInfo}
-                      isConsecutive={item.isConsecutive}
-                      messageSelection={messageSelection}
-                      socket={socket}
-                      setReplyingTo={setReplyingTo}
-                      textareaRef={textareaRef}
-                      setContextMenu={setContextMenu}
-                    />
-                  </div>
-                );
-              })}
-              <div ref={messagesEndRef} />
             </div>
 
             {/* Message Input Area */}
@@ -1434,17 +1633,20 @@ export default function Messages() {
               <div className="flex-1 overflow-y-auto p-6 flex flex-col items-center text-center">
                 <div className="mb-4">
                   <Avatar 
-                    name={selectedContact.fullName || selectedContact.name} 
+                    name={getContactDisplayName(selectedContact)} 
                     avatarUrl={formatAvatar(selectedContact.avatar)} 
                     size="w-24 h-24"
                   />
                 </div>
                 
                 <h2 className="text-xl font-bold text-slate-900 mb-1">
-                  {selectedContact.fullName || selectedContact.name}
+                  {getContactDisplayName(selectedContact)}
                 </h2>
-                <div className="px-3 py-1 bg-blue-50 text-blue-600 text-[10px] font-bold rounded-full uppercase tracking-widest mb-4">
-                  {selectedContact.role || 'User'}
+                {getContactSecondaryLabel(selectedContact) && (
+                  <div className="text-sm text-slate-500 mb-2">{getContactSecondaryLabel(selectedContact)}</div>
+                )}
+                <div className={`px-3 py-1 text-[10px] font-bold rounded-full uppercase tracking-widest mb-4 border ${getRoleBadgeClass(selectedContact.role)}`}>
+                  {getRoleBadgeLabel(selectedContact.role)}
                 </div>
 
                 <div className="w-full space-y-6 text-left mt-4">
@@ -1508,7 +1710,7 @@ export default function Messages() {
                   setReplyingTo({ 
                     _id: contextMenu.messageId, 
                     content: contextMenu.message.content, 
-                    senderName: contextMenu.message.senderId?.fullName || contextMenu.message.senderId?.name || 'Unknown' 
+                    senderName: contextMenu.message.senderId?.displayName || contextMenu.message.senderId?.fullName || contextMenu.message.senderId?.name || 'Unknown' 
                   });
                   setContextMenu(null);
                   if (textareaRef.current) textareaRef.current.focus();

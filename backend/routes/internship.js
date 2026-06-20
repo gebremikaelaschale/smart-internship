@@ -2,9 +2,13 @@ const express = require('express');
 const router = express.Router();
 const auth = require('../middleware/authMiddleware');
 const Internship = require('../models/Internship');
+const Profile = require('../models/Profile');
 const Notification = require('../models/Notification');
 const User = require('../models/User');
+const CompanyProfile = require('../models/CompanyProfile');
+const Application = require('../models/Application');
 const ActivityLog = require('../models/ActivityLog');
+const { calculateMatchScore } = require('../utils/internshipMatching');
 
 async function writeActivity(req, action, details) {
     try {
@@ -24,12 +28,128 @@ function escapeRegex(value = '') {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function parseJsonField(value, fallback) {
+    if (typeof value === 'undefined' || value === null || value === '') return fallback;
+    if (Array.isArray(value) || typeof value === 'object') return value;
+
+    if (typeof value === 'string') {
+        try {
+            return JSON.parse(value);
+        } catch {
+            return fallback;
+        }
+    }
+
+    return fallback;
+}
+
+function normalizeList(value) {
+    return (Array.isArray(value) ? value : [])
+        .map((item) => String(item || '').trim())
+        .filter(Boolean);
+}
+
+function normalizeStructuredRequirements(value) {
+    const structured = parseJsonField(value, {}) || {};
+    return {
+        coreTechnicalSkills: normalizeList(structured.coreTechnicalSkills || structured.core || []),
+        preferredSkills: normalizeList(structured.preferredSkills || structured.preferred || []),
+        softSkills: normalizeList(structured.softSkills || structured.soft || [])
+    };
+}
+
+function flattenRequirementBuckets(structuredRequirements = {}) {
+    return [
+        ...(Array.isArray(structuredRequirements.coreTechnicalSkills) ? structuredRequirements.coreTechnicalSkills : []),
+        ...(Array.isArray(structuredRequirements.preferredSkills) ? structuredRequirements.preferredSkills : []),
+        ...(Array.isArray(structuredRequirements.softSkills) ? structuredRequirements.softSkills : [])
+    ].map((item) => String(item || '').trim()).filter(Boolean);
+}
+
+function deriveRequirementTokens(text = '') {
+    return String(text || '')
+        .split(/[\n,.]/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+}
+
+function resolveCompanyLogoUrl(company = {}) {
+    if (!company) return '';
+    return String(company.profileImage || company.logo || company.logoUrl || '').trim();
+}
+
+function getCompanyDisplayName(company = {}) {
+    return String(company.name || company.fullName || 'Industry Partner').trim();
+}
+
+function normalizeInternshipResponse(internship, companyLogoFallback = '') {
+    const item = internship && typeof internship.toObject === 'function' ? internship.toObject() : { ...internship };
+    const company = item.companyId || {};
+    const logo = resolveCompanyLogoUrl(company) || String(companyLogoFallback || '').trim();
+
+    return {
+        ...item,
+        internship_title: String(item.title || '').trim(),
+        company_name: getCompanyDisplayName(company),
+        company_logo_url: logo,
+        location: String(item.location || 'Addis Ababa').trim(),
+        duration: String(item.duration || item.internshipDuration || item.trainingDuration || '').trim(),
+        modality: String(item.workModality || 'On-site').trim()
+    };
+}
+
+async function buildStudentInternshipScope(req) {
+    const [student, verifiedCompanies] = await Promise.all([
+        User.findById(req.user.id).select('role department college isVerified verificationStatus').lean(),
+        User.find({
+            role: { $in: ['employer', 'Industry Partner'] },
+            isVerified: true
+        }).select('_id').lean()
+    ]);
+
+    if (!student || String(student.role || '').toLowerCase() !== 'student') {
+        return null;
+    }
+
+    if (!student.isVerified || String(student.verificationStatus || '').toLowerCase() !== 'verified') {
+        return {
+            blocked: true,
+            message: 'Complete your profile and wait for HOD verification before browsing internships.'
+        };
+    }
+
+    const departmentPattern = String(student.department || '').trim()
+        ? new RegExp(`^${escapeRegex(student.department)}$`, 'i')
+        : null;
+    const collegePattern = String(student.college || '').trim()
+        ? new RegExp(`^${escapeRegex(student.college)}$`, 'i')
+        : null;
+
+    const visibilityConditions = [];
+
+    const targetConditions = [{ targetDepartments: { $size: 0 } }];
+    if (departmentPattern) targetConditions.push({ targetDepartments: departmentPattern });
+    if (collegePattern) targetConditions.push({ targetDepartments: collegePattern });
+
+    if (targetConditions.length > 0) {
+        visibilityConditions.push({ $or: targetConditions });
+    }
+
+    return {
+        student,
+        verifiedCompanyIds: verifiedCompanies.map((company) => company._id),
+        departmentPattern,
+        visibilityConditions
+    };
+}
+
 // 1. መፍጠር (Industry Partner Only)
 router.post('/', auth, async (req, res) => {
     if (String(req.user.role || '').toLowerCase() !== 'employer') return res.status(403).json({ msg: "Access Denied: Employers only." });
     try {
         const title = String(req.body.title || '').trim();
-        const description = String(req.body.description || '').trim();
+        const internshipRequirements = String(req.body.internship_requirements || req.body.description || '').trim();
+        const description = internshipRequirements;
         let duration = String(req.body.duration || '').trim();
         const startDate = req.body.startDate ? new Date(req.body.startDate) : null;
         const endDate = req.body.endDate ? new Date(req.body.endDate) : null;
@@ -51,27 +171,27 @@ router.post('/', auth, async (req, res) => {
         }
 
         if (!title || !description || !duration || !startDate || !endDate || !Number.isInteger(studentsNeeded) || studentsNeeded < 1) {
-            return res.status(400).json({ message: 'Please provide title, description, duration (or start/end dates), and a valid studentsNeeded value.' });
+            return res.status(400).json({ message: 'Please provide title, internship requirements, duration (or start/end dates), and a valid studentsNeeded value.' });
         }
 
         if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || endDate < startDate) {
             return res.status(400).json({ message: 'Invalid date range: endDate must be the same as or after startDate.' });
         }
 
-        const skills = Array.isArray(req.body.requiredSkills)
-            ? req.body.requiredSkills.map((skill) => String(skill).trim()).filter(Boolean)
-            : String(req.body.requiredSkills || '').split(',').map((skill) => skill.trim()).filter(Boolean);
+        const derivedSkills = deriveRequirementTokens(internshipRequirements);
 
         const newInternship = new Internship({
             ...req.body,
             title,
             description,
+            internship_requirements: internshipRequirements,
             duration,
             startDate,
             endDate,
             deadline: req.body.deadline || endDate,
             studentsNeeded,
-            requiredSkills: skills,
+            requiredSkills: derivedSkills,
+            requirements: derivedSkills,
             targetDepartments: req.body.targetDepartments || [],
             targetBatch: req.body.targetBatch || 'Graduating Class',
             workModality: req.body.workModality || 'On-site',
@@ -82,6 +202,7 @@ router.post('/', auth, async (req, res) => {
             programType: 'Internship Program',
             trainingFocus: true,
             companyId: req.user.id,
+            companyEmail: req.user.email,
             status: 'Pending'
         });
         await newInternship.save();
@@ -115,12 +236,27 @@ router.post('/', auth, async (req, res) => {
 
 // 2. ለተማሪዎች (ክፍት የሆኑትን ብቻ)
 // 🔍 GET Dynamic Filters (Majors, Locations, Durations)
-router.get('/filters', async (req, res) => {
+router.get('/filters', auth, async (req, res) => {
     try {
+        const scope = await buildStudentInternshipScope(req);
+        if (!scope) {
+            return res.status(403).json({ message: 'Access denied: Student role required.' });
+        }
+        if (scope.blocked) {
+            return res.status(403).json({ message: scope.message });
+        }
+
+        const baseConditions = [
+            { status: 'Open' },
+            { companyId: { $in: scope.verifiedCompanyIds } },
+            ...scope.visibilityConditions
+        ];
+        const filter = baseConditions.length === 1 ? baseConditions[0] : { $and: baseConditions };
+
         const [departments, locations, durations] = await Promise.all([
-            Internship.distinct('targetDepartments', { status: 'Open' }),
-            Internship.distinct('location', { status: 'Open' }),
-            Internship.distinct('duration', { status: 'Open' })
+            Internship.distinct('targetDepartments', filter),
+            Internship.distinct('location', filter),
+            Internship.distinct('duration', filter)
         ]);
 
         const normalize = (list) => {
@@ -142,10 +278,17 @@ router.get('/filters', async (req, res) => {
     }
 });
 
-router.get('/', async (req, res) => {
+router.get('/', auth, async (req, res) => {
     try {
+        const scope = await buildStudentInternshipScope(req);
+        if (!scope) {
+            return res.status(403).json({ message: 'Access denied: Student role required.' });
+        }
+        if (scope.blocked) {
+            return res.status(403).json({ message: scope.message });
+        }
+
         const q = String(req.query.q || '').trim();
-        const status = String(req.query.status || 'Open').trim();
         const location = String(req.query.location || '').trim();
         const isPaid = req.query.isPaid;
         const duration = String(req.query.duration || '').trim();
@@ -154,25 +297,26 @@ router.get('/', async (req, res) => {
         const page = Math.max(Number(req.query.page) || 1, 1);
         const skip = (page - 1) * limit;
 
-        const filter = {};
-        if (status && status.toLowerCase() !== 'all') {
-            filter.status = status;
-        }
+        const conditions = [
+            { status: 'Open' },
+            { companyId: { $in: scope.verifiedCompanyIds } },
+            ...scope.visibilityConditions
+        ];
 
         if (location && location.toLowerCase() !== 'any location') {
-            filter.location = new RegExp(escapeRegex(location), 'i');
+            conditions.push({ location: new RegExp(escapeRegex(location), 'i') });
         }
 
         if (isPaid !== undefined && isPaid !== 'all' && isPaid !== '') {
-            filter.isPaid = isPaid === 'true';
+            conditions.push({ isPaid: isPaid === 'true' });
         }
 
         if (duration && duration.toLowerCase() !== 'all' && duration.toLowerCase() !== 'any duration') {
-            filter.duration = new RegExp(escapeRegex(duration), 'i');
+            conditions.push({ duration: new RegExp(escapeRegex(duration), 'i') });
         }
 
         if (major) {
-            filter.targetDepartments = new RegExp(`^${escapeRegex(major)}$`, 'i');
+            conditions.push({ targetDepartments: new RegExp(`^${escapeRegex(major)}$`, 'i') });
         }
 
         if (q) {
@@ -180,7 +324,8 @@ router.get('/', async (req, res) => {
             
             // Search for company names first
             const matchingCompanies = await User.find({
-                role: 'employer',
+                role: { $in: ['employer', 'Industry Partner', 'Employer'] },
+                isVerified: true,
                 $or: [
                     { name: pattern },
                     { fullName: pattern }
@@ -199,12 +344,10 @@ router.get('/', async (req, res) => {
                 ]
             };
 
-            if (filter.$and) {
-                filter.$and.push(searchFilter);
-            } else {
-                filter.$or = searchFilter.$or;
-            }
+            conditions.push(searchFilter);
         }
+
+        const filter = conditions.length === 1 ? conditions[0] : { $and: conditions };
 
         const sortKey = String(req.query.sort || 'newest').toLowerCase();
         let sortObj = { createdAt: -1 }; // Default: Newest
@@ -234,8 +377,65 @@ router.get('/', async (req, res) => {
             Internship.countDocuments(filter)
         ]);
 
+        const companyIds = [...new Set(internships
+            .map((item) => String(item.companyId?._id || item.companyId || ''))
+            .filter(Boolean)
+        )];
+
+        const companyProfiles = companyIds.length > 0
+            ? await CompanyProfile.find({ user: { $in: companyIds } }).select('user logo logoUrl').lean()
+            : [];
+
+        const companyProfileMap = companyProfiles.reduce((map, profile) => {
+            map[String(profile.user)] = profile;
+            return map;
+        }, {});
+
+        const profile = await Profile.findOne({ userId: req.user.id }).lean();
+        const studentDepartment = String(scope.student?.department || profile?.personalInfo?.department || '').trim();
+
+        const internshipIds = internships.map((internship) => internship?._id).filter(Boolean);
+        const existingApplications = internshipIds.length > 0
+            ? await Application.find({ studentId: req.user.id, internshipId: { $in: internshipIds } })
+                .select('internshipId matchingScore match_score')
+                .lean()
+            : [];
+
+        const storedScoreByInternshipId = new Map(
+            existingApplications.map((application) => {
+                const camel = Number(application?.matchingScore);
+                const snake = Number(application?.match_score);
+                const camelValue = Number.isFinite(camel) ? camel : 0;
+                const snakeValue = Number.isFinite(snake) ? snake : 0;
+                return [String(application?.internshipId || ''), Math.max(camelValue, snakeValue)];
+            })
+        );
+
+        const scoredInternships = internships.map((internship) => {
+            const storedScore = storedScoreByInternshipId.get(String(internship?._id || ''));
+            const match = storedScore != null
+                ? { score: storedScore, reasoning: '', matchedTerms: [], departmentMatched: true }
+                : calculateMatchScore(profile || {}, internship, {
+                    student: scope.student,
+                    studentDepartment
+                });
+
+            const company = internship.companyId || {};
+            const companyFallback = companyProfileMap[String(company._id || company)]?.logoUrl
+                || companyProfileMap[String(company._id || company)]?.logo
+                || '';
+
+            return {
+                ...normalizeInternshipResponse(internship, companyFallback),
+                matchScore: match.score,
+                matchReasoning: match.reasoning,
+                matchedTerms: match.matchedTerms,
+                departmentMatched: match.departmentMatched
+            };
+        });
+
         return res.json({
-            items: internships,
+            items: scoredInternships,
             total,
             page,
             totalPages: Math.ceil(total / limit)
@@ -247,15 +447,32 @@ router.get('/', async (req, res) => {
 });
 
 // 2.1 Search suggestions for internship titles
-router.get('/suggestions', async (req, res) => {
+router.get('/suggestions', auth, async (req, res) => {
     try {
+        const scope = await buildStudentInternshipScope(req);
+        if (!scope) {
+            return res.status(403).json({ message: 'Access denied: Student role required.' });
+        }
+        if (scope.blocked) {
+            return res.status(403).json({ message: scope.message });
+        }
+
         const q = String(req.query.q || '').trim();
         if (!q) {
             return res.json([]);
         }
 
         const pattern = new RegExp(escapeRegex(q), 'i');
-        const suggestions = await Internship.find({ status: 'Open', title: pattern })
+        const suggestionFilter = {
+            $and: [
+                { status: 'Open' },
+                { companyId: { $in: scope.verifiedCompanyIds } },
+                ...scope.visibilityConditions,
+                { title: pattern }
+            ]
+        };
+
+        const suggestions = await Internship.find(suggestionFilter)
             .select('title location')
             .sort({ createdAt: -1 })
             .limit(8)
@@ -302,15 +519,48 @@ router.get('/my-internships', auth, async (req, res) => {
 });
 
 // 3.1 Get Single Internship by ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', auth, async (req, res) => {
     try {
         const mongoose = require('mongoose');
         if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
             return res.status(400).json({ message: 'Invalid Internship ID format.' });
         }
-        const internship = await Internship.findById(req.params.id).populate('companyId', 'name fullName profileImage');
+        const internship = await Internship.findById(req.params.id);
         if (!internship) return res.status(404).json({ message: 'Internship not found.' });
-        res.json(internship);
+
+        // Enforce: only return internships that are Open and belong to verified companies,
+        // unless the requester is the owning employer.
+        const companyId = internship.companyId;
+
+        // If requester owns the internship, allow access even if the status is still pending/closed.
+        const requesterId = String(req.user?.id || req.user?.userId || req.user?._id || '');
+        if (requesterId && requesterId === String(companyId)) {
+            const populated = await Internship.findById(req.params.id).populate('companyId', 'name fullName profileImage');
+            return res.json(populated);
+        }
+
+        if (String(internship.status || '').toLowerCase() !== 'open') {
+            return res.status(404).json({ message: 'Internship not found.' });
+        }
+
+        // Check company verification via User or CompanyProfile
+        const companyUser = await User.findById(companyId).select('isVerified').lean();
+        let isCompanyVerified = companyUser ? Boolean(companyUser.isVerified) : false;
+        if (!isCompanyVerified) {
+            // try CompanyProfile fallback
+            try {
+                const CompanyProfile = require('../models/CompanyProfile');
+                const cp = await CompanyProfile.findOne({ user: companyId }).select('verification.status').lean();
+                if (cp && String(cp.verification?.status || '').toLowerCase() === 'verified') isCompanyVerified = true;
+            } catch (e) {
+                // ignore
+            }
+        }
+
+        if (!isCompanyVerified) return res.status(404).json({ message: 'Internship not found.' });
+
+        const populated = await Internship.findById(req.params.id).populate('companyId', 'name fullName profileImage');
+        res.json(populated);
     } catch (err) {
         res.status(500).json({ message: 'Error fetching internship details.' });
     }
@@ -325,23 +575,24 @@ router.put('/:id', auth, async (req, res) => {
         if (String(internship.companyId) !== String(req.user.id)) return res.status(403).json({ message: 'Unauthorized: You can only update your own internships.' });
 
         const title = String(req.body.title || '').trim();
-        const description = String(req.body.description || '').trim();
+        const internshipRequirements = String(req.body.internship_requirements || req.body.description || '').trim();
+        const description = internshipRequirements;
         const studentsNeeded = Number(req.body.studentsNeeded);
 
         if (!title || !description || !Number.isInteger(studentsNeeded) || studentsNeeded < 1) {
-            return res.status(400).json({ message: 'Please provide title, description, and a valid studentsNeeded value.' });
+            return res.status(400).json({ message: 'Please provide title, internship requirements, and a valid studentsNeeded value.' });
         }
 
-        const skills = Array.isArray(req.body.requiredSkills)
-            ? req.body.requiredSkills.map((skill) => String(skill).trim()).filter(Boolean)
-            : String(req.body.requiredSkills || '').split(',').map((skill) => skill.trim()).filter(Boolean);
+        const derivedSkills = deriveRequirementTokens(internshipRequirements);
 
         Object.assign(internship, {
             ...req.body,
             title,
             description,
+            internship_requirements: internshipRequirements,
             studentsNeeded,
-            requiredSkills: skills,
+            requiredSkills: derivedSkills,
+            requirements: derivedSkills,
             // Deadline might be updated, if not use current
             deadline: req.body.deadline || internship.deadline
         });

@@ -6,7 +6,8 @@ export function resolveDashboardRoute(role, adminType = '') {
   if (safeRole === 'employer') return '/employer/dashboard';
   if (safeRole === 'dean' || safeAdminType === 'collegeadmin') return '/dean/dashboard';
   if (safeRole === 'hod' || safeAdminType === 'deptadmin') return '/hod/dashboard';
-  if (safeRole === 'admin' || safeRole === 'super_admin' || safeAdminType === 'superadmin') return '/admin/dashboard';
+  // Use the Super Admin entry path so admin users land on the Super Admin studio
+  if (safeRole === 'admin' || safeRole === 'super_admin' || safeAdminType === 'superadmin') return '/admin/super-admin';
 
   return '/login';
 }

@@ -24,8 +24,9 @@ export const authService = {
     return data;
   },
 
-  async changePassword(payload) {
-    const { data } = await api.post('/auth/change-password', payload);
+  async changePassword(payload, token) {
+    const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
+    const { data } = await api.post('/auth/change-password', payload, headers ? { headers } : undefined);
     return data;
   },
 

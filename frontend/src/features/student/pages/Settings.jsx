@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { studentAPI } from '../studentAPI';
+import useAuth from '@/hooks/useAuth';
+import { authAPI } from '@/features/auth/authAPI';
 
 const Card = ({ children, className = "" }) => (
   <div className={`bg-white rounded-[32px] border border-slate-100 shadow-[0_15px_40px_rgba(15,23,42,0.03)] p-8 ${className}`}>
@@ -56,6 +58,7 @@ const PasswordInput = ({ label, name, value, onChange, placeholder }) => {
 export default function Settings() {
   const [passwords, setPasswords] = useState({ current: '', new: '', confirm: '' });
   const [notifications, setNotifications] = useState({ emailAlerts: true, statusUpdates: true });
+  const auth = useAuth();
   const [loading, setLoading] = useState(false);
   const [notifLoading, setNotifLoading] = useState(false);
   const [testLoading, setTestLoading] = useState(false);
@@ -77,6 +80,15 @@ export default function Settings() {
     };
     fetchPrefs();
   }, []);
+
+  useEffect(() => {
+    if (!message.text && !notifMsg.text) return undefined;
+    const timer = setTimeout(() => {
+      setMessage({ type: '', text: '' });
+      setNotifMsg({ type: '', text: '' });
+    }, 4000);
+    return () => clearTimeout(timer);
+  }, [message, notifMsg]);
 
   const handlePasswordChange = (e) => {
     setPasswords({ ...passwords, [e.target.name]: e.target.value });
@@ -121,10 +133,11 @@ export default function Settings() {
     }
     setLoading(true);
     try {
-      const response = await studentAPI.changePassword({
+      const token = auth?.token || localStorage.getItem('token') || '';
+      const response = await authAPI.changePassword({
         currentPassword: passwords.current,
         newPassword: passwords.new
-      });
+      }, token);
       setMessage({ type: 'success', text: response.data.message || 'Password updated successfully!' });
       setPasswords({ current: '', new: '', confirm: '' });
     } catch (err) {

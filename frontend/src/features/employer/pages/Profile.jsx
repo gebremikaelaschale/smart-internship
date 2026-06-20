@@ -174,6 +174,7 @@ export default function EmployerProfile() {
   });
   const [selectedCollege, setSelectedCollege] = useState(null);
   const [profileCompleteness, setProfileCompleteness] = useState(0);
+  const [verification, setVerification] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -364,6 +365,7 @@ export default function EmployerProfile() {
 
     // 3. Update UI indicators
     setProfileCompleteness(Number(data?.profileCompleteness || 0));
+    setVerification(data?.verification || null);
     setMessage(successText);
     setIsDirty(false);
     
@@ -429,6 +431,7 @@ export default function EmployerProfile() {
         } 
         
         setProfileCompleteness(Number(data?.profileCompleteness || 0));
+        setVerification(data?.verification || null);
         setIsDirty(false);
       } catch (requestError) {
         if (active) {
@@ -1131,6 +1134,63 @@ export default function EmployerProfile() {
                   {form.businessLicenseUrl ? 'Document Provided' : 'Verification Required'}
                 </div>
               </div>
+
+              {/* Dynamic Verification Banners */}
+              {verification?.status === 'Verified' && (
+                <div className="mb-6 rounded-2xl border border-emerald-200 bg-emerald-50/50 p-6 flex items-start gap-4">
+                  <div className="h-12 w-12 rounded-xl bg-emerald-100 text-emerald-600 flex items-center justify-center shrink-0">
+                    <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                    </svg>
+                  </div>
+                  <div className="space-y-1">
+                    <h4 className="text-base font-bold text-emerald-800 uppercase tracking-wider leading-none">Account Verified</h4>
+                    <p className="text-sm font-semibold text-emerald-700 leading-relaxed">
+                      Congratulations! Your company account is verified. You now have full access to create internships and interact with students.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {verification?.status === 'Pending' && (
+                <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50/50 p-6 flex items-start gap-4">
+                  <div className="h-12 w-12 rounded-xl bg-amber-100 text-amber-600 flex items-center justify-center shrink-0">
+                    <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </div>
+                  <div className="space-y-1">
+                    <h4 className="text-base font-bold text-amber-800 uppercase tracking-wider leading-none">Verification Pending</h4>
+                    <p className="text-sm font-semibold text-amber-700 leading-relaxed">
+                      Your company documents are submitted and pending review by the system administrator. You will be notified once reviewed.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {verification?.status === 'Rejected' && (
+                <div className="mb-6 rounded-2xl border border-rose-200 bg-rose-50/50 p-6 flex items-start gap-4">
+                  <div className="h-12 w-12 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                    <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                  </div>
+                  <div className="space-y-1">
+                    <h4 className="text-base font-bold text-rose-800 uppercase tracking-wider leading-none">Verification Rejected</h4>
+                    <p className="text-sm font-semibold text-rose-700 leading-relaxed">
+                      Your verification request has been rejected by the administrator due to the following reason:
+                    </p>
+                    <div className="max-h-[120px] overflow-y-auto pr-1 mt-2 inline-block max-w-xl scrollbar-thin scrollbar-thumb-rose-200">
+                      <p className="text-sm font-black text-rose-950 bg-white border border-rose-200 px-4 py-2.5 rounded-xl italic shadow-sm leading-relaxed">
+                        "{verification?.reason || 'No specific reason provided.'}"
+                      </p>
+                    </div>
+                    <p className="text-xs text-rose-600 font-bold mt-2">
+                      Please review the reason, upload the correct documents below, and save your profile to request verification again.
+                    </p>
+                  </div>
+                </div>
+              )}
 
               <div 
                 className={`relative flex min-h-[260px] flex-col items-center justify-center rounded-3xl border-2 border-dashed p-8 transition-all duration-300 ${

@@ -84,7 +84,7 @@ export default function AnalyticsAdmin() {
       <div className="grid gap-4 xl:grid-cols-2">
         <Card title="Application Status Breakdown" description="Live distribution of application outcomes.">
           <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
               <BarChart data={data.statusBreakdown}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                 <XAxis dataKey="status" tickLine={false} axisLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
@@ -98,7 +98,7 @@ export default function AnalyticsAdmin() {
 
         <Card title="Trends" description="Monthly applications versus accepted trend by month.">
           <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
               <LineChart data={data.monthlyTrend}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                 <XAxis dataKey="month" tickLine={false} axisLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />

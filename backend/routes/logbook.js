@@ -6,6 +6,8 @@ const Report = require('../models/Report');
 const Application = require('../models/Application');
 const Internship = require('../models/Internship');
 const User = require('../models/User');
+const Profile = require('../models/Profile');
+const CompanyProfile = require('../models/CompanyProfile');
 const Notification = require('../models/Notification');
 const multer = require('multer');
 const path = require('path');
@@ -26,7 +28,7 @@ const storage = multer.diskStorage({
     }
 });
 
-const upload = multer({ 
+const upload = multer({
     storage,
     limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
     fileFilter: (req, file, cb) => {
@@ -48,8 +50,8 @@ router.post('/', auth, upload.single('file'), async (req, res) => {
             return res.status(403).json({ message: 'Only students can submit logbooks.' });
         }
 
-        let { 
-            internshipId, weekNumber, summary, title, fileUrl, hoursWorked, 
+        let {
+            internshipId, weekNumber, summary, title, fileUrl, hoursWorked,
             startDate, endDate, attachments, dailyBreakdown, skills,
             mentorshipRequested, goals, status
         } = req.body;
@@ -59,8 +61,14 @@ router.post('/', auth, upload.single('file'), async (req, res) => {
             fileUrl = `/uploads/logbooks/${req.file.filename}`;
         }
 
-        if (!internshipId || !weekNumber || !summary) {
-            return res.status(400).json({ message: 'internshipId, weekNumber, and summary are required.' });
+        if (!internshipId || String(internshipId) === 'undefined') {
+            return res.status(400).json({ message: 'Internship ID is missing. You might not have an active internship.' });
+        }
+        if (!weekNumber) {
+            return res.status(400).json({ message: 'Week Number is required.' });
+        }
+        if (!summary && status !== 'Draft') {
+            return res.status(400).json({ message: 'Description (Summary) is required. Please write what you did.' });
         }
 
         if (!mongoose.Types.ObjectId.isValid(internshipId)) {
@@ -97,21 +105,23 @@ router.post('/', auth, upload.single('file'), async (req, res) => {
             `Workflow consistency is high with ${hoursWorked || 0} hours logged. ` +
             `Summary suggests proactive resolution of technical hurdles.`;
 
-        // --- NEW: Auto Skill Detection ---
-        const detectedSkills = [];
-        const skillKeywords = {
-            'Frontend': ['react', 'vue', 'html', 'css', 'javascript', 'ui', 'ux'],
-            'Backend': ['node', 'express', 'mongodb', 'sql', 'api', 'server', 'database'],
-            'DevOps': ['docker', 'kubernetes', 'aws', 'ci/cd', 'deployment'],
-            'Soft Skills': ['communication', 'teamwork', 'leadership', 'presentation']
-        };
+        // --- Parse Skills for FormData ---
+        let parsedSkills = [];
+        if (req.body['skills[]']) {
+            parsedSkills = Array.isArray(req.body['skills[]']) ? req.body['skills[]'] : [req.body['skills[]']];
+        } else if (req.body.skills) {
+            parsedSkills = Array.isArray(req.body.skills) ? req.body.skills : [req.body.skills];
+        }
 
-        const lowerSummary = String(summary).toLowerCase();
-        Object.entries(skillKeywords).forEach(([category, keywords]) => {
-            if (keywords.some(k => lowerSummary.includes(k))) {
-                detectedSkills.push(category);
-            }
-        });
+        // --- Parse Goals for FormData ---
+        let parsedGoals = [];
+        if (req.body['goals[0][text]']) {
+            parsedGoals.push({ text: req.body['goals[0][text]'], completed: true });
+        } else if (typeof goals === 'string') {
+            try { parsedGoals = JSON.parse(goals); } catch (e) { }
+        } else if (Array.isArray(goals)) {
+            parsedGoals = goals;
+        }
 
         const reportData = {
             studentId: req.user.id,
@@ -121,13 +131,13 @@ router.post('/', auth, upload.single('file'), async (req, res) => {
             endDate: endDate ? new Date(endDate) : undefined,
             hoursWorked: hoursWorked ? Number(hoursWorked) : undefined,
             dailyBreakdown: Array.isArray(dailyBreakdown) ? dailyBreakdown : [],
-            skills: [...new Set([...(Array.isArray(skills) ? skills : []), ...detectedSkills])],
+            skills: parsedSkills,
             mentorshipRequested: Boolean(mentorshipRequested),
-            goals: Array.isArray(goals) ? goals : [],
+            goals: parsedGoals,
             aiInsights,
             auditTrail: {
                 ipAddress: req.ip || '127.0.0.1',
-                location: 'CBE Corporate HQ - Addis Ababa', 
+                location: 'Corporate HQ',
                 verified: true
             },
             type: 'Weekly',
@@ -153,7 +163,7 @@ router.post('/', auth, upload.single('file'), async (req, res) => {
             // --- Badge & Achievement System ---
             const user = await User.findById(req.user.id);
             const reportCount = await Report.countDocuments({ studentId: req.user.id, status: 'Submitted' });
-            
+
             let newBadge = null;
             if (reportCount === 1) newBadge = { title: 'First Milestone', icon: '🚀' };
             else if (reportCount === 3) newBadge = { title: 'Consistent Reporter', icon: '🔥' };
@@ -163,11 +173,7 @@ router.post('/', auth, upload.single('file'), async (req, res) => {
                 user.badges.push(newBadge);
             }
 
-            // Update Skill Analytics
-            detectedSkills.forEach(s => {
-                const current = user.skillAnalytics.get(s) || 0;
-                user.skillAnalytics.set(s, Math.min(100, current + 10));
-            });
+            // Note: Skill analytics updates removed as requested
 
             await user.save();
 
@@ -210,7 +216,7 @@ router.patch('/:id', auth, async (req, res) => {
         }
 
         const { summary, goals, hoursWorked, dailyBreakdown, skills, attachments } = req.body;
-        
+
         if (summary) report.summary = summary;
         if (goals) report.goals = goals;
         if (hoursWorked) report.hoursWorked = hoursWorked;
@@ -227,6 +233,28 @@ router.patch('/:id', auth, async (req, res) => {
     }
 });
 
+// ─── Student: Delete a draft logbook ─────────────────────────────────────────
+router.delete('/:id', auth, async (req, res) => {
+    try {
+        const report = await Report.findById(req.params.id);
+        if (!report) return res.status(404).json({ message: 'Logbook not found.' });
+
+        if (String(report.studentId) !== String(req.user.id)) {
+            return res.status(403).json({ message: 'Not authorized.' });
+        }
+
+        // Only allow deleting drafts or unreviewed submissions to preserve academic record integrity
+        if (report.status !== 'Draft' && report.status !== 'Submitted') {
+            return res.status(400).json({ message: 'Only Drafts or unreviewed reports can be deleted.' });
+        }
+
+        await Report.findByIdAndDelete(req.params.id);
+        res.json({ message: 'Draft deleted successfully.' });
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to delete draft.' });
+    }
+});
+
 // ─── Student: Get my logbooks ────────────────────────────────────────────────
 router.get('/mine', auth, async (req, res) => {
     try {
@@ -235,12 +263,63 @@ router.get('/mine', auth, async (req, res) => {
             return res.status(403).json({ message: 'Only students can view their logbooks.' });
         }
 
+        // Fetch Advisor
+        const student = await User.findById(req.user.id).select('departmentId').lean();
+        let advisor = null;
+        if (student?.departmentId) {
+            advisor = await User.findOne({
+                departmentId: student.departmentId,
+                role: { $in: ['hod', 'DeptAdmin', 'CollegeAdmin', 'admin'] }
+            }).select('name fullName email phone profileImage role').lean();
+        }
+
         const reports = await Report.find({ studentId: req.user.id, type: 'Weekly' })
-            .populate('internshipId', 'title')
+            .populate({
+                path: 'internshipId',
+                select: 'title companyId',
+                populate: {
+                    path: 'companyId',
+                    select: 'name fullName email phone profileImage'
+                }
+            })
             .sort({ weekNumber: 1 })
             .lean();
 
-        res.json(reports);
+        // 🏢 Fetch Company Profiles for correct Supervisor details
+        const companyIds = [...new Set(reports.map(r => r.internshipId?.companyId?._id).filter(Boolean))];
+        const companyProfiles = await CompanyProfile.find({ user: { $in: companyIds } }).lean();
+        const profileMap = companyProfiles.reduce((acc, p) => {
+            acc[p.user.toString()] = p;
+            return acc;
+        }, {});
+
+        const enrichedReports = reports.map(r => {
+            const compId = r.internshipId?.companyId?._id?.toString();
+            const profile = compId ? profileMap[compId] : null;
+            
+            let mentorDetails = null;
+            if (r.internshipId?.companyId) {
+                // Strictly prioritize Focal Person (Supervisor) as requested
+                const hasFocal = profile?.focalPerson?.name;
+                const rep = hasFocal ? profile.focalPerson : (profile?.representative || {});
+                
+                mentorDetails = {
+                    name: rep.name || profile?.companyName || r.internshipId.companyId.fullName || r.internshipId.companyId.name,
+                    email: rep.email || profile?.officialEmail || r.internshipId.companyId.email,
+                    phone: rep.phone || profile?.phone || r.internshipId.companyId.phone,
+                    position: hasFocal ? 'Internship Supervisor' : (rep.position || 'Company Representative'),
+                    profileImage: profile?.logo || r.internshipId.companyId.profileImage
+                };
+            }
+
+            return {
+                ...r,
+                advisor: advisor || null,
+                mentorDetails: mentorDetails
+            };
+        });
+
+        res.json(enrichedReports);
     } catch (err) {
         res.status(500).json({ message: 'Failed to load logbooks.' });
     }
@@ -282,10 +361,10 @@ router.get('/my-internship', auth, async (req, res) => {
 
         // Fallback advisor if none found
         if (!advisor) {
-            advisor = { 
-                fullName: 'Dr. Academic Advisor', 
+            advisor = {
+                fullName: 'Dr. Academic Advisor',
                 role: 'University Advisor',
-                profileImage: '' 
+                profileImage: ''
             };
         }
 
@@ -294,7 +373,7 @@ router.get('/my-internship', auth, async (req, res) => {
             internshipId: application.internshipId?._id,
             internshipTitle: application.internshipId?.title || 'Internship',
             companyName: application.internshipId?.companyId?.fullName || application.internshipId?.companyId?.name || 'Industry Partner',
-            
+
             // 👨‍🏫 Mentor (Industry)
             mentor: {
                 name: application.internshipId?.companyId?.fullName || application.internshipId?.companyId?.name || 'Company Mentor',
@@ -321,21 +400,50 @@ router.get('/my-internship', auth, async (req, res) => {
 // ─── Employer: Get logbooks submitted for their internships ──────────────────
 router.get('/employer', auth, async (req, res) => {
     try {
-        const role = String(req.user?.role || '').toLowerCase();
-        if (role !== 'employer') {
+        const rawRole = String(req.user?.role || '');
+        const role = rawRole.toLowerCase();
+        const isEmployer = role === 'employer' || role === 'industry partner' || rawRole === 'Industry Partner';
+
+        if (!isEmployer) {
             return res.status(403).json({ message: 'Only employers can view submitted logbooks.' });
         }
 
-        const internships = await Internship.find({ companyId: req.user.id }).select('_id title').lean();
-        const internshipIds = internships.map(i => i._id);
+        // 1. Find all internships belonging to this employer
+        const employerInternships = await Internship.find({
+            $or: [{ companyId: req.user.id }, { companyEmail: req.user.email }]
+        }).select('_id').lean();
+        const internshipIds = employerInternships.map(i => String(i._id));
 
-        const reports = await Report.find({ internshipId: { $in: internshipIds }, type: 'Weekly' })
-            .populate('studentId', 'fullName name email')
+        if (internshipIds.length === 0) return res.json([]);
+
+        // 2. Find all 'Weekly' reports that match these internships
+        // We use a broad search first to ensure we don't miss anything
+        const reports = await Report.find({
+            type: 'Weekly',
+            internshipId: { $in: internshipIds },
+            status: { $ne: 'Draft' }
+        })
+            .populate('studentId', 'fullName name email department profileImage')
             .populate('internshipId', 'title')
             .sort({ createdAt: -1 })
             .lean();
 
-        res.json(reports);
+        // 3. Robust Photo Sync with Profile Model
+        const studentIds = [...new Set(reports.map(r => r.studentId?._id).filter(Boolean))];
+        const profiles = await Profile.find({ userId: { $in: studentIds } }).select('profilePicUrl userId').lean();
+        const profileMap = profiles.reduce((acc, p) => {
+            acc[String(p.userId)] = p.profilePicUrl;
+            return acc;
+        }, {});
+
+        const enrichedReports = reports.map(report => {
+            if (report.studentId) {
+                report.studentId.profileImage = report.studentId.profileImage || profileMap[String(report.studentId._id)] || '';
+            }
+            return report;
+        });
+
+        res.json(enrichedReports);
     } catch (err) {
         res.status(500).json({ message: 'Failed to load logbooks.' });
     }
@@ -344,12 +452,14 @@ router.get('/employer', auth, async (req, res) => {
 // ─── Employer: Company Supervisor Review ─────────────────────────────────────
 router.patch('/:id/company-review', auth, async (req, res) => {
     try {
-        const role = String(req.user?.role || '').toLowerCase();
-        if (role !== 'employer') {
+        const rawRole = String(req.user?.role || '');
+        const role = rawRole.toLowerCase();
+        const isEmployer = role === 'employer' || role === 'industry partner' || rawRole === 'Industry Partner';
+        if (!isEmployer) {
             return res.status(403).json({ message: 'Only employers can perform company reviews.' });
         }
 
-        const { status, feedback, performanceScores } = req.body; // status: 'Approved', 'Needs Revision', 'Declined'
+        const { status, feedback, performanceScores, reviewedBy } = req.body; // status: 'Approved', 'Needs Revision', 'Declined'
         const validStatuses = ['Approved', 'Needs Revision', 'Declined'];
         if (!validStatuses.includes(status)) {
             return res.status(400).json({ message: 'Invalid status.' });
@@ -364,16 +474,16 @@ router.patch('/:id/company-review', auth, async (req, res) => {
 
         report.companyStatus = status;
         report.companyFeedback = feedback;
-        
+
         // 📊 7. PERFORMANCE SCORE SYSTEM
         if (performanceScores && typeof performanceScores === 'object') {
             report.performanceScores = {
-                technical: Number(performanceScores.technical || 0),
-                communication: Number(performanceScores.communication || 0),
-                teamwork: Number(performanceScores.teamwork || 0)
+                technical: Math.min(10, Math.max(0, Number(performanceScores.technical || 0))),
+                communication: Math.min(10, Math.max(0, Number(performanceScores.communication || 0))),
+                teamwork: Math.min(10, Math.max(0, Number(performanceScores.teamwork || 0)))
             };
         }
-        
+
         if (status === 'Approved') {
             report.status = 'Approved by Company';
         } else if (status === 'Needs Revision') {
@@ -389,12 +499,14 @@ router.patch('/:id/company-review', auth, async (req, res) => {
             title: 'Logbook Review: Company',
             message: `Your Week ${report.weekNumber} logbook was ${status.toLowerCase()} by your company supervisor.`,
             type: status === 'Approved' ? 'success' : 'warning',
-            targetRoute: '/student-dashboard/logbook'
+            targetRoute: '/student-dashboard/logbook',
+            sourceKey: `logbook-review-company:${report._id}:${new Date().getTime()}`
         });
 
         res.json({ message: `Company review complete: ${status}`, report });
     } catch (err) {
-        res.status(500).json({ message: 'Failed to process company review.' });
+        console.error('Company Review Error:', err);
+        res.status(500).json({ message: err.message || 'Failed to process company review.' });
     }
 });
 
@@ -458,7 +570,7 @@ router.get('/university-all', auth, async (req, res) => {
         }
 
         // In a real system, we would filter by departmentId or collegeId of the user
-        const reports = await Report.find({ type: 'Weekly' })
+        const reports = await Report.find({ type: 'Weekly', status: { $ne: 'Draft' } })
             .populate('studentId', 'fullName name email')
             .populate('internshipId', 'title')
             .sort({ createdAt: -1 })

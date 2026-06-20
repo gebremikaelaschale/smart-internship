@@ -59,6 +59,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/admin', require('./routes/admin')); // አዲሱ የዩኒቨርሲቲ መዋቅር መቆጣጠሪያ
 app.use('/api/admin', require('./routes/adminGovernance'));
 app.use('/api/dean', require('./routes/dean'));
+app.use('/api/hod', require('./routes/hod'));
 app.use('/api/profile', require('./routes/profile'));
 app.use('/api/internships', require('./routes/internship'));
 app.use('/api/matching', require('./routes/matching'));
@@ -67,12 +68,16 @@ app.use('/api/task', require('./routes/task'));
 app.use('/api/messages', require('./routes/message'));
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/student', require('./routes/student'));
+app.use('/api/students', require('./routes/students'));
 app.use('/api/notification', require('./routes/notification'));
 app.use('/api/notifications', require('./routes/notification'));
 app.use('/api/employer-profile', require('./routes/employerProfile'));
 app.use('/api/evaluation', require('./routes/evaluation'));
 app.use('/api/logbook', require('./routes/logbook'));
 app.use('/api/user-preferences', require('./routes/userPreferences'));
+app.use('/api/landing', require('./routes/landing'));
+app.use('/api/super-admin', require('./routes/superAdminPartners'));
+app.use('/api/companies', require('./routes/companyVerification'));
 
 const io = new Server(server, {
     cors: {
@@ -85,4 +90,13 @@ createChatSocket(io);
 app.set('io', io);
 
 const PORT = process.env.PORT || 5000;
+server.on('error', (error) => {
+    if (error.code === 'EADDRINUSE') {
+        console.error(`❌ Port ${PORT} is already in use. Stop the other process or change PORT in .env.`);
+        process.exit(1);
+    }
+
+    throw error;
+});
+
 server.listen(PORT, () => console.log(`🚀 SmartIntern Server running on port ${PORT}`));

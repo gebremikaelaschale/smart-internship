@@ -6,6 +6,7 @@ const companyProfileSchema = new mongoose.Schema({
     // 1. Basic Info (Extended)
     companyName: { type: String, required: true },
     logo: { type: String },
+    logoUrl: { type: String },
     coverImage: { type: String },
     description: { type: String },
     industryType: { type: String },
@@ -31,7 +32,8 @@ const companyProfileSchema = new mongoose.Schema({
     verification: {
         businessLicenseUrl: String,
         registrationDocUrl: String,
-        status: { type: String, enum: ['Pending', 'Verified', 'Rejected'], default: 'Pending' }
+        status: { type: String, enum: ['Pending', 'Verified', 'Rejected'], default: 'Pending' },
+        reason: String
     },
     
     // 8. Media / Gallery
@@ -69,6 +71,15 @@ const companyProfileSchema = new mongoose.Schema({
     // 14. Smart Indicators
     responseRate: { type: String, default: "Responds within 24 hours" },
     isActive: { type: Boolean, default: true },
+
+    // 15. Digital Identity Assets (signature is encrypted at rest)
+    digitalSignature: {
+        cipherText: { type: String, default: '' },
+        iv: { type: String, default: '' },
+        tag: { type: String, default: '' },
+        mimeType: { type: String, default: 'image/png' },
+        updatedAt: { type: Date, default: null }
+    },
     
     updatedAt: { type: Date, default: Date.now }
 }, { timestamps: true });

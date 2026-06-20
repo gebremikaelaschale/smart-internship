@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const router = express.Router();
 const auth = require('../middleware/authMiddleware');
+const superAdminOnly = require('../middleware/superAdminMiddleware');
 const { normalizeRole, normalizeAdminType, hasGovernanceAccess, isSuperAdmin: isSuperAdminRole } = require('../utils/governanceRoles');
 const College = require('../models/College');
 const Department = require('../models/Department');
@@ -19,6 +20,9 @@ const Certificate = require('../models/Certificate');
 const SystemSetting = require('../models/SystemSetting');
 const LoginLog = require('../models/LoginLog');
 const Profile = require('../models/Profile');
+const { normalizeString } = require('../utils/normalize');
+const { canonicalizeAcademicName, findBestAcademicMatch } = require('../utils/academicNormalization');
+const { updateCompanyStatus } = require('../controllers/companyStatusController');
 
 const EMAIL_USER = process.env.EMAIL_USER;
 const EMAIL_PASS = process.env.EMAIL_PASS;
@@ -34,7 +38,7 @@ const mailTransporter = EMAIL_USER && EMAIL_PASS
     : null;
 
 function createRandomPassword(length = 10) {
-    const charset = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%';
+    const charset = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     const bytes = crypto.randomBytes(length);
     let password = '';
     for (let index = 0; index < length; index += 1) {
@@ -42,6 +46,37 @@ function createRandomPassword(length = 10) {
     }
     return password;
 }
+
+function escapeRegex(value = '') {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function createAndEmitNotification(req, payload) {
+    const notification = await Notification.create(payload);
+    try {
+        const io = req.app.get('io');
+        if (io && payload?.userId) {
+            io.to(`user:${String(payload.userId)}`).emit('notification:new', notification.toObject());
+        }
+    } catch (e) {
+        // socket failures should not block the main request
+    }
+    return notification;
+}
+
+// ─── GET Current Admin Profile (for ProfileAdmin page) ───────────────────────
+router.get('/me', auth, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id)
+            .select('name fullName email phone profileImage role jobTitle department college')
+            .lean();
+        if (!user) return res.status(404).json({ message: 'User not found.' });
+        res.json(user);
+    } catch (err) {
+        res.status(500).json({ message: 'Failed to fetch profile.' });
+    }
+});
+
 
 async function sendGovernanceAccountEmail({ to, name, role, password, loginUrl }) {
     if (!mailTransporter) {
@@ -138,7 +173,7 @@ function canExportInternships(req) {
 
 function canExportApplications(req) {
     const adminType = getAdminType(req);
-    return ['superadmin', 'collegeadmin'].includes(adminType);
+    return ['superadmin', 'collegeadmin', 'deptadmin'].includes(adminType);
 }
 
 function resolveExportReason(req, res) {
@@ -182,6 +217,30 @@ function safeRegex(value) {
     if (!input) return null;
     const escaped = input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return new RegExp(escaped, 'i');
+}
+
+function normalizeAcademicQueryKey(value = '') {
+    return String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+}
+
+function buildAcademicSpaceInsensitiveRegex(value = '') {
+    const compact = normalizeAcademicQueryKey(value);
+    if (!compact) return null;
+
+    const pattern = compact
+        .split('')
+        .map((character) => escapeRegex(character))
+        .join('\\s*');
+
+    return new RegExp(`^\\s*${pattern}\\s*$`, 'i');
+}
+
+function academicNameMatches(left, right) {
+    const leftValue = canonicalizeAcademicName(left);
+    const rightValue = canonicalizeAcademicName(right);
+    if (!leftValue || !rightValue) return false;
+    if (leftValue === rightValue) return true;
+    return leftValue.includes(rightValue) || rightValue.includes(leftValue);
 }
 
 function buildAuditLogsFilter(req) {
@@ -284,12 +343,24 @@ async function getAdminScope(req) {
 
 function applyStudentScopeFilter(baseFilter, scope) {
     const filter = { ...(baseFilter || {}) };
-    if (scope?.adminType === 'collegeadmin' && scope?.college) {
-        filter.college = scope.college;
+    const scopeConditions = [];
+
+    if (scope?.adminType === 'collegeadmin') {
+        if (scope?.collegeId) scopeConditions.push({ collegeId: scope.collegeId });
+        const collegeRegex = buildAcademicSpaceInsensitiveRegex(scope.college);
+        if (collegeRegex) scopeConditions.push({ college: collegeRegex });
     }
+
     if (scope?.adminType === 'deptadmin') {
-        if (scope?.college) filter.college = scope.college;
-        if (scope?.department) filter.department = scope.department;
+        if (scope?.departmentId) scopeConditions.push({ departmentId: scope.departmentId });
+        const departmentRegex = buildAcademicSpaceInsensitiveRegex(scope.department);
+        if (departmentRegex) scopeConditions.push({ department: departmentRegex });
+    }
+
+    if (scopeConditions.length === 1) {
+        Object.assign(filter, scopeConditions[0]);
+    } else if (scopeConditions.length > 1) {
+        filter.$and = [...(filter.$and || []), { $or: scopeConditions }];
     }
     return filter;
 }
@@ -313,6 +384,77 @@ async function getScopedStudentIds(scope) {
     const studentFilter = applyStudentScopeFilter({ role: { $in: ['student', 'Student'] } }, scope);
     const students = await User.find(studentFilter).select('_id').lean();
     return students.map((item) => item._id);
+}
+
+async function getScopedEmployerIds(scope) {
+    const employerFilter = applyUserScopeFilter({ role: { $in: ['employer', 'Industry Partner'] } }, scope);
+    const employers = await User.find(employerFilter).select('_id').lean();
+    return employers.map((item) => item._id);
+}
+
+function normalizeDepartmentName(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+function buildSpaceInsensitiveRegex(value) {
+    const parts = String(value || '').trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) return null;
+    const pattern = parts.map((part) => escapeRegex(part)).join('\\s*');
+    return new RegExp(`^\\s*${pattern}\\s*$`, 'i');
+}
+
+function normalizeAcademicKey(value) {
+    return String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+}
+
+function academicNameMatches(left, right) {
+    const leftKey = normalizeAcademicKey(left);
+    const rightKey = normalizeAcademicKey(right);
+    return Boolean(leftKey && rightKey && leftKey === rightKey);
+}
+
+async function getScopedDepartmentNames(scope) {
+    if (!scope || scope.adminType === 'superadmin') return [];
+
+    if (scope.adminType === 'deptadmin') {
+        if (scope.department) return [scope.department];
+        if (!scope.departmentId) return [];
+
+        const department = await Department.findById(scope.departmentId).select('name').lean();
+        return department?.name ? [department.name] : [];
+    }
+
+    const collegeFilter = scope.collegeId
+        ? { _id: scope.collegeId }
+        : scope.college
+            ? { name: scope.college }
+            : null;
+
+    if (!collegeFilter) return [];
+
+    const college = await College.findOne(collegeFilter).select('_id').lean();
+    if (!college?._id) return [];
+
+    const departments = await Department.find({ collegeId: college._id }).select('name').lean();
+    return departments.map((department) => String(department?.name || '').trim()).filter(Boolean);
+}
+
+function applyDepartmentScopeFilter(baseFilter, departmentNames = []) {
+    if (!Array.isArray(departmentNames) || departmentNames.length === 0) {
+        return baseFilter;
+    }
+
+    const scopedRegexes = departmentNames
+        .map((name) => String(name || '').trim())
+        .filter(Boolean)
+        .map((name) => new RegExp(`^${escapeRegex(name)}$`, 'i'));
+
+    if (!scopedRegexes.length) return baseFilter;
+
+    return {
+        ...(baseFilter || {}),
+        targetDepartments: { $in: scopedRegexes }
+    };
 }
 
 function normalizeDeviceLabel(raw) {
@@ -355,6 +497,15 @@ async function getCurrentUserSecurityOverview(user) {
             .lean()
     ]);
 
+    const storedLastLogin = user?.lastLoginAt
+        ? {
+            at: user.lastLoginAt,
+            ipAddress: null,
+            deviceInfo: null,
+            source: 'user-last-login'
+        }
+        : null;
+
     const fallbackLastLogin = latestActivity
         ? {
             at: latestActivity.timestamp || null,
@@ -364,12 +515,13 @@ async function getCurrentUserSecurityOverview(user) {
         }
         : null;
 
-    const lastLogin = latestLoginLog
+    const selectedLastLogin = storedLastLogin || latestLoginLog;
+    const lastLogin = selectedLastLogin
         ? {
-            at: latestLoginLog.createdAt || null,
-            ipAddress: latestLoginLog.ipAddress || null,
-            deviceInfo: latestLoginLog.userAgent || null,
-            source: 'login-log'
+            at: selectedLastLogin.at || selectedLastLogin.createdAt || null,
+            ipAddress: selectedLastLogin.ipAddress || null,
+            deviceInfo: selectedLastLogin.deviceInfo || selectedLastLogin.userAgent || null,
+            source: selectedLastLogin.source || 'login-log'
         }
         : fallbackLastLogin;
 
@@ -418,9 +570,12 @@ function evaluateCompanyFraudRisk(company = {}) {
         score += 60;
         flags.push('Verification rejected by admin');
     }
-    if (verification === 'Pending' && (!hasLicense || !hasRegistrationDoc)) {
+    if (!hasLicense) {
+        score += 55;
+        flags.push('Missing business license');
+    } else if (verification === 'Pending' && !hasRegistrationDoc) {
         score += 35;
-        flags.push('Missing legal verification documents');
+        flags.push('Missing registration document');
     }
     if (completeness < 40) {
         score += 20;
@@ -504,18 +659,27 @@ router.get('/super-admin', auth, async (req, res) => {
     }
 
     try {
-        const recentMonths = buildRecentMonths(6);
+        const recentMonths = buildRecentMonths(12);
         const firstMonth = recentMonths[0]?.key;
         const [firstYear, firstMonthNumber] = String(firstMonth || '').split('-').map(Number);
         const startDate = Number.isFinite(firstYear) && Number.isFinite(firstMonthNumber)
             ? new Date(Date.UTC(firstYear, firstMonthNumber - 1, 1))
-            : new Date(Date.now() - (180 * 24 * 60 * 60 * 1000));
+            : new Date(Date.now() - (365 * 24 * 60 * 60 * 1000));
+
+        const verifiedCompanies = await User.find({
+            role: { $in: ['employer', 'Industry Partner'] },
+            isVerified: true
+        }).select('_id').lean();
+        const verifiedCompanyIds = verifiedCompanies.map(c => c._id);
 
         const [
-            students,
+            studentIds,
             companies,
             internships,
             activeInternships,
+            colleges,
+            departments,
+            totalApplications,
             applicationMonthly,
             internshipMonthly,
             latestInternship,
@@ -524,10 +688,13 @@ router.get('/super-admin', auth, async (req, res) => {
             companyProfiles,
             pendingInternships
         ] = await Promise.all([
-            User.countDocuments({ role: { $in: ['student', 'Student'] } }),
+            User.distinct('_id', { role: { $in: ['student', 'Student'] } }),
             CompanyProfile.countDocuments(),
-            Internship.countDocuments(),
-            Internship.countDocuments({ status: 'Open' }),
+            Internship.countDocuments({ companyId: { $in: verifiedCompanyIds } }),
+            Internship.countDocuments({ status: 'Open', companyId: { $in: verifiedCompanyIds } }),
+            College.countDocuments(),
+            Department.countDocuments(),
+            Application.countDocuments(),
             Application.aggregate([
                 { $match: { createdAt: { $gte: startDate } } },
                 {
@@ -587,8 +754,8 @@ router.get('/super-admin', auth, async (req, res) => {
         if (latestInternship) {
             activity.push({
                 type: 'internship-posted',
-                message: 'Company posted internship',
-                details: latestInternship.title || 'New internship was posted',
+                message: 'New internship posted',
+                details: latestInternship.title || 'A new internship opening was published',
                 timestamp: latestInternship.createdAt || new Date()
             });
         }
@@ -596,7 +763,7 @@ router.get('/super-admin', auth, async (req, res) => {
             const studentName = latestApplication?.studentId?.fullName || latestApplication?.studentId?.name || 'Student';
             activity.push({
                 type: 'application-submitted',
-                message: 'Student applied',
+                message: 'Student submitted application',
                 details: `${studentName} applied for ${latestApplication?.internshipId?.title || 'an internship'}`,
                 timestamp: latestApplication.createdAt || new Date()
             });
@@ -604,8 +771,8 @@ router.get('/super-admin', auth, async (req, res) => {
         if (latestActivatedInternship) {
             activity.push({
                 type: 'internship-approved',
-                message: 'Admin approved internship',
-                details: latestActivatedInternship.title || 'Internship is active',
+                message: 'Internship approved by admin',
+                details: latestActivatedInternship.title || 'Internship campaign is now live',
                 timestamp: latestActivatedInternship.updatedAt || new Date()
             });
         }
@@ -633,10 +800,12 @@ router.get('/super-admin', auth, async (req, res) => {
 
         return res.json({
             stats: {
-                students: Number(students || 0),
+                students: Number(studentIds.length || 0),
                 companies: Number(companies || 0),
+                colleges: Number(colleges || 0),
+                departments: Number(departments || 0),
                 internships: totalInternships,
-                activeInternships: activeInternshipCount
+                applications: Number(totalApplications || 0)
             },
             analyticsSeries,
             internshipSuccess: {
@@ -665,13 +834,16 @@ router.get('/college', auth, async (req, res) => {
         const scope = await getAdminScope(req);
 
         if (scope.adminType === 'superadmin') {
-            const [colleges, departments, pendingCompanyVerifications, activeStudents, departmentsWithoutHod, acceptedStudentIds] = await Promise.all([
+            const [colleges, departments, pendingCompanyVerifications, activeStudents, departmentsWithoutHod, acceptedStudentIds, totalPartners, totalInternships, totalApplications] = await Promise.all([
                 College.countDocuments(),
                 Department.countDocuments(),
                 CompanyProfile.countDocuments({ 'verification.status': 'Pending' }),
-                User.countDocuments({ role: { $in: ['student', 'Student'] } }),
+                User.distinct('_id', { role: { $in: ['student', 'Student'] } }).then((ids) => ids.length),
                 Department.countDocuments({ $or: [{ head: null }, { head: { $exists: false } }] }),
-                Application.distinct('studentId', { status: 'Accepted' })
+                Application.distinct('studentId', { status: 'Accepted' }),
+                User.countDocuments({ role: { $in: ['employer', 'Industry Partner'] } }),
+                Internship.countDocuments(),
+                Application.countDocuments()
             ]);
 
             const studentsWithoutInternship = Math.max(Number(activeStudents || 0) - Number(acceptedStudentIds.length || 0), 0);
@@ -683,7 +855,11 @@ router.get('/college', auth, async (req, res) => {
                     pendingRequests: Number(pendingCompanyVerifications || 0),
                     activeStudents: Number(activeStudents || 0),
                     departmentsWithoutHod: Number(departmentsWithoutHod || 0),
-                    studentsWithoutInternship: Number(studentsWithoutInternship || 0)
+                    studentsWithoutInternship: Number(studentsWithoutInternship || 0),
+                    students: Number(activeStudents || 0),
+                    industryPartners: Number(totalPartners || 0),
+                    internships: Number(totalInternships || 0),
+                    applications: Number(totalApplications || 0)
                 }
             });
         }
@@ -694,37 +870,155 @@ router.get('/college', auth, async (req, res) => {
                 ? { name: scope.college }
                 : { _id: null };
 
-        const [collegeDoc, scopedStudentIds] = await Promise.all([
-            College.findOne(collegeFilter).select('_id').lean(),
-            getScopedStudentIds(scope)
+        const collegeDoc = await College.findOne(collegeFilter).select('_id name').lean();
+
+        const collegeDepartmentMatch = collegeDoc?._id
+            ? {
+                $or: [
+                    { college: collegeDoc._id },
+                    { collegeId: collegeDoc._id }
+                ]
+            }
+            : null;
+
+        const collegeLinkClauses = [];
+        if (collegeDoc?._id) collegeLinkClauses.push({ collegeId: collegeDoc._id });
+        if (collegeDoc?.name) collegeLinkClauses.push({ college: collegeDoc.name });
+
+        const scopedStudentFilter = collegeLinkClauses.length > 0
+            ? { role: { $in: ['student', 'Student'] }, $or: collegeLinkClauses }
+            : { role: { $in: ['student', 'Student'] } };
+
+        const scopedEmployerFilter = collegeLinkClauses.length > 0
+            ? { role: { $in: ['employer', 'Industry Partner'] }, $or: collegeLinkClauses }
+            : { role: { $in: ['employer', 'Industry Partner'] } };
+
+        const [scopedStudentIds, scopedEmployerIds] = await Promise.all([
+            User.find(scopedStudentFilter).select('_id').lean(),
+            User.find(scopedEmployerFilter).select('_id').lean()
         ]);
 
-        const [departments, departmentsWithoutHod, pendingRequests, acceptedStudentIds] = await Promise.all([
-            collegeDoc?._id
-                ? Department.countDocuments({ college: collegeDoc._id })
+        const studentIds = scopedStudentIds.map((item) => item._id);
+        const employerIds = scopedEmployerIds.map((item) => item._id);
+
+        const [departments, departmentsWithoutHod, pendingRequests, acceptedStudentIds, totalInternships, totalApplications, scopedStudentUsers, scopedProfiles, scopedApplications] = await Promise.all([
+            collegeDepartmentMatch
+                ? Department.countDocuments(collegeDepartmentMatch)
                 : 0,
-            collegeDoc?._id
+            collegeDepartmentMatch
                 ? Department.countDocuments({
-                    college: collegeDoc._id,
-                    $or: [{ head: null }, { head: { $exists: false } }]
+                    $and: [
+                        collegeDepartmentMatch,
+                        { $or: [{ head: null }, { head: { $exists: false } }] }
+                    ]
                 })
                 : 0,
-            scopedStudentIds.length > 0
+            studentIds.length > 0
                 ? Application.countDocuments({
-                    studentId: { $in: scopedStudentIds },
+                    studentId: { $in: studentIds },
                     status: { $in: ['Pending', 'Under Review', 'Interview'] }
                 })
                 : 0,
-            scopedStudentIds.length > 0
+            studentIds.length > 0
                 ? Application.distinct('studentId', {
-                    studentId: { $in: scopedStudentIds },
+                    studentId: { $in: studentIds },
                     status: 'Accepted'
                 })
+                : [],
+            employerIds.length > 0
+                ? Internship.countDocuments({ companyId: { $in: employerIds } })
+                : 0,
+            studentIds.length > 0
+                ? Application.countDocuments({ studentId: { $in: studentIds } })
+                : 0,
+            studentIds.length > 0
+                ? User.find({ _id: { $in: studentIds } }).select('_id fullName name department college collegeId').lean()
+                : [],
+            studentIds.length > 0
+                ? Profile.find({ userId: { $in: studentIds } }).select('userId personalInfo.department').lean()
+                : [],
+            studentIds.length > 0
+                ? Application.find({ studentId: { $in: studentIds } })
+                    .populate('studentId', 'fullName name email department college collegeId')
+                    .populate('internshipId', 'title companyId')
+                    .sort({ updatedAt: -1 })
+                    .lean()
                 : []
         ]);
 
-        const activeStudents = Number(scopedStudentIds.length || 0);
+        const activeStudents = Number(studentIds.length || 0);
         const studentsWithoutInternship = Math.max(activeStudents - Number(acceptedStudentIds.length || 0), 0);
+        const placementStatuses = new Set(['Accepted', 'Placed']);
+        const placementCount = scopedApplications.filter((application) => placementStatuses.has(String(application?.status || ''))).length;
+        const placementProgress = totalApplications > 0
+            ? Math.round((placementCount / totalApplications) * 100)
+            : 0;
+
+        const profileDepartmentByUserId = new Map(
+            scopedProfiles.map((profile) => [String(profile.userId), String(profile?.personalInfo?.department || '').trim()])
+        );
+
+        scopedStudentUsers.forEach((user) => {
+            const userId = String(user._id);
+            if (!profileDepartmentByUserId.get(userId) && user.department) {
+                profileDepartmentByUserId.set(userId, String(user.department).trim());
+            }
+        });
+
+        const departmentStats = new Map();
+        scopedApplications.forEach((application) => {
+            const studentId = String(application?.studentId?._id || application?.studentId || '');
+            const departmentName = String(
+                profileDepartmentByUserId.get(studentId)
+                || application?.studentId?.department
+                || application?.studentId?.collegeDepartment
+                || ''
+            ).trim();
+
+            if (!departmentName) return;
+
+            const key = normalizeDepartmentName(departmentName);
+            const current = departmentStats.get(key) || {
+                department: departmentName,
+                totalApplications: 0,
+                placementCount: 0
+            };
+
+            current.totalApplications += 1;
+            if (placementStatuses.has(String(application?.status || ''))) {
+                current.placementCount += 1;
+            }
+            departmentStats.set(key, current);
+        });
+
+        const departmentComparison = Array.from(departmentStats.values())
+            .map((item) => ({
+                department: item.department || 'Department',
+                totalApplications: item.totalApplications,
+                placementCount: item.placementCount,
+                placementRate: item.totalApplications > 0
+                    ? Math.round((item.placementCount / item.totalApplications) * 100)
+                    : 0
+            }))
+            .sort((left, right) => right.placementRate - left.placementRate || right.totalApplications - left.totalApplications)
+            .slice(0, 6);
+
+        const recentActivities = scopedApplications
+            .filter((application) => ['Accepted', 'Placed', 'Interview', 'Shortlisted'].includes(String(application?.status || '')))
+            .slice(0, 5)
+            .map((application) => {
+                const status = String(application?.status || 'Pending');
+                const studentName = application?.studentId?.fullName || application?.studentId?.name || 'Unnamed Student';
+                const internshipTitle = application?.internshipId?.title || 'Internship';
+
+                return {
+                    id: String(application?._id || ''),
+                    status,
+                    title: `${studentName} ${status.toLowerCase()} for ${internshipTitle}`,
+                    message: `${studentName} moved to ${status.toLowerCase()} on ${internshipTitle}.`,
+                    timestamp: application?.updatedAt || application?.createdAt || new Date()
+                };
+            });
 
         return res.json({
             stats: {
@@ -733,7 +1027,20 @@ router.get('/college', auth, async (req, res) => {
                 pendingRequests: Number(pendingRequests || 0),
                 activeStudents,
                 departmentsWithoutHod: Number(departmentsWithoutHod || 0),
-                studentsWithoutInternship: Number(studentsWithoutInternship || 0)
+                studentsWithoutInternship: Number(studentsWithoutInternship || 0),
+                students: Number(activeStudents || 0),
+                industryPartners: Number(employerIds.length || 0),
+                internships: Number(totalInternships || 0),
+                applications: Number(totalApplications || 0)
+            },
+            analytics: {
+                placementProgress: {
+                    percent: Number(placementProgress || 0),
+                    placed: Number(placementCount || 0),
+                    totalApplications: Number(totalApplications || 0)
+                },
+                departmentComparison,
+                recentActivities
             }
         });
     } catch {
@@ -748,7 +1055,7 @@ router.get('/security-overview', auth, async (req, res) => {
 
     try {
         const actor = await User.findById(req.user?.id)
-            .select('_id email fullName name')
+            .select('_id email fullName name lastLoginAt')
             .lean();
 
         const summary = await getCurrentUserSecurityOverview(actor);
@@ -922,7 +1229,7 @@ router.get('/certificates', auth, async (req, res) => {
         }
 
         const appFilter = {
-            status: 'Accepted',
+            status: { $in: ['Accepted', 'Placed', 'PLACED'] },
             ...((scope.adminType === 'collegeadmin' || scope.adminType === 'deptadmin')
                 ? { studentId: { $in: scopedStudentIds.length ? scopedStudentIds : [null] } }
                 : {}),
@@ -1476,7 +1783,7 @@ router.get('/users', auth, async (req, res) => {
         const role = String(req.query.role || 'all').trim();
 
         const filter = applyUserScopeFilter({
-            ...(role && role !== 'all' ? { role } : {}),
+            ...(role && role !== 'all' ? { role: { $regex: new RegExp(`^${role}$`, 'i') } } : {}),
             ...(q ? {
                 $or: [
                     { name: q },
@@ -1488,14 +1795,77 @@ router.get('/users', auth, async (req, res) => {
             } : {})
         }, scope);
 
+        const pipeline = [
+            { $match: filter },
+            { $sort: { createdAt: -1 } },
+            { $skip: skip },
+            { $limit: limit },
+            {
+                $lookup: {
+                    from: 'profiles',
+                    localField: '_id',
+                    foreignField: 'userId',
+                    as: 'studentProfile'
+                }
+            },
+            {
+                $lookup: {
+                    from: 'companyprofiles',
+                    localField: '_id',
+                    foreignField: 'user',
+                    as: 'companyProfile'
+                }
+            },
+            {
+                $addFields: {
+                    userImg: '$profileImage',
+                    studentImg: { $arrayElemAt: ['$studentProfile.profilePicUrl', 0] },
+                    companyImg: { $arrayElemAt: ['$companyProfile.logo', 0] }
+                }
+            },
+            {
+                $addFields: {
+                    profileImage: {
+                        $cond: [
+                            { $and: [{ $ne: ['$userImg', null] }, { $ne: ['$userImg', ''] }] },
+                            '$userImg',
+                            {
+                                $cond: [
+                                    { $and: [{ $ne: ['$studentImg', null] }, { $ne: ['$studentImg', ''] }] },
+                                    '$studentImg',
+                                    {
+                                        $cond: [
+                                            { $and: [{ $ne: ['$companyImg', null] }, { $ne: ['$companyImg', ''] }] },
+                                            '$companyImg',
+                                            null
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                $project: {
+                    name: 1,
+                    fullName: 1,
+                    email: 1,
+                    role: 1,
+                    isVerified: 1,
+                    status: 1,
+                    accountStatus: 1,
+                    department: 1,
+                    college: 1,
+                    createdAt: 1,
+                    profileImage: 1
+                }
+            }
+        ];
+
         const [total, items] = await Promise.all([
             User.countDocuments(filter),
-            User.find(filter)
-                .select('name fullName email role isVerified status accountStatus department college createdAt')
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limit)
-                .lean()
+            User.aggregate(pipeline)
         ]);
 
         return res.json({
@@ -1586,6 +1956,8 @@ router.get('/students', auth, async (req, res) => {
         const q = safeRegex(req.query.q);
         const department = String(req.query.department || 'all').trim();
         const internshipStatus = String(req.query.internshipStatus || 'all').trim();
+        const scopeDepartmentName = String(scope?.department || '').trim();
+        const scopeCollegeName = String(scope?.college || '').trim();
 
         const filter = applyStudentScopeFilter({
             role: { $in: ['student', 'Student'] },
@@ -1602,73 +1974,99 @@ router.get('/students', auth, async (req, res) => {
         }, scope);
 
         const students = await User.find(filter)
-            .select('name fullName email department college isVerified status accountStatus createdAt')
+            .select('name fullName email department college collegeId departmentId isVerified verificationStatus verificationRequestedAt verificationReviewedAt verificationNote rejectionReason status accountStatus profileImage createdAt')
             .sort({ createdAt: -1 })
             .lean();
 
-        const studentIds = students.map((item) => item?._id).filter(Boolean);
+        const visibleStudents = scope?.adminType === 'deptadmin'
+            ? students.filter((student) => {
+                const departmentIdMatch = scope?.departmentId && String(student?.departmentId || '') === String(scope.departmentId);
+                const departmentNameMatch = academicNameMatches(student?.department || '', scopeDepartmentName);
+
+                return departmentIdMatch || departmentNameMatch;
+            })
+            : students;
+
+        const studentIds = visibleStudents.map((item) => item?._id).filter(Boolean);
         let statusByStudentId = new Map();
+        let companyByStudentId = new Map();
         let progressByStudentId = new Map();
 
         if (studentIds.length > 0) {
             const [applicationStatuses, profiles] = await Promise.all([
                 Application.aggregate([
                     { $match: { studentId: { $in: studentIds } } },
-                    {
-                        $addFields: {
-                            statusRank: {
-                                $switch: {
-                                    branches: [
-                                        { case: { $eq: ['$status', 'Accepted'] }, then: 5 },
-                                        { case: { $eq: ['$status', 'Interview'] }, then: 4 },
-                                        { case: { $eq: ['$status', 'Under Review'] }, then: 3 },
-                                        { case: { $eq: ['$status', 'Pending'] }, then: 2 },
-                                        { case: { $eq: ['$status', 'Rejected'] }, then: 1 }
-                                    ],
-                                    default: 0
-                                }
-                            }
-                        }
-                    },
-                    { $sort: { statusRank: -1, updatedAt: -1, createdAt: -1 } },
-                    { $group: { _id: '$studentId', status: { $first: '$status' } } }
+                    { $sort: { updatedAt: -1, createdAt: -1 } },
+                    { $group: { _id: '$studentId', status: { $first: '$status' }, companyId: { $first: '$companyId' }, internshipId: { $first: '$internshipId' } } }
                 ]),
-                Profile.find({ userId: { $in: studentIds } })
-                    .select('userId profileStrength')
-                    .lean()
+                Profile.find({ userId: { $in: studentIds } }).lean()
             ]);
 
             statusByStudentId = new Map(
                 applicationStatuses.map((item) => [String(item?._id || ''), String(item?.status || '')])
             );
 
+            // Also map assigned company/internship for quick lookups
+            companyByStudentId = new Map(
+                applicationStatuses.map((item) => [String(item?._id || ''), item?.companyId || null])
+            );
+
             progressByStudentId = new Map(
-                profiles.map((item) => [String(item?.userId || ''), Number(item?.profileStrength || 0)])
+                profiles.map((item) => [String(item?.userId || ''), item])
             );
         }
 
-        const withInternshipData = students.map((student) => {
+            const withInternshipData = visibleStudents.map((student) => {
             const studentId = String(student?._id || '');
             const rawStatus = statusByStudentId.get(studentId) || '';
+            const assignedCompany = companyByStudentId.get(studentId) || null;
+            const profile = progressByStudentId.get(studentId);
 
             let normalizedInternshipStatus = 'Not Applied';
-            if (rawStatus === 'Accepted') normalizedInternshipStatus = 'Placed';
-            else if (['Pending', 'Under Review', 'Interview'].includes(rawStatus)) normalizedInternshipStatus = 'In Progress';
-            else if (rawStatus === 'Rejected') normalizedInternshipStatus = 'Not Placed';
+            if (['Placed', 'Accepted'].includes(rawStatus)) normalizedInternshipStatus = 'Placed';
+            else if (['Pending', 'Under Review', 'Interview', 'Seen', 'Shortlisted', 'Offered'].includes(rawStatus)) normalizedInternshipStatus = 'In Progress';
+            else if (['Rejected', 'Withdrawn'].includes(rawStatus)) normalizedInternshipStatus = 'Not Placed';
 
-            const profileProgress = progressByStudentId.get(studentId);
-            let progress = Number.isFinite(profileProgress) ? profileProgress : 0;
-            if (!Number.isFinite(profileProgress) || profileProgress <= 0) {
-                if (normalizedInternshipStatus === 'Placed') progress = 100;
-                else if (normalizedInternshipStatus === 'In Progress') progress = 65;
-                else if (normalizedInternshipStatus === 'Not Placed') progress = 40;
-                else progress = 20;
+            let progress = 0;
+            // Strict Database Check for Progress
+            if (['Placed', 'Accepted'].includes(rawStatus)) {
+                progress = 100; // Successfully Placed
+            } else if (rawStatus === 'Interview') {
+                progress = 75; // Advanced Stage
+            } else if (['Pending', 'Under Review', 'Seen', 'Shortlisted', 'Offered'].includes(rawStatus)) {
+                progress = 50; // Active Applicant
+            } else if (rawStatus === 'Rejected') {
+                progress = 25; // Attempted but currently not placed
+            } else {
+                progress = 0; // No real progress detected in DB
             }
+
+            const verificationStatus = String(student?.verificationStatus || '').trim()
+                || (student?.isVerified ? 'Verified' : 'Not Submitted');
 
             return {
                 ...student,
+                assignedCompanyId: assignedCompany || null,
+                fullName: student.fullName || student.name || '',
+                full_name: student.fullName || student.name || '',
+                profilePicture: profile?.profilePicUrl || student.profileImage || '',
+                profile_picture: profile?.profilePicUrl || student.profileImage || '',
+                verificationStatus,
+                status: verificationStatus,
                 internshipStatus: normalizedInternshipStatus,
-                progress: Math.max(0, Math.min(100, Math.round(progress)))
+                progress: Math.max(0, Math.min(100, Math.round(progress))),
+                profileDetails: profile ? {
+                    phone: profile.personalInfo?.phone || student.phone || '',
+                    bio: profile.personalInfo?.bio || '',
+                    address: profile.personalInfo?.address || '',
+                    yearOfStudy: profile.personalInfo?.yearOfStudy || '',
+                    college: student.college || profile.personalInfo?.college || '',
+                    gpa: profile.academicInfo?.gpa || '',
+                    skills: profile.academicInfo?.skills || [],
+                    resumeUrl: profile.resumeUrl || '',
+                    profilePicUrl: profile.profilePicUrl || student.profileImage || '',
+                    portfolio: profile.portfolioLinks || {}
+                } : null
             };
         });
 
@@ -1679,26 +2077,103 @@ router.get('/students', auth, async (req, res) => {
         const pagedItems = filteredByStatus.slice(skip, skip + limit);
         const total = filteredByStatus.length;
 
-        const departmentOptions = [...new Set(students.map((student) => String(student?.department || '').trim()).filter(Boolean))]
+        const departmentOptions = [...new Set(visibleStudents.map((student) => String(student?.department || '').trim()).filter(Boolean))]
             .sort((a, b) => a.localeCompare(b));
 
         return res.json({
             items: pagedItems,
-            filters: {
-                departments: departmentOptions,
-                internshipStatuses: ['Placed', 'In Progress', 'Not Placed', 'Not Applied']
-            },
             pagination: {
                 page,
                 limit,
                 total,
                 totalPages: Math.max(Math.ceil(total / limit), 1)
+            },
+            filters: {
+                departments: departmentOptions,
+                internshipStatuses: ['Placed', 'In Progress', 'Not Placed', 'Not Applied']
             }
         });
     } catch {
         return res.status(500).json({ message: 'Failed to load students.' });
     }
 });
+
+router.get('/students/:id', auth, async (req, res) => {
+    if (!hasAdminAccess(req.user?.role)) {
+        return res.status(403).json({ message: 'Unauthorized.' });
+    }
+
+    try {
+        const { id } = req.params;
+        const student = await User.findById(id)
+            .select('name fullName email department college collegeId departmentId isVerified verificationStatus verificationRequestedAt verificationReviewedAt verificationNote rejectionReason status accountStatus profileImage createdAt')
+            .lean();
+
+        if (!student) {
+            return res.status(404).json({ message: 'Student not found.' });
+        }
+
+        const [applications, profile] = await Promise.all([
+            Application.find({ studentId: id }).lean(),
+            Profile.findOne({ userId: id }).lean()
+        ]);
+
+        let normalizedInternshipStatus = 'Not Applied';
+        if (applications.length > 0) {
+            const statusPriority = {
+                'Placed': 6,
+                'Accepted': 5,
+                'Interview': 4,
+                'Shortlisted': 3,
+                'Seen': 2,
+                'Pending': 2,
+                'Under Review': 2,
+                'Rejected': 1,
+                'Withdrawn': 1
+            };
+
+            let highestRank = -1;
+            let rawStatus = 'Pending';
+
+            applications.forEach(app => {
+                const rank = statusPriority[app.status] || 0;
+                if (rank > highestRank) {
+                    highestRank = rank;
+                    rawStatus = app.status;
+                }
+            });
+
+            if (['Placed', 'Accepted'].includes(rawStatus)) normalizedInternshipStatus = 'Placed';
+            else if (['Pending', 'Under Review', 'Interview', 'Seen', 'Shortlisted', 'Offered'].includes(rawStatus)) normalizedInternshipStatus = 'In Progress';
+            else if (['Rejected', 'Withdrawn'].includes(rawStatus)) normalizedInternshipStatus = 'Not Placed';
+        }
+
+        const data = {
+            ...student,
+            verificationStatus: String(student?.verificationStatus || '').trim()
+                || (student?.isVerified ? 'Verified' : 'Not Submitted'),
+            internshipStatus: normalizedInternshipStatus,
+            profileDetails: profile ? {
+                phone: profile.personalInfo?.phone || student.phone || '',
+                bio: profile.personalInfo?.bio || '',
+                address: profile.personalInfo?.address || '',
+                yearOfStudy: profile.personalInfo?.yearOfStudy || '',
+                college: student.college || profile.personalInfo?.college || '',
+                gpa: profile.academicInfo?.gpa || '',
+                skills: profile.academicInfo?.skills || [],
+                resumeUrl: profile.resumeUrl || '',
+                profilePicUrl: profile.profilePicUrl || student.profileImage || '',
+                portfolio: profile.portfolioLinks || {}
+            } : null
+        };
+
+        return res.json({ item: data });
+    } catch {
+        return res.status(500).json({ message: 'Failed to fetch student profile.' });
+    }
+});
+
+
 
 router.get('/students/export', auth, async (req, res) => {
     if (!canExportStudents(req)) {
@@ -1746,6 +2221,7 @@ router.get('/students/export', auth, async (req, res) => {
                             statusRank: {
                                 $switch: {
                                     branches: [
+                                        { case: { $eq: ['$status', 'Placed'] }, then: 6 },
                                         { case: { $eq: ['$status', 'Accepted'] }, then: 5 },
                                         { case: { $eq: ['$status', 'Interview'] }, then: 4 },
                                         { case: { $eq: ['$status', 'Under Review'] }, then: 3 },
@@ -1758,7 +2234,7 @@ router.get('/students/export', auth, async (req, res) => {
                         }
                     },
                     { $sort: { statusRank: -1, updatedAt: -1, createdAt: -1 } },
-                    { $group: { _id: '$studentId', status: { $first: '$status' } } }
+                    { $group: { _id: '$studentId', status: { $first: '$status' }, companyId: { $first: '$companyId' }, internshipId: { $first: '$internshipId' } } }
                 ]),
                 Profile.find({ userId: { $in: studentIds } })
                     .select('userId profileStrength')
@@ -1767,6 +2243,10 @@ router.get('/students/export', auth, async (req, res) => {
 
             statusByStudentId = new Map(
                 applicationStatuses.map((item) => [String(item?._id || ''), String(item?.status || '')])
+            );
+
+            const companyByStudentId = new Map(
+                applicationStatuses.map((item) => [String(item?._id || ''), item?.companyId || null])
             );
 
             progressByStudentId = new Map(
@@ -1779,9 +2259,9 @@ router.get('/students/export', auth, async (req, res) => {
             const rawStatus = statusByStudentId.get(studentId) || '';
 
             let normalizedInternshipStatus = 'Not Applied';
-            if (rawStatus === 'Accepted') normalizedInternshipStatus = 'Placed';
-            else if (['Pending', 'Under Review', 'Interview'].includes(rawStatus)) normalizedInternshipStatus = 'In Progress';
-            else if (rawStatus === 'Rejected') normalizedInternshipStatus = 'Not Placed';
+            if (['Placed', 'Accepted'].includes(rawStatus)) normalizedInternshipStatus = 'Placed';
+            else if (['Pending', 'Under Review', 'Interview', 'Seen', 'Shortlisted', 'Offered'].includes(rawStatus)) normalizedInternshipStatus = 'In Progress';
+            else if (['Rejected', 'Withdrawn'].includes(rawStatus)) normalizedInternshipStatus = 'Not Placed';
 
             const profileProgress = progressByStudentId.get(studentId);
             let progress = Number.isFinite(profileProgress) ? profileProgress : 0;
@@ -1792,8 +2272,11 @@ router.get('/students/export', auth, async (req, res) => {
                 else progress = 20;
             }
 
+            const assignedCompany = companyByStudentId.get(studentId) || null;
+
             return {
                 ...student,
+                assignedCompanyId: assignedCompany || null,
                 internshipStatus: normalizedInternshipStatus,
                 progress: Math.max(0, Math.min(100, Math.round(progress)))
             };
@@ -1861,7 +2344,7 @@ router.get('/companies', auth, async (req, res) => {
         const [total, items] = await Promise.all([
             CompanyProfile.countDocuments(filter),
             CompanyProfile.find(filter)
-                .select('companyName industryType hqLocation verification isActive user createdAt')
+                .select('companyName logo industryType hqLocation verification isActive user representative createdAt')
                 .populate('user', 'name fullName email')
                 .sort({ createdAt: -1 })
                 .skip(skip)
@@ -1894,16 +2377,22 @@ router.get('/companies/:id', auth, async (req, res) => {
     }
 
     try {
-        const profile = await CompanyProfile.findById(req.params.id)
+        let profile = await CompanyProfile.findById(req.params.id)
             .populate('user', 'name fullName email role isVerified createdAt')
             .lean();
+
+        if (!profile) {
+            profile = await CompanyProfile.findOne({ user: req.params.id })
+                .populate('user', 'name fullName email role isVerified createdAt')
+                .lean();
+        }
 
         if (!profile) {
             return res.status(404).json({ message: 'Company profile not found.' });
         }
 
         return res.json({ item: profile });
-    } catch {
+    } catch (err) {
         return res.status(500).json({ message: 'Failed to load company profile.' });
     }
 });
@@ -1933,7 +2422,7 @@ router.get('/companies/export', auth, async (req, res) => {
         };
 
         const companies = await CompanyProfile.find(filter)
-            .select('companyName industryType hqLocation verification isActive user createdAt')
+            .select('companyName industryType hqLocation verification isActive user representative createdAt')
             .populate('user', 'name fullName email')
             .sort({ createdAt: -1 })
             .limit(10000)
@@ -1943,7 +2432,7 @@ router.get('/companies/export', auth, async (req, res) => {
             ['Company', 'Representative', 'Email', 'Industry', 'Location', 'Verification', 'Active', 'Created At'],
             ...companies.map((item) => [
                 item?.companyName || '',
-                item?.user?.fullName || item?.user?.name || '',
+                item?.representative?.name || item?.user?.fullName || item?.user?.name || '',
                 item?.user?.email || '',
                 item?.industryType || '',
                 item?.hqLocation || '',
@@ -1976,12 +2465,17 @@ router.get('/internships', auth, async (req, res) => {
     }
 
     try {
+        const scope = await getAdminScope(req);
+        const scopedDepartmentNames = await getScopedDepartmentNames(scope);
+        const effectiveDepartmentNames = scope?.adminType === 'superadmin'
+            ? []
+            : (scopedDepartmentNames.length ? scopedDepartmentNames : ['__no_department_match__']);
         const { page, limit, skip } = getPagination(req);
         const q = safeRegex(req.query.q);
         const status = String(req.query.status || 'all').trim();
 
         const filter = {
-            ...(status && status !== 'all' ? { status } : {}),
+            ...(status && status !== 'all' ? { status: status.charAt(0).toUpperCase() + status.slice(1) } : {}),
             ...(q ? {
                 $or: [
                     { title: q },
@@ -1991,18 +2485,23 @@ router.get('/internships', auth, async (req, res) => {
             } : {})
         };
 
+        const scopedFilter = applyDepartmentScopeFilter(filter, effectiveDepartmentNames);
+        const pendingFilter = applyDepartmentScopeFilter({ status: 'Pending' }, effectiveDepartmentNames);
+        const openFilter = applyDepartmentScopeFilter({ status: 'Open' }, effectiveDepartmentNames);
+        const closedFilter = applyDepartmentScopeFilter({ status: 'Closed' }, effectiveDepartmentNames);
+
         const [total, items, totalPending, totalOpen, totalClosed] = await Promise.all([
-            Internship.countDocuments(filter),
-            Internship.find(filter)
+            Internship.countDocuments(scopedFilter),
+            Internship.find(scopedFilter)
                 .select('title location status studentsNeeded deadline companyId createdAt')
                 .populate('companyId', 'name fullName email')
                 .sort({ createdAt: -1 })
                 .skip(skip)
                 .limit(limit)
                 .lean(),
-            Internship.countDocuments({ status: 'Pending' }),
-            Internship.countDocuments({ status: 'Open' }),
-            Internship.countDocuments({ status: 'Closed' })
+            Internship.countDocuments(pendingFilter),
+            Internship.countDocuments(openFilter),
+            Internship.countDocuments(closedFilter)
         ]);
 
         return res.json({
@@ -2033,11 +2532,16 @@ router.get('/internships/export', auth, async (req, res) => {
     if (!exportReason) return;
 
     try {
+        const scope = await getAdminScope(req);
+        const scopedDepartmentNames = await getScopedDepartmentNames(scope);
+        const effectiveDepartmentNames = scope?.adminType === 'superadmin'
+            ? []
+            : (scopedDepartmentNames.length ? scopedDepartmentNames : ['__no_department_match__']);
         const q = safeRegex(req.query.q);
         const status = String(req.query.status || 'all').trim();
 
         const filter = {
-            ...(status && status !== 'all' ? { status } : {}),
+            ...(status && status !== 'all' ? { status: status.charAt(0).toUpperCase() + status.slice(1) } : {}),
             ...(q ? {
                 $or: [
                     { title: q },
@@ -2047,7 +2551,9 @@ router.get('/internships/export', auth, async (req, res) => {
             } : {})
         };
 
-        const internships = await Internship.find(filter)
+        const scopedFilter = applyDepartmentScopeFilter(filter, effectiveDepartmentNames);
+
+        const internships = await Internship.find(scopedFilter)
             .select('title location status studentsNeeded deadline companyId createdAt')
             .populate('companyId', 'name fullName email')
             .sort({ createdAt: -1 })
@@ -2110,7 +2616,11 @@ router.get('/applications', auth, async (req, res) => {
         }
 
         const filter = {
-            ...(status && status !== 'all' ? { status } : {}),
+            ...(status && status !== 'all'
+                ? status === 'Accepted' || status === 'Placed'
+                    ? { status: { $in: ['Accepted', 'Placed'] } }
+                    : { status }
+                : {}),
             ...((scope.adminType === 'collegeadmin' || scope.adminType === 'deptadmin')
                 ? { studentId: { $in: scopedStudentIds.length ? scopedStudentIds : [null] } }
                 : {}),
@@ -2126,22 +2636,37 @@ router.get('/applications', auth, async (req, res) => {
         const [total, items, pending, underReview, interview, accepted, rejected] = await Promise.all([
             Application.countDocuments(filter),
             Application.find(filter)
-                .select('studentId internshipId status matchingScore createdAt')
+                .select('studentId internshipId status matchingScore match_score createdAt')
                 .populate('studentId', 'name fullName email')
-                .populate('internshipId', 'title')
+                .populate('internshipId', 'title location requiredSkills targetDepartments department')
                 .sort({ createdAt: -1 })
                 .skip(skip)
                 .limit(limit)
                 .lean()
-            ,Application.countDocuments({ ...filter, status: 'Pending' }),
+            , Application.countDocuments({ ...filter, status: 'Pending' }),
             Application.countDocuments({ ...filter, status: 'Under Review' }),
             Application.countDocuments({ ...filter, status: 'Interview' }),
-            Application.countDocuments({ ...filter, status: 'Accepted' }),
+            Application.countDocuments({ ...filter, status: { $in: ['Accepted', 'Placed'] } }),
             Application.countDocuments({ ...filter, status: 'Rejected' })
         ]);
 
+        const enrichedItems = items.map(app => {
+            const camel = Number(app?.matchingScore);
+            const snake = Number(app?.match_score);
+            const camelValue = Number.isFinite(camel) ? camel : 0;
+            const snakeValue = Number.isFinite(snake) ? snake : 0;
+            const finalScore = Math.max(camelValue, snakeValue);
+
+            return {
+                ...app,
+                matchingScore: finalScore,
+                match_score: finalScore,
+                matchScore: finalScore
+            };
+        });
+
         return res.json({
-            items,
+            items: enrichedItems,
             stats: {
                 pending: Number(pending || 0),
                 underReview: Number(underReview || 0),
@@ -2161,125 +2686,14 @@ router.get('/applications', auth, async (req, res) => {
     }
 });
 
-router.get('/applications/export', auth, async (req, res) => {
-    if (!canExportApplications(req)) {
-        return res.status(403).json({ message: 'Only SuperAdmin or CollegeAdmin can export applications.' });
-    }
-
-    const exportReason = resolveExportReason(req, res);
-    if (!exportReason) return;
-
-    try {
-        const scope = await getAdminScope(req);
-        const scopedStudentIds = await getScopedStudentIds(scope);
-        const q = String(req.query.q || '').trim();
-        const status = String(req.query.status || 'all').trim();
-
-        let studentIds = [];
-        let internshipIds = [];
-        if (q) {
-            const regex = safeRegex(q);
-            const [users, internships] = await Promise.all([
-                User.find({ $or: [{ name: regex }, { fullName: regex }, { email: regex }] }).select('_id').lean(),
-                Internship.find({ title: regex }).select('_id').lean()
-            ]);
-            studentIds = users.map((item) => item._id);
-            internshipIds = internships.map((item) => item._id);
-        }
-
-        const filter = {
-            ...(status && status !== 'all' ? { status } : {}),
-            ...((scope.adminType === 'collegeadmin' || scope.adminType === 'deptadmin')
-                ? { studentId: { $in: scopedStudentIds.length ? scopedStudentIds : [null] } }
-                : {}),
-            ...(q ? {
-                $or: [
-                    { remarks: safeRegex(q) },
-                    { studentId: { $in: studentIds.length ? studentIds : [null] } },
-                    { internshipId: { $in: internshipIds.length ? internshipIds : [null] } }
-                ]
-            } : {})
-        };
-
-        const applications = await Application.find(filter)
-            .select('studentId internshipId status matchingScore remarks createdAt')
-            .populate('studentId', 'name fullName email')
-            .populate('internshipId', 'title')
-            .sort({ createdAt: -1 })
-            .limit(10000)
-            .lean();
-
-        const rows = [
-            ['Student', 'Email', 'Internship', 'Status', 'Match Score', 'Remarks', 'Created At'],
-            ...applications.map((item) => [
-                item?.studentId?.fullName || item?.studentId?.name || '',
-                item?.studentId?.email || '',
-                item?.internshipId?.title || '',
-                item?.status || '',
-                item?.matchingScore ?? '',
-                item?.remarks || '',
-                item?.createdAt ? new Date(item.createdAt).toISOString() : ''
-            ])
-        ];
-
-        const csv = toCsv(rows);
-        const filename = `admin-applications-${Date.now()}.csv`;
-
-        await logAdminAction(
-            req,
-            'ADMIN_EXPORT_APPLICATIONS',
-            `Rows=${applications.length} Reason=${exportReason} Filters=${JSON.stringify({ q: req.query.q || '', status: req.query.status || 'all' })}`
-        );
-
-        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        return res.status(200).send(csv);
-    } catch {
-        return res.status(500).json({ message: 'Failed to export applications.' });
-    }
-});
-
 router.put('/companies/:id/verification', auth, async (req, res) => {
     if (!isSuperAdmin(req)) {
         return res.status(403).json({ message: 'Only SuperAdmin can update company verification.' });
     }
-
-    try {
-        const allowedStatuses = new Set(['Pending', 'Verified', 'Rejected']);
-        const status = String(req.body?.status || '').trim();
-        if (!allowedStatuses.has(status)) {
-            return res.status(400).json({ message: 'Invalid verification status.' });
-        }
-
-        const profile = await CompanyProfile.findByIdAndUpdate(
-            req.params.id,
-            { $set: { 'verification.status': status } },
-            { returnDocument: 'after' }
-        )
-            .select('companyName verification user')
-            .populate('user', 'name fullName email')
-            .lean();
-
-        if (!profile) {
-            return res.status(404).json({ message: 'Company profile not found.' });
-        }
-
-        if (profile.user?._id) {
-            await User.findByIdAndUpdate(profile.user._id, {
-                $set: { isVerified: status === 'Verified' }
-            });
-        }
-
-        await logAdminAction(
-            req,
-            'ADMIN_COMPANY_VERIFICATION_UPDATED',
-            `Company=${profile?.companyName || profile?._id} Verification=${status}`
-        );
-
-        return res.json({ message: 'Company verification updated.', item: profile });
-    } catch {
-        return res.status(500).json({ message: 'Failed to update company verification.' });
-    }
+    const status = String(req.body?.status || '').trim();
+    req.body = req.body || {};
+    req.body.status = status;
+    return updateCompanyStatus(req, res);
 });
 
 router.put('/internships/:id/status', auth, async (req, res) => {
@@ -2312,23 +2726,23 @@ router.put('/internships/:id/status', auth, async (req, res) => {
             console.log(`🚀 Internship [${internship.title}] was approved. Starting notification fan-out...`);
             const { sendEmail } = require('../utils/mailer');
             const UserPreferences = require('../models/UserPreferences');
-            
+
             try {
                 // Fetch all students
                 const students = await User.find({ role: { $in: ['student', 'Student'] } })
                     .select('_id email name fullName')
                     .lean();
-                
+
                 console.log(`👥 Found ${students.length} total students in database.`);
-                
+
                 const studentIds = students.map(s => s._id);
-                
+
                 // Filter out only those who specifically disabled emailAlerts
-                const optOutPrefs = await UserPreferences.find({ 
+                const optOutPrefs = await UserPreferences.find({
                     userId: { $in: studentIds },
-                    'notifications.emailAlerts': false 
+                    'notifications.emailAlerts': false
                 }).select('userId').lean();
-                
+
                 const optOutIds = new Set(optOutPrefs.map(p => String(p.userId)));
                 const targets = students.filter(s => !optOutIds.has(String(s._id)));
 
@@ -2424,6 +2838,15 @@ router.put('/applications/:id/status', auth, async (req, res) => {
             `Application=${item?._id} Status=${status} Internship=${item?.internshipId?.title || 'N/A'} Remarks=${remarks || '-'}`
         );
 
+        // If admin marked an application as Accepted or Placed, ensure the student's User record reflects placement
+        try {
+            if (['Accepted', 'Placed'].includes(String(item?.status || '').trim())) {
+                await User.findByIdAndUpdate(item.studentId, { internshipStatus: 'Placed', status: 'PLACED' }).catch(() => {});
+            }
+        } catch (e) {
+            // non-critical
+        }
+
         return res.json({ message: 'Application status updated.', item });
     } catch {
         return res.status(500).json({ message: 'Failed to update application status.' });
@@ -2447,15 +2870,22 @@ router.get('/colleges', auth, async (req, res) => {
                     : { _id: null };
 
         const colleges = await College.find(collegeFilter)
-            .populate('dean', 'name fullName email role createdAt')
+            .populate('dean', 'name fullName email phone role createdAt')
             .sort({ name: 1 })
             .lean();
 
         const collegeIds = colleges.map((college) => college._id);
-        const departments = await Department.find({ college: { $in: collegeIds } }).select('college').lean();
+        const departments = await Department.find({
+            $or: [
+                { college: { $in: collegeIds } },
+                { collegeId: { $in: collegeIds } }
+            ]
+        }).select('college collegeId').lean();
+
         const departmentCounts = departments.reduce((accumulator, item) => {
-            const key = String(item?.college || '');
-            accumulator[key] = (accumulator[key] || 0) + 1;
+            // try both fields
+            const key = String(item?.college || item?.collegeId || '');
+            if (key) accumulator[key] = (accumulator[key] || 0) + 1;
             return accumulator;
         }, {});
 
@@ -2535,7 +2965,7 @@ router.post('/add-college', auth, async (req, res) => {
             await User.findByIdAndUpdate(deanUser._id, { college: name, collegeId: college._id });
         }
 
-        const populated = await College.findById(college._id).populate('dean', 'name fullName email role college').lean();
+        const populated = await College.findById(college._id).populate('dean', 'name fullName email phone role college').lean();
         res.status(201).json({ msg: "College added successfully", college: populated });
     } catch (err) { res.status(500).json({ error: "Failed to create college." }); }
 });
@@ -2547,6 +2977,7 @@ router.post('/colleges', auth, async (req, res) => {
         const deanId = String(req.body.deanId || '').trim();
         const deanName = String(req.body?.dean?.name || '').trim();
         const deanEmail = String(req.body?.dean?.email || '').toLowerCase().trim();
+        const deanPhone = String(req.body?.dean?.phone || '').trim();
 
         if (!name) {
             return res.status(400).json({ message: 'College name is required.' });
@@ -2575,6 +3006,7 @@ router.post('/colleges', auth, async (req, res) => {
                 name: deanName,
                 fullName: deanName,
                 email: deanEmail,
+                phone: deanPhone,
                 password: hashedPassword,
                 role: 'dean',
                 isFirstLogin: true,
@@ -2610,7 +3042,7 @@ router.post('/colleges', auth, async (req, res) => {
             }
         }
 
-        const populated = await College.findById(college._id).populate('dean', 'name fullName email role college').lean();
+        const populated = await College.findById(college._id).populate('dean', 'name fullName email phone role college').lean();
         res.status(201).json({
             college: populated,
             temporaryPassword: temporaryPassword || null,
@@ -2644,7 +3076,7 @@ router.put('/colleges/:id/dean', auth, async (req, res) => {
             { $set: { dean: deanUser?._id || null, deanId: deanUser?._id || null } },
             { returnDocument: 'after' }
         )
-            .populate('dean', 'name fullName email role college')
+            .populate('dean', 'name fullName email phone role college')
             .lean();
 
         if (!college) {
@@ -2666,7 +3098,7 @@ router.post('/colleges/:id/dean/reset-password', auth, async (req, res) => {
 
     try {
         const college = await College.findById(req.params.id)
-            .populate('dean', 'name fullName email role')
+            .populate('dean', 'name fullName email phone role')
             .lean();
 
         if (!college) {
@@ -2679,6 +3111,7 @@ router.post('/colleges/:id/dean/reset-password', auth, async (req, res) => {
         }
 
         const temporaryPassword = createRandomPassword();
+        let emailSent = true;
 
         try {
             await sendGovernanceAccountEmail({
@@ -2688,8 +3121,9 @@ router.post('/colleges/:id/dean/reset-password', auth, async (req, res) => {
                 password: temporaryPassword,
                 loginUrl: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/login`
             });
-        } catch {
-            return res.status(500).json({ message: 'Failed to send password reset email to dean.' });
+        } catch (mailError) {
+            emailSent = false;
+            console.log("Email delivery skipped or offline. Password will be updated in database anyway.");
         }
 
         const hashedPassword = await bcrypt.hash(temporaryPassword, 12);
@@ -2706,9 +3140,14 @@ router.post('/colleges/:id/dean/reset-password', auth, async (req, res) => {
             `College=${college?.name || ''} Dean=${deanUser?.email || ''}`
         );
 
-        return res.json({ message: 'Dean password reset successfully. Credentials were sent by email.' });
-    } catch {
-        return res.status(500).json({ message: 'Failed to reset dean password.' });
+        return res.json({
+            message: emailSent
+                ? `Dean password reset successfully. Credentials were sent by email to ${deanUser.email}.`
+                : `Dean password updated! (Email system offline). Temporary Password: ${temporaryPassword}`
+        });
+    } catch (err) {
+        console.error('Failed to reset dean password:', err);
+        return res.status(500).json({ message: (err && err.message) || 'Failed to reset dean password.' });
     }
 });
 
@@ -2795,7 +3234,28 @@ router.put('/colleges/:id', auth, async (req, res) => {
         }
 
         if (college.dean?._id) {
-            await User.findByIdAndUpdate(college.dean._id, { college: college.name, collegeId: college._id });
+            const updates = { college: college.name, collegeId: college._id };
+            
+            if (req.body?.dean) {
+                if (req.body.dean.name !== undefined) {
+                    updates.name = req.body.dean.name;
+                    updates.fullName = req.body.dean.name;
+                }
+                if (req.body.dean.email !== undefined) {
+                    updates.email = req.body.dean.email.toLowerCase().trim();
+                }
+                if (req.body.dean.phone !== undefined) {
+                    updates.phone = req.body.dean.phone;
+                }
+            }
+
+            const updatedDean = await User.findByIdAndUpdate(
+                college.dean._id, 
+                updates,
+                { returnDocument: 'after' }
+            ).select('name fullName email phone role college createdAt').lean();
+            
+            college.dean = updatedDean;
         }
 
         return res.json({ message: 'College updated successfully.', college });
@@ -2807,8 +3267,19 @@ router.put('/colleges/:id', auth, async (req, res) => {
 router.delete('/colleges/:id', auth, async (req, res) => {
     if (!isSuperAdmin(req)) return res.status(403).json({ msg: "SuperAdmin access only." });
     try {
+        const college = await College.findById(req.params.id);
+        if (!college) {
+            return res.status(404).json({ message: 'College not found.' });
+        }
+        
+        // Delete the associated dean user account
+        const deanId = college.dean || college.deanId;
+        if (deanId) {
+            await User.findByIdAndDelete(deanId);
+        }
+
         await College.findByIdAndDelete(req.params.id);
-        res.json({ msg: "College removed." });
+        res.json({ msg: "College and associated dean account removed." });
     } catch (err) { res.status(500).send("Delete failed."); }
 });
 
@@ -2843,28 +3314,120 @@ router.get('/departments', auth, async (req, res) => {
 
         const departments = await Department.find(departmentFilter)
             .populate('college', 'name')
-            .populate('head', 'name fullName email role createdAt')
+            .populate('head', 'name fullName email phone role createdAt')
             .sort({ name: 1 })
             .lean();
 
-        const departmentNames = departments.map((item) => String(item?.name || '').trim()).filter(Boolean);
-        const users = await User.find({ department: { $exists: true, $ne: '' } })
-            .select('department')
+        const studentUsers = await User.find({ role: { $in: ['student', 'Student'] } })
+            .select('_id college collegeId department departmentId')
             .lean();
 
-        const memberCountByDepartment = users.reduce((accumulator, user) => {
-            const key = String(user?.department || '').trim().toLowerCase();
-            if (!key) return accumulator;
-            accumulator[key] = (accumulator[key] || 0) + 1;
+        const departmentById = new Map(
+            departments.map((department) => [String(department?._id || ''), department])
+        );
+
+        const collegeCandidates = [];
+        const collegeById = new Map();
+        const collegeByName = new Map();
+        departments.forEach((department) => {
+            const collegeIdKey = String(department?.college?._id || department?.collegeId || department?.college || '').trim();
+            const collegeName = String(department?.college?.name || '').trim();
+            if (!collegeIdKey || collegeById.has(collegeIdKey)) return;
+            const candidate = { _id: collegeIdKey, name: collegeName };
+            collegeById.set(collegeIdKey, candidate);
+            if (collegeName) collegeByName.set(canonicalizeAcademicName(collegeName), candidate);
+            collegeCandidates.push(candidate);
+        });
+
+        const studentCountAccumulator = {};
+        studentUsers.forEach((student) => {
+            const explicitDepartmentId = String(student?.departmentId || '').trim();
+            if (explicitDepartmentId && departmentById.has(explicitDepartmentId)) {
+                studentCountAccumulator[explicitDepartmentId] = (studentCountAccumulator[explicitDepartmentId] || 0) + 1;
+                return;
+            }
+
+            const studentCollegeId = String(student?.collegeId || '').trim();
+            const studentCollegeName = canonicalizeAcademicName(student?.college || '');
+            const resolvedCollege = studentCollegeId && collegeById.has(studentCollegeId)
+                ? collegeById.get(studentCollegeId)
+                : (studentCollegeName ? collegeByName.get(studentCollegeName) || findBestAcademicMatch(studentCollegeName, collegeCandidates, 0.8)?.candidate || null : null);
+
+            const departmentCandidates = departments.filter((department) => {
+                if (!resolvedCollege) return true;
+                const candidateCollegeId = String(department?.college?._id || department?.collegeId || department?.college || '').trim();
+                return candidateCollegeId === String(resolvedCollege._id || '').trim();
+            });
+
+            const departmentMatch = findBestAcademicMatch(student?.department || '', departmentCandidates, 0.8);
+            if (departmentMatch?.candidate?._id) {
+                const matchedDepartmentId = String(departmentMatch.candidate._id);
+                studentCountAccumulator[matchedDepartmentId] = (studentCountAccumulator[matchedDepartmentId] || 0) + 1;
+            }
+        });
+
+        const departmentNameFrequency = departments.reduce((accumulator, item) => {
+            const key = String(item?.name || '').trim().toLowerCase();
+            if (key) accumulator[key] = (accumulator[key] || 0) + 1;
             return accumulator;
         }, {});
 
-        return res.json(departments.map((department) => ({
-            ...department,
-            memberCount: memberCountByDepartment[String(department?.name || '').trim().toLowerCase()] || 0
-        })).filter((department) => departmentNames.includes(String(department?.name || '').trim())));
-    } catch {
-        return res.status(500).json({ message: 'Failed to load departments.' });
+        const memberAgg = await User.aggregate([
+            {
+                $group: {
+                    _id: {
+                        departmentId: { $ifNull: ['$departmentId', ''] },
+                        collegeId: { $ifNull: ['$collegeId', ''] },
+                        departmentName: { $toLower: { $ifNull: ['$department', ''] } },
+                        collegeName: { $ifNull: ['$college', ''] }
+                    },
+                    count: { $sum: 1 }
+                }
+            }
+        ]).allowDiskUse(true);
+
+        const studentCountByDepartmentId = studentCountAccumulator;
+        const memberCountByDepartmentId = {};
+        const memberCountByDepartmentKey = {};
+        const memberCountByDepartmentName = {};
+
+        memberAgg.forEach((row) => {
+            const deptId = String(row._id.departmentId || '');
+            if (deptId) memberCountByDepartmentId[deptId] = (memberCountByDepartmentId[deptId] || 0) + row.count;
+
+            const scopedKey = `${String(row._id.collegeId || '').trim().toLowerCase()}::${String(row._id.departmentName || '').trim().toLowerCase()}`;
+            if (scopedKey) memberCountByDepartmentKey[scopedKey] = (memberCountByDepartmentKey[scopedKey] || 0) + row.count;
+
+            const deptNameKey = String(row._id.departmentName || '').trim().toLowerCase();
+            if (deptNameKey) memberCountByDepartmentName[deptNameKey] = (memberCountByDepartmentName[deptNameKey] || 0) + row.count;
+        });
+
+        const makeDepartmentKey = (collegeValue, departmentValue) => {
+            const collegeKey = String(collegeValue || '').trim().toLowerCase();
+            const departmentKey = String(departmentValue || '').trim().toLowerCase();
+            return collegeKey && departmentKey ? `${collegeKey}::${departmentKey}` : '';
+        };
+
+        return res.json(departments.map((department) => {
+            const departmentIdKey = String(department?._id || '');
+            const departmentNameKey = String(department?.name || '').trim().toLowerCase();
+            const collegeIdKey = String(department?.college?._id || department?.collegeId || department?.college || '');
+            const collegeNameKey = String(department?.college?.name || '').trim();
+            const scopedIdKey = makeDepartmentKey(collegeIdKey, department?.name);
+            const scopedNameKey = makeDepartmentKey(collegeNameKey, department?.name);
+            const allowLooseNameFallback = departmentNameFrequency[departmentNameKey] === 1;
+            const fallbackMemberCount = (memberCountByDepartmentKey[scopedIdKey] || 0)
+                + (scopedNameKey !== scopedIdKey ? (memberCountByDepartmentKey[scopedNameKey] || 0) : 0)
+                + (allowLooseNameFallback ? (memberCountByDepartmentName[departmentNameKey] || 0) : 0);
+            return {
+                ...department,
+                memberCount: (memberCountByDepartmentId[departmentIdKey] || 0) + fallbackMemberCount,
+                studentCount: studentCountByDepartmentId[departmentIdKey] || 0
+            };
+        }));
+    } catch (err) {
+        console.error('Failed to load departments:', err);
+        return res.status(500).json({ message: (err && err.message) || 'Failed to load departments.' });
     }
 });
 
@@ -2892,7 +3455,7 @@ router.get('/department-heads', auth, async (req, res) => {
         }
 
         const heads = await User.find(headFilter)
-            .select('name fullName email role college department createdAt')
+            .select('name fullName email phone role college department createdAt')
             .sort({ fullName: 1, name: 1 })
             .lean();
 
@@ -2936,7 +3499,7 @@ router.post('/add-department', auth, async (req, res) => {
 
         let headUser = null;
         if (headId) {
-            headUser = await User.findById(headId).select('name fullName email role').lean();
+            headUser = await User.findById(headId).select('name fullName email phone role').lean();
             if (!headUser || !isDepartmentHeadUser(headUser)) {
                 return res.status(400).json({ message: 'Please choose a valid head user account.' });
             }
@@ -2962,7 +3525,7 @@ router.post('/add-department', auth, async (req, res) => {
 
         const populated = await Department.findById(department._id)
             .populate('college', 'name')
-            .populate('head', 'name fullName email role')
+            .populate('head', 'name fullName email phone role')
             .lean();
 
         res.status(201).json({ msg: 'Department added successfully', department: populated });
@@ -2979,9 +3542,25 @@ router.post('/departments', auth, async (req, res) => {
         const headId = String(req.body?.headId || '').trim();
         const headName = String(req.body?.head?.name || '').trim();
         const headEmail = String(req.body?.head?.email || '').toLowerCase().trim();
+        const headPhone = String(req.body?.head?.phone || '').trim();
 
         if (!name || !collegeId) {
             return res.status(400).json({ message: 'Department name and college are required.' });
+        }
+
+        if (!headId) {
+            if (!headName) {
+                return res.status(400).json({ message: 'HOD full name is required.' });
+            }
+            if (!headEmail) {
+                return res.status(400).json({ message: 'HOD email address is required.' });
+            }
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(headEmail)) {
+                return res.status(400).json({ message: 'Please enter a valid HOD email address (e.g., hod@gmail.com).' });
+            }
+            if (!headPhone) {
+                return res.status(400).json({ message: 'HOD phone number is required.' });
+            }
         }
 
         const college = await College.findById(collegeId).select('name').lean();
@@ -3008,11 +3587,11 @@ router.post('/departments', auth, async (req, res) => {
         let headUser = null;
         let temporaryPassword = '';
         if (headId) {
-            headUser = await User.findById(headId).select('name fullName email role').lean();
+            headUser = await User.findById(headId).select('name fullName email phone role').lean();
             if (!headUser || !isDepartmentHeadUser(headUser)) {
                 return res.status(400).json({ message: 'Please choose a valid head user account.' });
             }
-        } else if (headName && headEmail) {
+        } else if (headName && headEmail && headPhone) {
             if (await User.findOne({ email: headEmail }).lean()) {
                 return res.status(409).json({ message: 'An account with this HOD email already exists.' });
             }
@@ -3023,6 +3602,7 @@ router.post('/departments', auth, async (req, res) => {
                 name: headName,
                 fullName: headName,
                 email: headEmail,
+                phone: headPhone,
                 password: hashedPassword,
                 role: 'hod',
                 isFirstLogin: true,
@@ -3071,7 +3651,7 @@ router.post('/departments', auth, async (req, res) => {
 
         const populated = await Department.findById(department._id)
             .populate('college', 'name')
-            .populate('head', 'name fullName email role')
+            .populate('head', 'name fullName email phone role')
             .lean();
 
         await logAdminAction(
@@ -3103,6 +3683,9 @@ router.put('/departments/:id', auth, async (req, res) => {
 
     try {
         const name = String(req.body?.name || '').trim();
+        const hodName = String(req.body?.hodName || req.body?.head?.name || '').trim();
+        const hodEmail = String(req.body?.hodEmail || req.body?.head?.email || '').toLowerCase().trim();
+        const hodPhone = String(req.body?.hodPhone || req.body?.head?.phone || '').trim();
         if (!name) {
             return res.status(400).json({ message: 'Department name is required.' });
         }
@@ -3134,13 +3717,79 @@ router.put('/departments/:id', auth, async (req, res) => {
 
         const previousName = String(currentDepartment?.name || '').trim();
 
+        let currentHead = null;
+        if (currentDepartment?.head) {
+            currentHead = await User.findById(currentDepartment.head).select('name fullName email phone role').lean();
+        }
+
+        if (hodEmail && currentHead && String(currentHead.email || '').toLowerCase() !== hodEmail) {
+            const emailConflict = await User.findOne({ email: hodEmail, _id: { $ne: currentHead._id } }).lean();
+            if (emailConflict) {
+                return res.status(409).json({ message: 'An account with this HOD email already exists.' });
+            }
+        }
+
+        let updatedHead = currentHead;
+        if (hodName || hodEmail || hodPhone) {
+            if (currentHead?._id) {
+                updatedHead = await User.findByIdAndUpdate(
+                    currentHead._id,
+                    {
+                        $set: {
+                            ...(hodName ? { name: hodName, fullName: hodName } : {}),
+                            ...(hodEmail ? { email: hodEmail } : {}),
+                            ...(hodPhone ? { phone: hodPhone } : {}),
+                            department: name,
+                            college: currentDepartment?.college?.name || '',
+                            collegeId: currentDepartment?.college?._id || null,
+                            departmentId: req.params.id
+                        }
+                    },
+                    { returnDocument: 'after' }
+                ).select('name fullName email phone role').lean();
+            } else if (hodName && hodEmail && hodPhone) {
+                if (await User.findOne({ email: hodEmail }).lean()) {
+                    return res.status(409).json({ message: 'An account with this HOD email already exists.' });
+                }
+
+                const temporaryPassword = createRandomPassword();
+                const hashedPassword = await bcrypt.hash(temporaryPassword, 12);
+                updatedHead = await User.create({
+                    name: hodName,
+                    fullName: hodName,
+                    email: hodEmail,
+                    phone: hodPhone,
+                    password: hashedPassword,
+                    role: 'hod',
+                    isFirstLogin: true,
+                    college: currentDepartment?.college?.name || '',
+                    collegeId: currentDepartment?.college?._id || null,
+                    department: name,
+                    departmentId: req.params.id
+                });
+
+                await sendGovernanceAccountEmail({
+                    to: hodEmail,
+                    name: hodName,
+                    role: 'HOD',
+                    password: temporaryPassword,
+                    loginUrl: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/login`
+                });
+            }
+        }
+
         const updatedDepartment = await Department.findByIdAndUpdate(
             req.params.id,
-            { $set: { name } },
+            {
+                $set: {
+                    name,
+                    ...(updatedHead?._id ? { head: updatedHead._id, headId: updatedHead._id } : {})
+                }
+            },
             { returnDocument: 'after' }
         )
             .populate('college', 'name')
-            .populate('head', 'name fullName email role')
+            .populate('head', 'name fullName email phone role')
             .lean();
 
         if (previousName && previousName.toLowerCase() !== name.toLowerCase()) {
@@ -3175,7 +3824,7 @@ router.put('/departments/:id/head', auth, async (req, res) => {
 
         let headUser = null;
         if (headId) {
-            headUser = await User.findById(headId).select('name fullName email role').lean();
+            headUser = await User.findById(headId).select('name fullName email phone role').lean();
             if (!headUser || !isDepartmentHeadUser(headUser)) {
                 return res.status(400).json({ message: 'Please choose a valid head user account.' });
             }
@@ -3202,7 +3851,7 @@ router.put('/departments/:id/head', auth, async (req, res) => {
             { returnDocument: 'after' }
         )
             .populate('college', 'name')
-            .populate('head', 'name fullName email role')
+            .populate('head', 'name fullName email phone role')
             .lean();
 
         if (headUser?._id) {
@@ -3219,6 +3868,74 @@ router.put('/departments/:id/head', auth, async (req, res) => {
         return res.json({ message: 'Department head assigned successfully.', department: updatedDepartment });
     } catch {
         return res.status(500).json({ message: 'Failed to assign department head.' });
+    }
+});
+
+router.post('/departments/:id/head/reset-password', auth, async (req, res) => {
+    if (!canManageDepartments(req)) {
+        return res.status(403).json({ message: 'Unauthorized.' });
+    }
+
+    try {
+        const department = await Department.findById(req.params.id)
+            .populate('college', 'name')
+            .populate('head', 'name fullName email phone role')
+            .lean();
+
+        if (!department) {
+            return res.status(404).json({ message: 'Department not found.' });
+        }
+
+        if (getAdminType(req) === 'collegeadmin') {
+            const actor = await User.findById(req.user?.id).select('college').lean();
+            if (!actor?.college || String(actor.college).trim().toLowerCase() !== String(department?.college?.name || '').trim().toLowerCase()) {
+                return res.status(403).json({ message: 'CollegeAdmin can only reset heads in their own college.' });
+            }
+        }
+
+        const headUser = department?.head;
+        if (!headUser?._id || !headUser?.email) {
+            return res.status(400).json({ message: 'No HOD is assigned to this department.' });
+        }
+
+        const temporaryPassword = createRandomPassword();
+        let emailSent = true;
+
+        try {
+            await sendGovernanceAccountEmail({
+                to: headUser.email,
+                name: headUser.name || headUser.fullName,
+                role: 'HOD',
+                password: temporaryPassword,
+                loginUrl: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/login`
+            });
+        } catch (mailError) {
+            emailSent = false;
+            console.log('Email delivery skipped or offline. Password will be updated in database anyway.');
+        }
+
+        const hashedPassword = await bcrypt.hash(temporaryPassword, 12);
+        await User.findByIdAndUpdate(headUser._id, {
+            $set: {
+                password: hashedPassword,
+                isFirstLogin: true
+            }
+        });
+
+        await logAdminAction(
+            req,
+            'ADMIN_DEPARTMENT_HEAD_PASSWORD_RESET',
+            `Department=${department?.name || ''} HOD=${headUser?.email || ''}`
+        );
+
+        return res.json({
+            message: emailSent
+                ? `Department head password reset successfully. Credentials were sent by email to ${headUser.email}.`
+                : `Department head password updated! (Email system offline). Temporary Password: ${temporaryPassword}`
+        });
+    } catch (err) {
+        console.error('Failed to reset department head password:', err);
+        return res.status(500).json({ message: (err && err.message) || 'Failed to reset department head password.' });
     }
 });
 
@@ -3280,6 +3997,7 @@ router.delete('/departments/:id', auth, async (req, res) => {
     try {
         const currentDepartment = await Department.findById(req.params.id)
             .populate('college', 'name')
+            .populate('head', 'email name fullName')
             .lean();
 
         if (!currentDepartment) {
@@ -3293,7 +4011,25 @@ router.delete('/departments/:id', auth, async (req, res) => {
             }
         }
 
+        const linkedHeadId = currentDepartment?.headId || currentDepartment?.head?._id || currentDepartment?.head || null;
         await Department.findByIdAndDelete(req.params.id);
+        if (linkedHeadId) {
+            await User.findByIdAndDelete(linkedHeadId);
+        } else if (currentDepartment?.head?.email) {
+            await User.findOneAndDelete({ email: String(currentDepartment.head.email).toLowerCase().trim() });
+        }
+        await User.deleteMany({
+            role: 'hod',
+            collegeId: currentDepartment?.college?._id || null,
+            department: currentDepartment?.name || ''
+        });
+
+        await logAdminAction(
+            req,
+            'ADMIN_DEPARTMENT_DELETED',
+            `Department=${currentDepartment?.name || ''} College=${currentDepartment?.college?.name || ''} HOD=${String(linkedHeadId || '')}`
+        );
+
         res.json({ msg: "Department removed." });
     } catch (err) { res.status(500).send("Delete failed."); }
 });
@@ -3321,43 +4057,67 @@ router.get('/partners', auth, async (req, res) => {
     } catch (err) { res.status(500).send("Partner fetch failed."); }
 });
 
-router.put('/companies/:id/verification', auth, async (req, res) => {
-    if (!isSuperAdmin(req)) return res.status(403).json({ message: "SuperAdmin only." });
-    try {
-        const { status } = req.body; // 'Verified', 'Rejected', or 'Pending'
-        const profile = await CompanyProfile.findByIdAndUpdate(req.params.id, { 
-            'verification.status': status 
-        }, { returnDocument: 'after' });
-        
-        if (!profile) return res.status(404).json({ message: "Company profile not found." });
-
-        // Sync with User model
-        if (status === 'Verified') {
-            await User.findByIdAndUpdate(profile.user, { isVerified: true });
-        } else {
-            await User.findByIdAndUpdate(profile.user, { isVerified: false });
-        }
-        
-        await logAdminAction(req, 'ADMIN_COMPANY_VERIFICATION', `Company=${profile.companyName} Status=${status}`);
-        
-        res.json({ message: `Company verification updated to ${status}.`, item: profile });
-    } catch (err) { res.status(500).json({ message: "Verification update failed." }); }
+router.put('/companies/:id/verification', auth, superAdminOnly, async (req, res) => {
+    // Delegate to centralized company status updater
+    req.body = req.body || {};
+    req.body.status = String(req.body?.status || '').trim();
+    return updateCompanyStatus(req, res);
 });
 
-router.put('/verify-partner/:id', auth, async (req, res) => {
-    if (!isSuperAdmin(req)) return res.status(403).send("SuperAdmin only.");
+router.put('/verify-partner/:id', auth, superAdminOnly, async (req, res) => {
     try {
-        const { status } = req.body; 
-        const profile = await CompanyProfile.findByIdAndUpdate(req.params.id, { 
-            'verification.status': status 
-        }, { returnDocument: 'after' });
-        
-        if (status === 'Verified') {
-            await User.findByIdAndUpdate(profile.user, { isVerified: true });
-        } else {
-            await User.findByIdAndUpdate(profile.user, { isVerified: false });
+        const { status } = req.body;
+        const reason = String(req.body?.reason || '').trim();
+
+        if (status === 'Rejected' && !reason) {
+            return res.status(400).json({ message: 'Rejection reason is required.' });
         }
-        
+
+        const profile = await CompanyProfile.findByIdAndUpdate(
+            req.params.id,
+            {
+                'verification.status': status,
+                'verification.reason': status === 'Rejected' ? reason : ''
+            },
+            { returnDocument: 'after' }
+        );
+
+        if (!profile) return res.status(404).json({ message: 'Company profile not found.' });
+
+        const userId = profile.user?._id || profile.user || null;
+
+        if (userId) {
+            await User.findByIdAndUpdate(userId, { isVerified: status === 'Verified' });
+        }
+
+        await createAndEmitNotification(req, {
+            userId,
+            receiverRole: 'industry',
+            senderId: req.user?.id || null,
+            senderRole: 'super_admin',
+            title: status === 'Rejected' ? 'Action Required: Verification Rejected' : 'Verification Approved',
+            message: status === 'Verified'
+                ? 'Your organization verification has been approved. You may now continue posting internships and managing your employer profile.'
+                : `Your organization verification was rejected for the following reason: ${reason}. Please update your profile and resubmit.`,
+            type: status === 'Verified' ? 'success' : 'warning',
+            targetRoute: '/employer/profile',
+            category: 'general',
+            metadata: {
+                kind: 'company-verification',
+                verificationStatus: status,
+                rejectionReason: status === 'Rejected' ? reason : '',
+                reviewedBy: req.user?.id || null,
+                reviewedAt: new Date().toISOString()
+            }
+        });
+
+        try {
+            const io = req.app.get('io');
+            if (io) {
+                io.emit('company:status-changed', { companyId: String(userId), status, reason: status === 'Rejected' ? reason : '' });
+            }
+        } catch (e) { }
+
         res.json(profile);
     } catch (err) { res.status(500).send("Verification update failed."); }
 });
@@ -3366,8 +4126,8 @@ router.put('/verify-partner/:id', auth, async (req, res) => {
 router.get('/governance-admins', auth, async (req, res) => {
     if (!isSuperAdmin(req)) return res.status(403).send("Unauthorized.");
     try {
-        const admins = await User.find({ 
-            role: { $in: ['SuperAdmin', 'CollegeAdmin', 'DeptAdmin', 'Admin', 'admin', 'dean', 'hod'] } 
+        const admins = await User.find({
+            role: { $in: ['SuperAdmin', 'CollegeAdmin', 'DeptAdmin', 'Admin', 'admin', 'dean', 'hod'] }
         }).select('-password').sort({ role: 1 });
         res.json(admins);
     } catch (err) { res.status(500).send("Admin fetch failed."); }
@@ -3385,7 +4145,7 @@ router.post('/create-governance-admin', auth, async (req, res) => {
         }
         const bcrypt = require('bcryptjs');
         const hashedPassword = await bcrypt.hash(password, 10);
-        
+
         const newUser = new User({
             fullName,
             email,
@@ -3395,7 +4155,7 @@ router.post('/create-governance-admin', auth, async (req, res) => {
             department: '',
             isVerified: true
         });
-        
+
         await newUser.save();
         res.json(newUser);
     } catch (err) { res.status(500).send("Admin creation failed."); }
@@ -3415,7 +4175,7 @@ router.get('/placement-stats', auth, async (req, res) => {
                 }
             }
         ]);
-        
+
         const monthlyStats = await Application.aggregate([
             {
                 $group: {
@@ -3446,11 +4206,11 @@ router.get('/audit-logs', auth, async (req, res) => {
         const [total, logs] = await Promise.all([
             ActivityLog.countDocuments(filter),
             ActivityLog.find(filter)
-            .populate('userId', 'fullName email role')
-            .sort({ timestamp: -1 })
-            .skip(skip)
-            .limit(limit)
-            .lean()
+                .populate('userId', 'fullName email role')
+                .sort({ timestamp: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean()
         ]);
 
         return res.json({

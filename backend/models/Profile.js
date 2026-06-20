@@ -9,9 +9,18 @@ const ProfileSchema = new mongoose.Schema({
         address: String,
         bio: String
     },
+    skills_description: String,
     academicInfo: {
         gpa: Number,
         skills: [String],
+        skillEntries: [
+            {
+                skill: String,
+                level: String,
+                context: String,
+                normalizedSkill: String
+            }
+        ],
         courses: [String]
     },
     profilePicUrl: String,

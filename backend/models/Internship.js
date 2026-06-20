@@ -6,6 +6,7 @@ const InternshipSchema = new mongoose.Schema({
     trainingFocus: { type: Boolean, default: true },
     title: { type: String, required: true },
     description: { type: String, required: true },
+    internship_requirements: { type: String },
     location: { type: String, default: 'Addis Ababa' },
     targetDepartments: [String],
     targetBatch: { type: String }, // e.g. 3rd Year, 4th Year, Graduating
@@ -18,6 +19,11 @@ const InternshipSchema = new mongoose.Schema({
     stipend: { type: String },
     requirements: [String],
     requiredSkills: [String],
+    structuredRequirements: {
+        coreTechnicalSkills: [String],
+        preferredSkills: [String],
+        softSkills: [String]
+    },
     deadline: { type: Date, required: true },
     status: { type: String, enum: ['Pending', 'Open', 'Closed'], default: 'Pending' }
 }, { timestamps: true });

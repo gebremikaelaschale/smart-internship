@@ -16,9 +16,21 @@ export function AuthProvider({ children }) {
   }, []);
 
   const setSession = ({ user: nextUser, token: nextToken }) => {
-    authService.setSession({ user: nextUser, token: nextToken });
+    const resolvedToken = nextToken ?? token;
+    authService.setSession({ user: nextUser, token: resolvedToken });
     setUser(nextUser || null);
-    setToken(nextToken || '');
+    if (typeof nextToken !== 'undefined') {
+      setToken(nextToken || '');
+    }
+  };
+
+  const updateUser = (patch = {}) => {
+    setUser((previousUser) => {
+      if (!previousUser) return previousUser;
+      const nextUser = { ...previousUser, ...patch };
+      authService.setSession({ user: nextUser, token });
+      return nextUser;
+    });
   };
 
   const login = async (credentials) => {
@@ -40,7 +52,8 @@ export function AuthProvider({ children }) {
     isAuthenticated: Boolean(user && token),
     login,
     logout,
-    setSession
+    setSession,
+    updateUser
   }), [user, token, loading]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

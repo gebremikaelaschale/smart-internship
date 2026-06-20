@@ -1,9 +1,9 @@
-@import url('https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,500;0,700;0,800;1,700;1,800&family=Outfit:wght@400;500;600;700;800;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Montserrat:ital,wght@0,500;0,700;0,800;1,700;1,800&family=Poppins:wght@400;500;600;700;800&display=swap');
 @import "tailwindcss";
 
 :root {
   color-scheme: light;
-  font-family: 'Outfit', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   background: #f8fafc;
 }
 
@@ -11,6 +11,10 @@ html,
 body,
 #root {
   min-height: 100%;
+}
+
+html {
+  scroll-behavior: smooth;
 }
 
 body {
@@ -48,6 +52,7 @@ a {
     opacity: 0;
     transform: translateY(-8px) scale(0.98);
   }
+
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
@@ -63,6 +68,7 @@ a {
   0% {
     background-position: -200% 0;
   }
+
   100% {
     background-position: 200% 0;
   }
@@ -72,6 +78,16 @@ a {
   background: linear-gradient(110deg, #e2e8f0 8%, #f1f5f9 18%, #e2e8f0 33%);
   background-size: 220% 100%;
   animation: dashboard-shimmer 1.2s linear infinite;
+}
+
+@keyframes logo-marquee {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(-50%);
+  }
 }
 
 .glass-card {
@@ -106,6 +122,69 @@ html.dark body {
     radial-gradient(circle at bottom right, rgba(14, 165, 233, 0.18), transparent 26%),
     #020617;
   color: #e2e8f0;
+}
+
+/* True dark mode global surface corrections */
+html.dark .bg-white,
+html.dark .bg-slate-50,
+html.dark .bg-slate-100,
+html.dark .bg-slate-200,
+html.dark .bg-white\/80,
+html.dark .bg-white\/90,
+html.dark .bg-slate-50\/70,
+html.dark .bg-slate-50\/50,
+html.dark .bg-slate-100\/70,
+html.dark .bg-slate-100\/90,
+html.dark .bg-slate-50\/40 {
+  background-color: rgba(15, 23, 42, 0.92) !important;
+  background-image: none !important;
+}
+
+html.dark .border-slate-100,
+html.dark .border-slate-200,
+html.dark .border-slate-300,
+html.dark .border-slate-400,
+html.dark .border-sky-100,
+html.dark .border-cyan-100,
+html.dark .border-rose-100,
+html.dark .border-white\/60 {
+  border-color: #334155 !important;
+}
+
+html.dark .text-slate-900,
+html.dark .text-slate-800 {
+  color: #f8fafc !important;
+}
+
+html.dark .text-slate-700,
+html.dark .text-slate-600,
+html.dark .text-slate-500,
+html.dark .text-slate-400 {
+  color: #cbd5e1 !important;
+}
+
+html.dark .glass-card {
+  background: rgba(15, 23, 42, 0.76);
+  border-color: rgba(148, 163, 184, 0.14);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.38);
+}
+
+html.dark .glass-card-strong {
+  background: rgba(15, 23, 42, 0.86);
+  border-color: rgba(148, 163, 184, 0.16);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+}
+
+html.dark .gradient-header {
+  background: linear-gradient(135deg, #020617 0%, #111827 52%, #0f172a 100%);
+}
+
+html.dark .soft-panel-shadow {
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28);
+}
+
+html.dark .dashboard-skeleton {
+  background: linear-gradient(110deg, #111827 8%, #111827 18%, #0f172a 33%);
 }
 
 html.dark .student-dashboard .student-panel {
@@ -179,4 +258,41 @@ html.dark .student-shell .hover\:bg-slate-50:hover,
 html.dark .student-shell .hover\:bg-sky-50:hover,
 html.dark .student-shell .hover\:bg-rose-50:hover {
   background-color: #1e293b !important;
+}
+
+/* Gradient highlight used for headline emphasis */
+.gradient-highlight {
+  background-image: linear-gradient(90deg, #2b6cb0, #FFD700);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Shimmer effect */
+.shimmer-shadow {
+  position: relative;
+}
+.shimmer-shadow::after {
+  content: '';
+  position: absolute;
+  left: -20%;
+  top: 0;
+  height: 100%;
+  width: 40%;
+  background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.6) 50%, rgba(255,255,255,0) 100%);
+  transform: skewX(-18deg);
+  opacity: 0.0;
+  pointer-events: none;
+  animation: shimmer 2.2s infinite;
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-120%) skewX(-18deg); opacity: 0; }
+  40% { transform: translateX(30%) skewX(-18deg); opacity: 0.9; }
+  100% { transform: translateX(120%) skewX(-18deg); opacity: 0; }
+}
+
+/* Soft shadow for a subtle 3D effect */
+.shimmer-shadow {
+  text-shadow: 0 6px 18px rgba(2,6,23,0.06);
 }

@@ -67,15 +67,7 @@ export default function ProgramSubNav() {
         </NavLink>
       </nav>
 
-      <Link
-        to="/employer/post-internship"
-        className="inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-5 py-2.5 text-sm font-bold text-white shadow-xl shadow-slate-200 transition hover:bg-slate-800 hover:shadow-2xl active:scale-95"
-      >
-        <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-        </svg>
-        Post Internship
-      </Link>
+      {/* Removed duplicate left-side Post Internship button */}
     </div>
   );
 }

@@ -21,6 +21,7 @@ function statusPillClass(status) {
 }
 
 export default function Certificates() {
+  const actionsDisabled = true;
   const [items, setItems] = useState([]);
   const [stats, setStats] = useState({
     pendingEvaluation: 0,
@@ -184,22 +185,23 @@ export default function Certificates() {
                             value={noteById[applicationId] || ''}
                             onChange={(event) => setNoteById((prev) => ({ ...prev, [applicationId]: event.target.value }))}
                             placeholder="Verification note (optional)"
+                            disabled={actionsDisabled}
                             className="w-full rounded-lg border border-slate-200 px-2 py-1.5 text-xs"
                           />
                           <div className="flex flex-wrap gap-2">
                             <button
                               type="button"
                               onClick={() => verify(applicationId, 'Verified')}
-                              disabled={isBusy}
-                              className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 disabled:opacity-50"
+                              disabled={isBusy || actionsDisabled}
+                              className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               Verify
                             </button>
                             <button
                               type="button"
                               onClick={() => verify(applicationId, 'Rejected')}
-                              disabled={isBusy}
-                              className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-semibold text-rose-700 disabled:opacity-50"
+                              disabled={isBusy || actionsDisabled}
+                              className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-semibold text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               Reject
                             </button>

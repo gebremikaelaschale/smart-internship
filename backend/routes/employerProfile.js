@@ -6,6 +6,7 @@ const User = require('../models/User');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const { encryptSignatureDataUrl, decryptSignatureDataUrl } = require('../utils/signatureCrypto');
 
 // Configure Multer for company documents
 const storage = multer.diskStorage({
@@ -101,14 +102,129 @@ router.get('/', auth, async (req, res) => {
                 verification: { status: 'Pending' }
             });
         }
+        const signatureDataUrl = decryptSignatureDataUrl(profile?.digitalSignature || {});
+        const safeProfile = profile.toObject ? profile.toObject() : profile;
+        safeProfile.logoUrl = safeProfile.logoUrl || safeProfile.logo || '';
+        safeProfile.signatureUrl = signatureDataUrl;
         // DEBUG LOG
         console.log(`[EmployerProfile GET] user=${req.user.id} | status=${profile?.verification?.status || 'NONE'}`);
-        res.json(profile);
+        res.json(safeProfile);
     } catch (err) { 
         console.error('Fetch Error:', err);
         res.status(500).send("Fetch error: " + err.message); 
     }
 });
+
+// 1.1 Owner-only identity endpoint (logo + decrypted signature)
+router.get('/identity', auth, async (req, res) => {
+    try {
+        let profile = await CompanyProfile.findOne({ user: req.user.id });
+        if (!profile) {
+            const user = await User.findById(req.user.id).select('fullName name email').lean();
+            const defaultCompanyName = String(user?.fullName || user?.name || 'Company').trim() || 'Company';
+            profile = await CompanyProfile.create({
+                user: req.user.id,
+                companyName: defaultCompanyName,
+                officialEmail: user?.email || '',
+                profileCompleteness: calculateCompleteness({
+                    companyName: defaultCompanyName,
+                    officialEmail: user?.email || ''
+                }),
+                verification: { status: 'Pending' }
+            });
+        }
+
+        return res.json({
+            logoUrl: profile.logoUrl || profile.logo || '',
+            signatureUrl: decryptSignatureDataUrl(profile.digitalSignature || {}),
+            hasLogo: Boolean(profile.logoUrl || profile.logo),
+            hasSignature: Boolean(profile?.digitalSignature?.cipherText)
+        });
+    } catch (err) {
+        return res.status(500).json({ message: 'Failed to load company identity.' });
+    }
+});
+
+const handleIdentityUpdate = async (req, res) => {
+    try {
+        const logoFile = req.files?.logoFile?.[0];
+        const signatureFile = req.files?.signatureFile?.[0];
+        const rawLogoUrl = String(req.body.logoUrl || '').trim();
+        const rawSignatureDataUrl = String(req.body.signatureDataUrl || '').trim();
+        const rawSignatureUrl = String(req.body.signatureUrl || '').trim();
+
+        if (!logoFile && !rawLogoUrl) {
+            return res.status(400).json({ message: 'Company logo is required.' });
+        }
+
+        if (!signatureFile && !rawSignatureDataUrl && !rawSignatureUrl) {
+            return res.status(400).json({ message: 'Digital signature is required.' });
+        }
+
+        let finalLogoUrl = rawLogoUrl;
+        if (logoFile) {
+            finalLogoUrl = `/uploads/company_docs/${logoFile.filename}`;
+        }
+
+        let signatureDataUrl = rawSignatureDataUrl || rawSignatureUrl;
+        if (signatureFile) {
+            const signaturePath = path.join(__dirname, '../uploads/company_docs', signatureFile.filename);
+            const fileBuffer = fs.readFileSync(signaturePath);
+            signatureDataUrl = `data:${signatureFile.mimetype};base64,${fileBuffer.toString('base64')}`;
+        }
+
+        if (!signatureDataUrl || !/^data:image\/(png|jpeg|jpg|webp);base64,/i.test(signatureDataUrl)) {
+            return res.status(400).json({ message: 'Invalid signature format.' });
+        }
+
+        const encryptedSignature = encryptSignatureDataUrl(signatureDataUrl);
+        if (!encryptedSignature?.cipherText) {
+            return res.status(400).json({ message: 'Failed to process signature image.' });
+        }
+
+        const updated = await CompanyProfile.findOneAndUpdate(
+            { user: req.user.id },
+            {
+                $set: {
+                    logo: finalLogoUrl,
+                    logoUrl: finalLogoUrl,
+                    digitalSignature: {
+                        ...encryptedSignature,
+                        mimeType: 'image/png',
+                        updatedAt: new Date()
+                    },
+                    updatedAt: new Date()
+                }
+            },
+            { returnDocument: 'after', upsert: true }
+        ).lean();
+
+        await User.findByIdAndUpdate(req.user.id, { profileImage: finalLogoUrl });
+
+        return res.json({
+            message: 'Digital identity updated successfully.',
+            identity: {
+                logoUrl: updated.logoUrl || updated.logo || '',
+                signatureUrl: decryptSignatureDataUrl(updated.digitalSignature || {}),
+                hasLogo: Boolean(updated.logoUrl || updated.logo),
+                hasSignature: Boolean(updated?.digitalSignature?.cipherText)
+            }
+        });
+    } catch (err) {
+        console.error('Identity Update Error:', err);
+        return res.status(500).json({ message: 'Failed to update company identity.' });
+    }
+};
+
+// 1.2 Owner-only identity update endpoint
+router.post('/identity', auth, upload.fields([
+    { name: 'logoFile', maxCount: 1 },
+    { name: 'signatureFile', maxCount: 1 }
+]), handleIdentityUpdate);
+router.put('/identity', auth, upload.fields([
+    { name: 'logoFile', maxCount: 1 },
+    { name: 'signatureFile', maxCount: 1 }
+]), handleIdentityUpdate);
 
 // 2. Sync / Update Profile
 router.post('/', auth, licenseUpload.fields([
@@ -201,6 +317,7 @@ router.post('/', auth, licenseUpload.fields([
             updateFields.name = String(updateData.companyName).trim();
         }
         if (updateData.logo) {
+            updateData.logoUrl = updateData.logo;
             updateFields.profileImage = updateData.logo;
         }
 
@@ -218,7 +335,8 @@ router.post('/', auth, licenseUpload.fields([
 // 3. Public View (for Students)
 router.get('/:id', async (req, res) => {
     try {
-        const profile = await CompanyProfile.findById(req.params.id);
+        const profile = await CompanyProfile.findById(req.params.id)
+            .select('-digitalSignature.cipherText -digitalSignature.iv -digitalSignature.tag');
         res.json(profile);
     } catch (err) { res.status(500).send("Error fetching public profile."); }
 });

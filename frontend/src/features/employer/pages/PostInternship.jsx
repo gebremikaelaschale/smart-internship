@@ -1,10 +1,11 @@
-import { useNavigate, useParams } from 'react-router-dom';
-import React, { useMemo, useState, useEffect } from 'react';
+import { useNavigate, useParams, Link } from 'react-router-dom';
+import React, { useState, useEffect } from 'react';
 import Select from 'react-select';
 import Card from '@/components/ui/Card';
 import Input from '@/components/ui/Input';
 import Button from '@/components/ui/Button';
 import { employerAPI } from '../employerAPI';
+import useCompanyVerificationSync from '@/hooks/useCompanyVerificationSync';
 
 const LOCATION_DATA = {
   "Amhara": {
@@ -175,13 +176,23 @@ const INITIAL_FORM = {
   targetDepartments: [],
   targetBatch: '4th Year',
   workModality: 'On-site',
-  compensationType: 'Unpaid'
+  compensationType: 'Unpaid',
+  internship_requirements: ''
 };
 
 export default function PostInternship() {
   const navigate = useNavigate();
   const { id } = useParams();
   const isEdit = Boolean(id);
+
+  const [companyProfile, setCompanyProfile] = useState(null);
+  useCompanyVerificationSync(() => {
+    employerAPI.getProfile().then(({ data }) => setCompanyProfile(data)).catch(() => {});
+  });
+
+  React.useEffect(() => {
+    employerAPI.getProfile().then(({ data }) => setCompanyProfile(data)).catch(() => {});
+  }, []);
 
   const [form, setForm] = useState({
     title: '',
@@ -200,23 +211,35 @@ export default function PostInternship() {
     skills: [],
     skillInput: '',
     description: '',
+    internship_requirements: '',
     expandedColleges: [], 
     expandedRegions: [], 
     expandedZones: []
   });
 
   const [submitting, setSubmitting] = useState(false);
-  const [loadingData, setLoadingData] = useState(isEdit);
+  const [isLoading, setIsLoading] = useState(isEdit);
+  const [loadError, setLoadError] = useState('');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
   useEffect(() => {
-    if (!isEdit) return;
+    if (!isEdit || !id) {
+      setIsLoading(false);
+      return undefined;
+    }
+
+    let isCancelled = false;
 
     const loadInternship = async () => {
       try {
-        setLoadingData(true);
+        setIsLoading(true);
+        setLoadError('');
         const { data } = await employerAPI.getInternship(id);
+
+        if (isCancelled) {
+          return;
+        }
         
         setForm({
           title: data.title || '',
@@ -232,28 +255,32 @@ export default function PostInternship() {
           minCgpa: data.minCgpa || '',
           interviewRequired: data.interviewRequired === true,
           slots: data.studentsNeeded || 1,
-          skills: Array.isArray(data.requiredSkills) ? data.requiredSkills : [],
           skillInput: '',
-          description: data.description || '',
+          description: data.description || data.internship_requirements || '',
+          internship_requirements: data.internship_requirements || data.description || '',
           expandedColleges: [], 
           expandedRegions: [], 
           expandedZones: []
         });
       } catch (err) {
+        if (isCancelled) {
+          return;
+        }
+
         const msg = err.response?.data?.message || err.message || 'Failed to load internship details.';
-        setError(msg);
+        setLoadError(msg);
       } finally {
-        setLoadingData(false);
+        if (!isCancelled) {
+          setIsLoading(false);
+        }
       }
     };
 
     loadInternship();
+    return () => {
+      isCancelled = true;
+    };
   }, [id, isEdit]);
-
-  const parsedSkills = useMemo(
-    () => form.skills,
-    [form.skills]
-  );
 
   const handleChange = (event) => {
     const { name, value } = event.target;
@@ -311,10 +338,13 @@ export default function PostInternship() {
     setError('');
     setSuccess('');
 
-    if (form.skills.length === 0) {
-      setError('Please add at least one required skill.');
+    const internshipRequirements = String(form.internship_requirements || '').trim();
+    if (!internshipRequirements) {
+      setError('Please describe the internship requirements.');
       return;
     }
+
+    const requirementTokens = internshipRequirements.split(/[\n,.]/).map((value) => value.trim()).filter(Boolean);
 
     try {
       setSubmitting(true);
@@ -332,8 +362,10 @@ export default function PostInternship() {
         minCgpa: Number(form.minCgpa) || 0,
         interviewRequired: form.interviewRequired,
         studentsNeeded: Number(form.slots),
-        requiredSkills: form.skills,
-        description: form.description,
+        internship_requirements: internshipRequirements,
+        description: internshipRequirements,
+        requiredSkills: requirementTokens,
+        requirements: requirementTokens,
         programType: 'Internship Program',
         trainingFocus: true
       };
@@ -354,11 +386,49 @@ export default function PostInternship() {
     }
   };
 
-  if (loadingData) {
+  if (isLoading) {
     return (
-      <div className="flex h-64 items-center justify-center">
-        <p className="text-slate-500 italic">Loading internship details...</p>
+      <div className="flex h-64 items-center justify-center rounded-3xl border border-slate-200 bg-white/80">
+        <div className="flex items-center gap-3 text-slate-600">
+          <span className="h-5 w-5 animate-spin rounded-full border-2 border-emerald-500 border-t-transparent" />
+          <p className="text-sm font-medium">Loading internship details...</p>
+        </div>
       </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <Card
+        title={isEdit ? 'Edit Internship Program' : 'Post Internship'}
+        description={isEdit ? 'Update your internship requirements and details.' : 'Create and publish an internship opportunity for students.'}
+      >
+        <div className="rounded-2xl border border-red-200 bg-red-50 p-6 text-red-700">
+          <p className="font-semibold">{loadError}</p>
+          <p className="mt-2 text-sm text-red-600">Please go back to your programs and open the internship again.</p>
+          <div className="mt-4">
+            <Link to="/employer/my-programs" className="inline-flex items-center justify-center rounded-full bg-slate-900 px-4 py-2 font-semibold text-white hover:bg-slate-800">Back to my programs</Link>
+          </div>
+        </div>
+      </Card>
+    );
+  }
+
+  // Block access if company not verified
+  if (companyProfile && String(companyProfile?.verification?.status || '').toLowerCase() !== 'verified') {
+    return (
+      <Card title="Post Internship" description="Create and publish an internship opportunity for students.">
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-6 text-amber-800">
+          <p className="font-semibold">Your organization is waiting for Super Admin verification.</p>
+          <p className="mt-2 text-sm">You will be able to post internships once the university's Super Admin approves your partnership.</p>
+          {String(companyProfile?.verification?.status || '').toLowerCase() === 'rejected' && companyProfile?.verification?.reason ? (
+            <p className="mt-2 text-sm"><strong>Rejection reason:</strong> {companyProfile.verification.reason}</p>
+          ) : null}
+          <div className="mt-4">
+            <Link to="/employer/profile" className="inline-flex items-center justify-center rounded-full bg-emerald-600 px-4 py-2 font-semibold text-white hover:bg-emerald-700">Update profile & resubmit</Link>
+          </div>
+        </div>
+      </Card>
     );
   }
 
@@ -726,44 +796,16 @@ export default function PostInternship() {
 
         <div className="md:col-span-2">
           <label className="block space-y-2">
-            <span className="text-sm font-medium text-slate-700">Skills (tags)</span>
-            <div className="rounded-xl border border-slate-200 bg-white px-3 py-2 focus-within:border-brand-500 focus-within:ring-2 focus-within:ring-brand-100">
-              <div className="mb-2 flex flex-wrap gap-2">
-                {form.skills.map((skill) => (
-                  <button
-                    key={skill}
-                    type="button"
-                    onClick={() => removeSkill(skill)}
-                    className="rounded-full bg-brand-100 px-3 py-1 text-xs font-medium text-brand-700 transition hover:bg-brand-200"
-                  >
-                    {skill} x
-                  </button>
-                ))}
-              </div>
-              <input
-                name="skillInput"
-                value={form.skillInput}
-                onChange={handleChange}
-                onKeyDown={handleSkillsKeyDown}
-                onBlur={addSkill}
-                placeholder="Type a skill and press Enter"
-                className="w-full border-0 bg-transparent px-1 py-1 text-sm text-slate-900 outline-none placeholder:text-slate-400"
-              />
-            </div>
-          </label>
-        </div>
-
-        <div className="md:col-span-2">
-          <label className="block space-y-2">
-            <span className="text-sm font-medium text-slate-700">Description</span>
+            <span className="text-sm font-medium text-slate-700">Internship Requirements & Role Description</span>
+            <p className="text-xs text-slate-500">Tip: A detailed description helps our AI match you with the most qualified students.</p>
             <textarea
-              name="description"
-              value={form.description}
+              name="internship_requirements"
+              value={form.internship_requirements}
               onChange={handleChange}
-              rows={5}
+              rows={9}
               required
-              placeholder="Describe the internship role, responsibilities, and expected outcomes."
-              className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+              placeholder="Describe the internship in detail. Mention the required technical skills (e.g., React, SQL), soft skills (e.g., communication), and what the student will be doing. Our AI will automatically extract keywords from your description to find the best match."
+              className="w-full rounded-2xl border border-slate-300 bg-white px-5 py-4 text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
             />
           </label>
         </div>

@@ -91,11 +91,12 @@ async function sendResetCodeEmail({ to, name, code }) {
 
 router.post('/register', loginLimiter, async (req, res) => {
   try {
-    const { name, fullName, email, password, role } = req.body;
+    const { name, fullName, email, password, role, phone } = req.body;
     const cleanName = String(name || fullName || '').trim();
     const cleanEmail = String(email || '').toLowerCase().trim();
     const cleanPassword = String(password || '').trim();
     const cleanRole = String(role || 'student').trim().toLowerCase();
+    const cleanPhone = String(phone || '').trim();
 
     if (!cleanName || !cleanEmail || !cleanPassword) {
       return res.status(400).json({ message: 'name, email, and password are required.' });
@@ -133,8 +134,11 @@ router.post('/register', loginLimiter, async (req, res) => {
       email: cleanEmail,
       password: hashedPassword,
       role: cleanRole,
+      phone: cleanPhone || '',
       isFirstLogin: true
     });
+
+    const publicRole = toDisplayUniversityRole({ role: cleanRole, adminType: null });
 
     const token = signToken({
       userId: user._id.toString(),
@@ -153,8 +157,11 @@ router.post('/register', loginLimiter, async (req, res) => {
         name: user.name,
         fullName: user.fullName,
         email: user.email,
+        phone: user.phone || '',
         role: cleanRole,
         isFirstLogin: user.isFirstLogin,
+        isVerified: Boolean(user.isVerified),
+        verificationStatus: user.verificationStatus || (user.isVerified ? 'Verified' : 'Not Submitted'),
         createdAt: user.createdAt
       }
     });
@@ -199,10 +206,13 @@ router.post('/login', loginLimiter, async (req, res) => {
       email: user.email,
       name: user.name || user.fullName,
       role,
-      adminType
+      adminType,
+      departmentId: user.departmentId || null,
+      collegeId: user.collegeId || null
     });
 
     user.isFirstLogin = false;
+    user.lastLoginAt = new Date();
     await user.save();
 
     await logLoginEvent({
@@ -219,11 +229,17 @@ router.post('/login', loginLimiter, async (req, res) => {
         name: user.name || user.fullName,
         fullName: user.fullName || user.name,
         email: user.email,
+        phone: user.phone || '',
         role: publicRole,
         adminType,
+        college: user.college || '',
+        department: user.department || '',
         collegeId: user.collegeId || null,
         departmentId: user.departmentId || null,
+        isVerified: Boolean(user.isVerified),
+        verificationStatus: user.verificationStatus || (user.isVerified ? 'Verified' : 'Not Submitted'),
         isFirstLogin: user.isFirstLogin,
+          lastLoginAt: user.lastLoginAt,
         createdAt: user.createdAt
       }
     });
@@ -378,6 +394,45 @@ router.get('/me', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ message: 'Unable to fetch profile.' });
+  }
+});
+
+router.post('/change-password', authMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: 'Current password and new password are required.' });
+    }
+
+    const user = await User.findById(req.user.id).select('+password');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+    
+    if (!user.password) {
+      return res.status(400).json({ message: 'Password is not set for this user.' });
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Current password is incorrect.' });
+    }
+    
+    // In our system, some seeded users have weak passwords like "password123".
+    // We only enforce strong password on the NEW password.
+    if (!STRONG_PASSWORD_REGEX.test(newPassword)) {
+      return res.status(400).json({ message: 'New password must be at least 8 characters and include uppercase, lowercase, number, and special character.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    user.password = hashedPassword;
+    await user.save();
+    
+    return res.json({ message: 'Password updated successfully!' });
+  } catch (error) {
+    console.error('Password change error:', error);
+    return res.status(500).json({ message: 'Unable to process password change request.' });
   }
 });
 

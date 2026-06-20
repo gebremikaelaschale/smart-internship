@@ -13,14 +13,37 @@ const userSchema = new mongoose.Schema({
     isFirstLogin: { type: Boolean, default: true },
     phone: { type: String },
     profileImage: { type: String, default: '' },
+    studentIdNumber: { type: String, default: '' },
+    idNumber: { type: String, default: '' },
+    id_number: { type: String, default: '' },
+    bio: { type: String, default: '' },
+    studentSignatureUrl: { type: String, default: '' },
+    studentSignature: { type: String, default: '' },
+    student_signature: { type: String, default: '' },
+    signatureData: { type: String, default: '' },
+    signature_data: { type: String, default: '' },
+    jobTitle: { type: String, default: '' },
     college: { type: String }, 
     department: { type: String },
     collegeId: { type: mongoose.Schema.Types.ObjectId, ref: 'College', default: null },
     departmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Department', default: null },
     isVerified: { type: Boolean, default: false },
+    verificationStatus: {
+        type: String,
+        enum: ['Not Submitted', 'Submitted', 'Pending', 'Verified', 'Rejected'],
+        default: 'Not Submitted'
+    },
+    verificationRequestedAt: { type: Date, default: null },
+    verificationReviewedAt: { type: Date, default: null },
+    verificationReviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    verificationNote: { type: String, default: '' },
+    rejectionReason: { type: String, default: '' },
+    rejection_reason: { type: String, default: '' },
+    adminType: { type: String, default: '' },
+    lastLoginAt: { type: Date, default: null },
     
     // Account Management
-    status: { type: String, enum: ['Pending', 'Active'], default: 'Active' },
+    status: { type: String, enum: ['Pending', 'Active', 'VERIFIED', 'PLACED', 'Not Submitted', 'Rejected'], default: 'Active' },
     accountStatus: { type: String, enum: ['Active', 'Deactivated'], default: 'Active' },
     language: { type: String, default: 'English' },
     timezone: { type: String, default: 'GMT+3 (East Africa Time)' },
@@ -105,6 +128,23 @@ userSchema.pre('validate', function () {
 
     if (this.email) {
         this.email = this.email.toLowerCase().trim();
+    }
+
+    if (typeof this.studentIdNumber !== 'undefined') {
+        const normalizedId = String(this.studentIdNumber || this.idNumber || this.id_number || '').trim();
+        this.studentIdNumber = normalizedId;
+        this.idNumber = normalizedId;
+        this.id_number = normalizedId;
+    }
+
+    if (typeof this.bio !== 'undefined') {
+        this.bio = String(this.bio || '').trim();
+    }
+
+    if (typeof this.signatureData !== 'undefined' || typeof this.signature_data !== 'undefined') {
+        const normalizedSignatureData = String(this.signatureData || this.signature_data || '').trim();
+        this.signatureData = normalizedSignatureData;
+        this.signature_data = normalizedSignatureData;
     }
 });
 

@@ -11,6 +11,7 @@ export const messagingAPI = {
   demoteRoomAdmin: (roomId, memberId) => api.delete(`/messages/rooms/${roomId}/admins/${memberId}`),
   getDirectHistory: (otherUserId, params = {}) => api.get(`/messages/history/direct/${otherUserId}`, { params }),
   getRoomHistory: (roomId, params = {}) => api.get(`/messages/history/room/${roomId}`, { params }),
+  getUnreadCount: () => api.get('/messages/unread-count'),
   
   // Message operations
   sendMessage: (payload) => api.post('/messages', payload),
@@ -24,6 +25,7 @@ export const messagingAPI = {
   // Message status and read receipts
   markDirectSeen: (otherUserId) => api.put(`/messages/seen/direct/${otherUserId}`),
   markRoomSeen: (roomId) => api.put(`/messages/seen/room/${roomId}`),
+  markConversationAsRead: ({ otherUserId = null, roomId = null }) => api.patch('/messages/mark-as-read', { otherUserId, roomId }),
   markMessageDelivered: (messageId) => api.put(`/messages/status/delivered/${messageId}`),
   markMessageRead: (messageId) => api.put(`/messages/status/read/${messageId}`),
   markMessagesRead: (messageIds, roomId, otherUserId) => api.put('/messages/status/batch-read', { messageIds, roomId, otherUserId }),

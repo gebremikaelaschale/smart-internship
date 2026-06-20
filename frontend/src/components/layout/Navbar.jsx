@@ -1,8 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import React, { useContext, useEffect, useMemo, useRef, useState } from 'react';
 import useAuth from '@/hooks/useAuth';
 import { studentAPI } from '@/features/student/studentAPI';
 import { employerAPI } from '@/features/employer/employerAPI';
+import { Link, useNavigate } from 'react-router-dom';
+import useNotificationCount from '@/hooks/useNotificationCount';
+import { NotificationContext } from '@/context/NotificationContext';
 
 function getInitials(name = '') {
   return name
@@ -51,10 +53,9 @@ export default function Navbar({ title, subtitle, actions }) {
   const isEmployer = String(user?.role || '').toLowerCase() === 'employer';
   const menuRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [profilePhoto, setProfilePhoto] = useState(user?.profilePicUrl || '');
+  const [profilePhoto, setProfilePhoto] = useState(user?.profilePicUrl || user?.profileImage || '');
+  const [localAdminName, setLocalAdminName] = useState('');
   const [imageError, setImageError] = useState(false);
-  const [downloadingStudentPaper, setDownloadingStudentPaper] = useState(false);
-  const [studentPaperNotice, setStudentPaperNotice] = useState({ type: '', message: '' });
   const [studentSummary, setStudentSummary] = useState({
     profileStrength: 0,
     profileHint: 'Complete your profile for better matching.',
@@ -68,44 +69,34 @@ export default function Navbar({ title, subtitle, actions }) {
     ongoingInterns: 0
   });
 
-  const displayName = user?.fullName || user?.name || 'Team Member';
+  const displayName = localAdminName || user?.fullName || user?.name || 'Team Member';
   const roleKey = String(user?.role || '').toLowerCase();
   const displayRole = useMemo(() => {
     if (!user?.role) return 'guest';
     return String(user.role).replace(/_/g, ' ');
   }, [user?.role]);
   const avatarText = getInitials(displayName) || 'U';
-  const isGovernanceRole = ['admin', 'dean', 'hod'].includes(roleKey);
+  const isGovernanceRole = ['admin', 'dean', 'hod', 'super_admin', 'superadmin'].includes(roleKey);
 
   const profileRoute = isEmployer
     ? '/employer/profile'
     : isStudent
       ? '/student/profile'
       : roleKey === 'dean'
+        ? '/dean/profile'
+        : roleKey === 'hod'
+          ? '/hod/profile'
+          : '/admin/profile';
+
+  const settingsRoute = isEmployer
+    ? '/employer/settings'
+    : isStudent
+      ? '/student/settings'
+      : roleKey === 'dean'
         ? '/dean/settings'
         : roleKey === 'hod'
-          ? '/hod/dashboard'
+          ? '/hod/settings'
           : '/admin/settings';
-
-  const primaryWorkRoute = isEmployer
-    ? '/employer/applicants'
-    : isStudent
-      ? '/student/applications'
-      : roleKey === 'dean'
-        ? '/dean/requests'
-        : roleKey === 'hod'
-          ? '/hod/students'
-          : '/admin/applications';
-
-  const secondaryWorkRoute = isEmployer
-    ? '/employer/my-programs'
-    : isStudent
-      ? '/student/internships'
-      : roleKey === 'dean'
-        ? '/dean/departments'
-        : roleKey === 'hod'
-          ? '/hod/students'
-          : '/admin/internships';
 
   const menuHintText = isEmployer
     ? employerSummary.dashboardHint
@@ -118,9 +109,37 @@ export default function Navbar({ title, subtitle, actions }) {
           : 'Use your admin workspace to manage governance and platform operations.';
 
   useEffect(() => {
-    setProfilePhoto(user?.profilePicUrl || '');
+    setProfilePhoto(user?.profilePicUrl || user?.profileImage || '');
     setImageError(false);
-  }, [user?.profilePicUrl, user?.fullName, user?.name]);
+  }, [user?.profilePicUrl, user?.profileImage, user?.fullName, user?.name]);
+
+  // Fetch fresh admin profile on mount so navbar shows latest photo/name from DB
+  useEffect(() => {
+    if (!isGovernanceRole || !token) return;
+    let active = true;
+    const hydrateAdminProfile = async () => {
+      try {
+        const { data } = await import('@/services/api').then(m => m.default.get('/admin/me'));
+        if (!active || !data) return;
+        const photoUrl = data.profileImage || data.profilePicUrl || '';
+        const name = data.fullName || data.name || '';
+        if (photoUrl) { setProfilePhoto(photoUrl); setImageError(false); }
+        if (name) setLocalAdminName(name);
+      } catch { /* silent fallback */ }
+    };
+    hydrateAdminProfile();
+
+    // Listen for profile save event to update Navbar immediately without refresh
+    const onProfileUpdated = (e) => {
+      if (e.detail?.fullName) setLocalAdminName(e.detail.fullName);
+      if (e.detail?.profileImage) { setProfilePhoto(e.detail.profileImage); setImageError(false); }
+    };
+    window.addEventListener('admin-profile-updated', onProfileUpdated);
+    return () => {
+      active = false;
+      window.removeEventListener('admin-profile-updated', onProfileUpdated);
+    };
+  }, [isGovernanceRole, token]);
 
   useEffect(() => {
     if (!isStudent || profilePhoto || !token) return;
@@ -285,106 +304,144 @@ export default function Navbar({ title, subtitle, actions }) {
     };
   }, []);
 
-  useEffect(() => {
-    if (!studentPaperNotice.message) return undefined;
-    const timer = window.setTimeout(() => {
-      setStudentPaperNotice({ type: '', message: '' });
-    }, 3200);
-    return () => window.clearTimeout(timer);
-  }, [studentPaperNotice]);
-
-  const handleDownloadStudentEvaluationPaper = async () => {
-    try {
-      setDownloadingStudentPaper(true);
-      setStudentPaperNotice({ type: '', message: '' });
-      const response = await studentAPI.downloadEvaluationPaper();
-      const payloadBlob = response?.data instanceof Blob
-        ? response.data
-        : new Blob([response?.data], { type: 'application/pdf' });
-
-      const headerBuffer = await payloadBlob.slice(0, 5).arrayBuffer();
-      const headerBytes = Array.from(new Uint8Array(headerBuffer));
-      const isPdfSignature = headerBytes.length >= 4
-        && headerBytes[0] === 0x25
-        && headerBytes[1] === 0x50
-        && headerBytes[2] === 0x44
-        && headerBytes[3] === 0x46;
-      const contentType = String(response?.headers?.['content-type'] || '');
-      const isPdfByContentType = contentType.toLowerCase().includes('application/pdf');
-
-      if (!isPdfSignature && !isPdfByContentType) {
-        throw new Error('Server returned non-PDF content.');
-      }
-
-      const blob = new Blob([payloadBlob], { type: 'application/pdf' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.setAttribute('download', `student-evaluation-paper-${Date.now()}.pdf`);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
-      setStudentPaperNotice({ type: 'success', message: 'Evaluation paper downloaded successfully.' });
-      setMenuOpen(false);
-    } catch (error) {
-      setStudentPaperNotice({ type: 'error', message: error?.message || 'Unable to download evaluation paper.' });
-    } finally {
-      setDownloadingStudentPaper(false);
-    }
-  };
 
   const avatarSrc = profilePhoto && !imageError ? profilePhoto : '';
-  const menuShellClass = isEmployer
-    ? 'absolute right-0 top-[calc(100%+0.75rem)] z-50 w-[min(23.5rem,calc(100vw-1.5rem))] overflow-hidden rounded-[30px] border border-emerald-200 bg-white shadow-[0_20px_60px_rgba(6,78,59,0.18)]'
-    : 'absolute right-0 top-[calc(100%+0.75rem)] z-50 w-[min(23.5rem,calc(100vw-1.5rem))] overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_20px_60px_rgba(15,23,42,0.18)]';
-  const menuHeaderClass = isEmployer
-    ? 'bg-[radial-gradient(circle_at_top_right,rgba(16,185,129,0.2),transparent_42%),linear-gradient(180deg,#ecfdf5_0%,#ffffff_100%)] px-4 py-5 sm:px-6 sm:py-6'
-    : 'bg-[radial-gradient(circle_at_top_right,rgba(14,165,233,0.18),transparent_42%),linear-gradient(180deg,#f4f7fb_0%,#ffffff_100%)] px-4 py-5 sm:px-6 sm:py-6';
-  const menuHintClass = isEmployer
-    ? 'mt-3 rounded-xl border border-emerald-100 bg-white/90 px-3 py-2 text-xs text-slate-600'
-    : 'mt-3 rounded-xl border border-sky-100 bg-white/80 px-3 py-2 text-xs text-slate-600';
-  const menuStatsWrapClass = isEmployer
-    ? 'grid grid-cols-2 gap-2 rounded-2xl border border-emerald-100 bg-emerald-50/40 p-2'
-    : 'grid grid-cols-2 gap-2 rounded-2xl border border-slate-100 bg-slate-50/70 p-2';
-  const menuLinkClass = isEmployer
-    ? 'group flex items-center justify-between rounded-2xl px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-emerald-50 hover:text-slate-950'
-    : 'group flex items-center justify-between rounded-2xl px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-sky-50 hover:text-slate-950';
-  const badgeClass = isEmployer
-    ? 'inline-flex rounded-full bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-emerald-700 shadow-sm'
-    : 'inline-flex rounded-full bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-sky-700 shadow-sm';
-  const verifiedClass = isEmployer
-    ? 'inline-flex items-center gap-1 rounded-full border border-emerald-100 bg-emerald-50 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-[0.2em] text-emerald-700'
-    : 'inline-flex items-center gap-1 rounded-full border border-sky-100 bg-sky-50 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-[0.2em] text-sky-700';
-  const employerActionIconClass = isEmployer
-    ? 'inline-flex h-7 w-7 items-center justify-center rounded-full bg-emerald-100 text-emerald-700'
-    : 'inline-flex h-7 w-7 items-center justify-center rounded-full bg-sky-100 text-sky-700';
-  const accountButtonClass = isStudent
-    ? `flex items-center gap-3 rounded-[999px] border pl-2.5 pr-3 py-1.5 text-left shadow-[0_2px_10px_rgba(15,23,42,0.08)] transition ${isDarkMode ? 'border-slate-700 bg-slate-900/90 hover:bg-slate-800 text-slate-100' : 'border-slate-200 bg-slate-50/95 hover:bg-white'}`
+  const menuShellClass = isDarkMode
+    ? 'absolute right-0 top-[calc(100%+0.75rem)] z-50 w-[min(23.5rem,calc(100vw-1.5rem))] overflow-hidden rounded-[30px] border border-slate-800 bg-slate-950 shadow-[0_20px_60px_rgba(0,0,0,0.35)]'
     : isEmployer
-      ? 'flex items-center gap-3 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-2 text-left shadow-[0_8px_20px_rgba(16,185,129,0.16)] transition hover:border-emerald-300 hover:bg-white hover:shadow-md'
-      : 'flex items-center gap-3 rounded-full border border-slate-200 bg-slate-50 px-3 py-2 text-left transition hover:shadow-md';
+      ? 'absolute right-0 top-[calc(100%+0.75rem)] z-50 w-[min(23.5rem,calc(100vw-1.5rem))] overflow-hidden rounded-[30px] border border-emerald-200 bg-white shadow-[0_20px_60px_rgba(6,78,59,0.18)]'
+      : 'absolute right-0 top-[calc(100%+0.75rem)] z-50 w-[min(23.5rem,calc(100vw-1.5rem))] overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_20px_60px_rgba(15,23,42,0.18)]';
+  const menuHeaderClass = isDarkMode
+    ? 'bg-slate-950 px-4 py-5 sm:px-6 sm:py-6'
+    : isEmployer
+      ? 'bg-[radial-gradient(circle_at_top_right,rgba(16,185,129,0.2),transparent_42%),linear-gradient(180deg,#ecfdf5_0%,#ffffff_100%)] px-4 py-5 sm:px-6 sm:py-6'
+      : 'bg-[radial-gradient(circle_at_top_right,rgba(14,165,233,0.18),transparent_42%),linear-gradient(180deg,#f4f7fb_0%,#ffffff_100%)] px-4 py-5 sm:px-6 sm:py-6';
+  const menuHintClass = isDarkMode
+    ? 'mt-3 rounded-xl border border-slate-700 bg-slate-900/90 px-3 py-2 text-xs text-slate-300'
+    : isEmployer
+      ? 'mt-3 rounded-xl border border-emerald-100 bg-white/90 px-3 py-2 text-xs text-slate-600'
+      : 'mt-3 rounded-xl border border-sky-100 bg-white/80 px-3 py-2 text-xs text-slate-600';
+  const menuStatsWrapClass = isDarkMode
+    ? 'grid grid-cols-2 gap-2 rounded-2xl border border-slate-700 bg-slate-900/80 p-2'
+    : isEmployer
+      ? 'grid grid-cols-2 gap-2 rounded-2xl border border-emerald-100 bg-emerald-50/40 p-2'
+      : 'grid grid-cols-2 gap-2 rounded-2xl border border-slate-100 bg-slate-50/70 p-2';
+  const menuLinkClass = isDarkMode
+    ? 'group flex items-center justify-between rounded-2xl px-4 py-3 text-sm font-medium text-slate-200 transition hover:bg-slate-800 hover:text-white'
+    : isEmployer
+      ? 'group flex items-center justify-between rounded-2xl px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-emerald-50 hover:text-slate-950'
+      : 'group flex items-center justify-between rounded-2xl px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-sky-50 hover:text-slate-950';
+  const badgeClass = isDarkMode
+    ? 'inline-flex rounded-full bg-slate-900 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-300 shadow-sm shadow-cyan-500/10'
+    : isEmployer
+      ? 'inline-flex rounded-full bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-emerald-700 shadow-sm'
+      : 'inline-flex rounded-full bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-sky-700 shadow-sm';
+  const verifiedClass = isDarkMode
+    ? 'inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-900 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-[0.2em] text-slate-300'
+    : isEmployer
+      ? 'inline-flex items-center gap-1 rounded-full border border-emerald-100 bg-emerald-50 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-[0.2em] text-emerald-700'
+      : 'inline-flex items-center gap-1 rounded-full border border-sky-100 bg-sky-50 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-[0.2em] text-sky-700';
+  const employerActionIconClass = isDarkMode
+    ? 'inline-flex h-7 w-7 items-center justify-center rounded-full bg-slate-800 text-sky-300'
+    : isEmployer
+      ? 'inline-flex h-7 w-7 items-center justify-center rounded-full bg-emerald-100 text-emerald-700'
+      : 'inline-flex h-7 w-7 items-center justify-center rounded-full bg-sky-100 text-sky-700';
+  const accountButtonClass = isDarkMode
+    ? 'flex items-center gap-3 rounded-full border border-slate-700 bg-slate-900/90 px-3 py-2 text-left shadow-[0_8px_20px_rgba(15,23,42,0.3)] transition hover:bg-slate-800 text-slate-100'
+    : isStudent
+      ? 'flex items-center gap-3 rounded-full border px-3 py-2 text-left shadow-[0_8px_20px_rgba(225,29,72,0.16)] transition border-rose-200 bg-rose-50 hover:bg-white hover:border-rose-300 hover:shadow-md'
+      : isEmployer
+        ? 'flex items-center gap-3 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-2 text-left shadow-[0_8px_20px_rgba(16,185,129,0.16)] transition hover:border-emerald-300 hover:bg-white hover:shadow-md'
+        : 'flex items-center gap-3 rounded-full border border-slate-200 bg-slate-50 px-3 py-2 text-left transition hover:shadow-md';
   const accountAvatarClass = isStudent
     ? 'flex h-10 w-10 items-center justify-center overflow-hidden rounded-full border border-white bg-gradient-to-br from-cyan-500 via-teal-500 to-blue-600 text-white'
     : isEmployer
       ? 'flex h-11 w-11 items-center justify-center overflow-hidden rounded-full border-2 border-white bg-gradient-to-br from-emerald-500 via-teal-500 to-cyan-600 text-white'
       : 'flex h-11 w-11 items-center justify-center overflow-hidden rounded-full border-2 border-white bg-brand-600 text-white';
-  const headerClass = isStudent
-    ? (isDarkMode
-      ? 'border-slate-800 bg-[linear-gradient(180deg,rgba(2,6,23,0.96),rgba(15,23,42,0.92))]'
-      : 'border-sky-100 bg-[linear-gradient(180deg,rgba(248,251,255,0.96),rgba(255,255,255,0.92))]')
-    : (isEmployer
-      ? 'border-emerald-200 bg-[linear-gradient(135deg,rgba(236,253,245,0.98),rgba(255,255,255,0.92))]'
-      : 'border-slate-200 bg-[linear-gradient(135deg,rgba(239,246,255,0.98),rgba(255,255,255,0.96))]');
+  const headerClass = isDarkMode
+    ? 'border-slate-800 bg-[linear-gradient(135deg,rgba(2,6,23,0.98),rgba(15,23,42,0.92))]'
+    : isStudent
+      ? 'border-rose-200 bg-[linear-gradient(135deg,rgba(255,241,242,0.98),rgba(255,255,255,0.96))]'
+      : isEmployer
+        ? 'border-emerald-200 bg-[linear-gradient(135deg,rgba(236,253,245,0.98),rgba(255,255,255,0.92))]'
+        : 'border-slate-200 bg-[linear-gradient(135deg,rgba(239,246,255,0.98),rgba(255,255,255,0.96))]';
   const eyebrowClass = isStudent
-    ? (isDarkMode ? 'text-sky-300' : 'text-sky-700')
-    : (isEmployer ? 'text-emerald-700' : 'text-blue-700');
-  const titleClass = isStudent
-    ? (isDarkMode ? 'text-slate-100' : 'text-slate-900')
-    : 'bg-gradient-to-r from-slate-900 via-blue-900 to-sky-700 bg-clip-text text-transparent';
-  const subtitleClass = isStudent
-    ? (isDarkMode ? 'text-slate-300' : 'text-slate-600')
-    : 'text-slate-600';
+    ? (isDarkMode ? 'text-rose-300' : 'text-rose-700')
+    : isDarkMode
+      ? 'text-slate-300'
+      : (isEmployer ? 'text-emerald-700' : 'text-blue-700');
+  const titleClass = isDarkMode
+    ? 'text-slate-100'
+    : isStudent
+      ? 'text-[#0f172a]'
+      : 'bg-gradient-to-r from-slate-900 via-blue-900 to-sky-700 bg-clip-text text-transparent';
+  const subtitleClass = isDarkMode
+    ? 'text-slate-300'
+    : isStudent
+      ? 'text-slate-600'
+      : 'text-slate-600';
+  const unreadCount = useNotificationCount();
+  const navigate = useNavigate();
+  const notifCtx = useContext(NotificationContext);
+  const bellRef = useRef(null);
+  const [bellOpen, setBellOpen] = useState(false);
+
+  const notificationsRoute = isStudent
+    ? '/student/notifications'
+    : isEmployer
+      ? '/employer/notifications'
+      : roleKey === 'dean'
+        ? '/dean/notifications'
+        : roleKey === 'hod'
+          ? '/hod/notifications'
+          : '/admin/notifications';
+
+  // Close bell dropdown on outside click or Escape
+  useEffect(() => {
+    if (!bellOpen) return undefined;
+    const onPointer = (e) => {
+      if (bellRef.current && !bellRef.current.contains(e.target)) setBellOpen(false);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') setBellOpen(false); };
+    document.addEventListener('mousedown', onPointer);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [bellOpen]);
+
+  // Navigate to notifications page, mark as read immediately, and pre-select the item
+  const handleBellItemClick = async (notifId) => {
+    setBellOpen(false);
+    // Mark as read immediately — removes it from the unread dropdown and decrements badge
+    if (notifCtx?.markNotificationRead) {
+      await notifCtx.markNotificationRead(notifId);
+    }
+    // Pre-select in context so the notifications page opens that item's full detail
+    if (notifCtx?.setSelectedNotificationId) {
+      notifCtx.setSelectedNotificationId(notifId);
+    }
+    navigate(notificationsRoute);
+  };
+
+  // Quick-view: UNREAD ONLY, sorted most recent first, capped at 8
+  const quickViewItems = useMemo(() => {
+    const all = Array.isArray(notifCtx?.notifications) ? notifCtx.notifications : [];
+    return all.filter((n) => !n.isRead).slice(0, 8);
+  }, [notifCtx?.notifications]);
+
+  function formatQuickTime(input) {
+    const date = new Date(input);
+    if (Number.isNaN(date.getTime())) return '';
+    const diffMs = Date.now() - date.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return 'Just now';
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h ago`;
+    return `${Math.floor(diffHr / 24)}d ago`;
+  }
 
   useEffect(() => {
     if (typeof document === 'undefined') return;
@@ -399,17 +456,18 @@ export default function Navbar({ title, subtitle, actions }) {
   }, [isDarkMode]);
 
   return (
-    <header className={`border-b backdrop-blur ${headerClass}`}>
+    <header className={`sticky top-0 z-50 shrink-0 border-b backdrop-blur ${headerClass}`}>
       <div className="flex items-center justify-between gap-4 px-6 py-4 lg:px-8">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <span className={`inline-flex items-center rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-[0.22em] ${isStudent ? (isDarkMode ? 'border-sky-700 bg-slate-900 text-sky-300' : 'border-sky-200 bg-sky-50 text-sky-700') : (isEmployer ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-sky-200 bg-sky-50 text-sky-700')}`}>
+            <span className={`inline-flex items-center rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-[0.22em] ${isStudent ? (isDarkMode ? 'border-rose-700 bg-slate-900 text-rose-300' : 'border-rose-200 bg-rose-50 text-rose-700') : (isEmployer ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-sky-200 bg-sky-50 text-sky-700')}`}>
               {subtitle || 'Internship Management System'}
             </span>
             {!isStudent ? <span className="inline-flex h-2.5 w-2.5 rounded-full bg-gradient-to-r from-blue-500 to-cyan-400 shadow-[0_0_0_6px_rgba(59,130,246,0.12)]" /> : null}
+            {isStudent ? <span className="inline-flex h-2.5 w-2.5 rounded-full bg-rose-500 shadow-[0_0_0_6px_rgba(244,63,94,0.12)]" /> : null}
           </div>
           <div className="mt-2 flex items-center gap-3">
-            <span className={`grid h-10 w-10 shrink-0 place-items-center rounded-2xl border shadow-sm ${isEmployer ? 'border-emerald-100 bg-emerald-50 text-emerald-700' : isStudent ? 'border-sky-100 bg-white text-sky-700' : 'border-sky-100 bg-white text-sky-700'}`} aria-hidden="true">
+            <span className={`grid h-10 w-10 shrink-0 place-items-center rounded-2xl border shadow-sm ${isEmployer ? 'border-emerald-100 bg-emerald-50 text-emerald-700' : isStudent ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-sky-100 bg-white text-sky-700'}`} aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-5 w-5">
                 <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z" />
                 <path d="M12 7v10" />
@@ -417,14 +475,118 @@ export default function Navbar({ title, subtitle, actions }) {
               </svg>
             </span>
             <div className="min-w-0">
-              <p className={`text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500 ${isStudent && isDarkMode ? 'text-slate-400' : ''}`}>Governance workspace</p>
               <h1 className={`mt-1 truncate text-2xl font-extrabold tracking-tight sm:text-[2rem] ${titleClass}`}>{title || 'Dashboard'}</h1>
             </div>
           </div>
-          <p className={`mt-2 max-w-2xl text-sm leading-6 ${subtitleClass}`}>{isEmployer ? 'Manage partner operations, internships, and approvals from a single command center.' : isStudent ? 'Track your internships and profile updates from a single dashboard.' : 'Monitor departments, students, approvals, and institutional activity from a single command center.'}</p>
+
         </div>
 
         <div className="flex items-center gap-3">
+          {/* ── Bell quick-view dropdown ── */}
+          <div className="relative" ref={bellRef}>
+            <button
+              type="button"
+              onClick={() => setBellOpen((v) => !v)}
+              aria-label={unreadCount > 0 ? `${unreadCount} unread notifications` : 'Notifications'}
+              title="Notifications"
+              className={`relative inline-flex h-10 w-10 items-center justify-center rounded-full border shadow-sm transition ${isDarkMode ? 'border-slate-700 bg-slate-900 text-slate-200 hover:border-sky-500 hover:text-white' : 'border-slate-200 bg-white text-slate-600 hover:border-sky-200 hover:text-slate-900'}`}
+            >
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" className="h-5 w-5">
+                <path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M13.73 21a2 2 0 01-3.46 0" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              {unreadCount > 0 ? (
+                <span className="absolute -right-0.5 -top-0.5 grid h-5 min-w-5 place-items-center rounded-full bg-rose-600 px-1 text-[10px] font-bold leading-none text-white shadow">
+                  {unreadCount > 99 ? '99+' : unreadCount}
+                </span>
+              ) : null}
+            </button>
+
+            {/* Dropdown panel */}
+            {bellOpen ? (
+              <div className="absolute right-0 top-[calc(100%+0.6rem)] z-50 w-[min(22rem,calc(100vw-1rem))] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-[0_20px_50px_rgba(15,23,42,0.16)]">
+                {/* Header */}
+                <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold text-slate-900">Notifications</span>
+                    {unreadCount > 0 ? (
+                      <span className="inline-flex items-center rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold text-rose-700">
+                        {unreadCount} new
+                      </span>
+                    ) : null}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { setBellOpen(false); navigate(notificationsRoute); }}
+                    className="text-[11px] font-semibold text-sky-600 transition hover:text-sky-700"
+                  >
+                    View all
+                  </button>
+                </div>
+
+                {/* Notification list */}
+                <div className="max-h-[22rem] overflow-y-auto [scrollbar-width:thin]">
+                  {quickViewItems.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-10 px-4 text-center">
+                      <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-100">
+                        <svg className="h-6 w-6 text-slate-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9" />
+                          <path d="M13.73 21a2 2 0 01-3.46 0" />
+                        </svg>
+                      </div>
+                      <p className="text-sm font-semibold text-slate-700">You're all caught up!</p>
+                      <p className="mt-1 text-xs text-slate-400">No new notifications right now.</p>
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-slate-100">
+                      {quickViewItems.map((notif) => {
+                        const id = String(notif._id || notif.id);
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() => handleBellItemClick(id)}
+                            className="w-full bg-sky-50/50 px-4 py-3 text-left transition hover:bg-sky-100/60"
+                          >
+                            <div className="flex items-start gap-3">
+                              {/* Unread dot — always shown since list is unread-only */}
+                              <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-sky-500" />
+                              <div className="min-w-0 flex-1">
+                                <p className="truncate text-sm font-semibold leading-snug text-slate-900">
+                                  {notif.title || 'Notification'}
+                                </p>
+                                <p className="mt-0.5 line-clamp-1 text-xs text-slate-500">
+                                  {notif.message || ''}
+                                </p>
+                              </div>
+                              <span className="shrink-0 text-[10px] font-medium text-slate-400">
+                                {formatQuickTime(notif.createdAt || notif.created_at)}
+                              </span>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Footer */}
+                <div className="border-t border-slate-100 px-4 py-2.5">
+                  <button
+                    type="button"
+                    onClick={() => { setBellOpen(false); navigate(notificationsRoute); }}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white transition hover:bg-slate-800"
+                  >
+                    Open Notifications
+                    <svg className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M4 10h12M10 4l6 6-6 6" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </div>
+
           {actions}
           <button
             type="button"
@@ -505,52 +667,12 @@ export default function Navbar({ title, subtitle, actions }) {
                       </div>
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setMenuOpen(false);
-                        window.location.href = profileRoute;
-                      }}
-                      title={menuHintText}
-                      className={`group rounded-2xl border bg-white/90 p-2.5 text-left shadow-sm transition hover:bg-white ${isEmployer ? 'border-emerald-100 hover:border-emerald-200' : 'border-sky-100 hover:border-sky-200'}`}
-                    >
-                      {isEmployer ? (
-                        <div className="grid h-16 w-16 place-items-center rounded-full bg-sky-50 text-sky-700">
-                          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" className="h-7 w-7">
-                            <path d="M3 10.5L12 4l9 6.5V20a1 1 0 01-1 1h-6v-6h-4v6H4a1 1 0 01-1-1v-9.5z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-                          </svg>
-                        </div>
-                      ) : isStudent ? (
-                        <ProfileStrengthRing value={studentSummary.profileStrength} />
-                      ) : (
-                        <div className="grid h-16 w-16 place-items-center rounded-full bg-sky-50 text-sky-700">
-                          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" className="h-7 w-7">
-                            <path d="M12 3l8 4.5v6c0 4.2-3.1 7.7-8 8.5-4.9-.8-8-4.3-8-8.5v-6L12 3z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-                            <path d="M9 12l2 2 4-4" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-                          </svg>
-                        </div>
-                      )}
-                      <p className="mt-1 text-center text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">{isEmployer ? 'Profile' : isStudent ? 'Strength' : 'Portal'}</p>
-                    </button>
+                    {/* Profile action button removed as requested */}
                   </div>
 
                   <p className={menuHintClass}>{menuHintText}</p>
                 </div>
 
-                {isStudent || isEmployer ? (
-                  <div className="px-2 pt-2">
-                  <div className={menuStatsWrapClass}>
-                    <div className="rounded-xl bg-white px-3 py-2">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">{isEmployer ? 'Applicants' : 'Applications'}</p>
-                      <p className="mt-1 text-sm font-semibold text-slate-900">{isEmployer ? employerSummary.applicantsCount : studentSummary.applicationsCount}</p>
-                    </div>
-                    <div className="rounded-xl bg-white px-3 py-2">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">{isEmployer ? 'Active programs' : 'Open roles'}</p>
-                      <p className="mt-1 text-sm font-semibold text-slate-900">{isEmployer ? employerSummary.activePrograms : `${studentSummary.internshipsCount} new`}</p>
-                    </div>
-                  </div>
-                  </div>
-                ) : null}
 
                 <div className="p-2">
                   <Link to={profileRoute} onClick={() => setMenuOpen(false)} className={menuLinkClass}>
@@ -561,44 +683,14 @@ export default function Navbar({ title, subtitle, actions }) {
                       Manage profile
                     </span>
                   </Link>
-                  <Link to={primaryWorkRoute} onClick={() => setMenuOpen(false)} className={menuLinkClass}>
+                  <Link to={settingsRoute} onClick={() => setMenuOpen(false)} className={menuLinkClass}>
                     <span className="flex items-center gap-2.5">
                       <span className={employerActionIconClass}>
-                        <svg viewBox="0 0 20 20" fill="none" aria-hidden="true" className="h-4 w-4"><path d="M5 3.5h7l3 3V16a1 1 0 01-1 1H5a1 1 0 01-1-1v-11a1 1 0 011-1z" stroke="currentColor" strokeWidth="1.7" /><path d="M12 3.5V7h3" stroke="currentColor" strokeWidth="1.7" /></svg>
+                        <svg viewBox="0 0 20 20" fill="none" aria-hidden="true" className="h-4 w-4"><path d="M10 4.5v1.5M10 14v1.5M5.5 10h1.5M13 10h1.5M7.05 7.05l1.06 1.06M11.9 11.9l1.06 1.06M7.05 12.95l1.06-1.06M11.9 8.1l1.06-1.06" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
                       </span>
-                      {isEmployer ? 'Review applicants' : isStudent ? 'View applications' : roleKey === 'dean' ? 'Review requests' : roleKey === 'hod' ? 'View students' : 'Review applications'}
+                      Settings
                     </span>
-                    {isStudent || isEmployer ? <span className="text-xs text-slate-500">({isEmployer ? employerSummary.applicantsCount : studentSummary.applicationsCount})</span> : null}
                   </Link>
-                  <Link to={secondaryWorkRoute} onClick={() => setMenuOpen(false)} className={menuLinkClass}>
-                    <span className="flex items-center gap-2.5">
-                      <span className={employerActionIconClass}>
-                        <svg viewBox="0 0 20 20" fill="none" aria-hidden="true" className="h-4 w-4"><circle cx="9" cy="9" r="5" stroke="currentColor" strokeWidth="1.7" /><path d="M13 13l3 3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" /></svg>
-                      </span>
-                      {isEmployer ? 'Manage programs' : isStudent ? 'Browse internships' : roleKey === 'dean' ? 'Manage departments' : roleKey === 'hod' ? 'Open students' : 'Manage internships'}
-                    </span>
-                    {isStudent || isEmployer ? <span className="text-xs text-slate-500">{isEmployer ? `(${employerSummary.ongoingInterns} ongoing)` : `(${studentSummary.internshipsCount} new)`}</span> : null}
-                  </Link>
-                  {isStudent ? (
-                    <button
-                      type="button"
-                      onClick={handleDownloadStudentEvaluationPaper}
-                      disabled={downloadingStudentPaper}
-                      className="group flex w-full items-center justify-between rounded-2xl px-4 py-3 text-sm font-medium text-slate-700 transition hover:bg-sky-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      <span className="flex items-center gap-2.5">
-                        <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-sky-100 text-sky-700">
-                          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true" className="h-4 w-4"><path d="M10 3v8m0 0l-2.5-2.5M10 11l2.5-2.5M4 13.5v1A1.5 1.5 0 005.5 16h9a1.5 1.5 0 001.5-1.5v-1" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                        </span>
-                        {downloadingStudentPaper ? 'Preparing evaluation paper...' : 'Download evaluation paper'}
-                      </span>
-                    </button>
-                  ) : null}
-                  {isStudent && studentPaperNotice.message ? (
-                    <div className={`mt-1 rounded-xl border px-3 py-2 text-xs ${studentPaperNotice.type === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-rose-200 bg-rose-50 text-rose-700'}`}>
-                      {studentPaperNotice.message}
-                    </div>
-                  ) : null}
                   <div className="my-2 h-px bg-slate-100" />
                   <button
                     type="button"

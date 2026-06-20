@@ -4,20 +4,402 @@ const router = express.Router();
 const auth = require('../middleware/authMiddleware');
 const Message = require('../models/Message');
 const User = require('../models/User');
+const College = require('../models/College');
 const Profile = require('../models/Profile');
 const CompanyProfile = require('../models/CompanyProfile');
+const Application = require('../models/Application');
+const Internship = require('../models/Internship');
+const Department = require('../models/Department');
 const ChatRoom = require('../models/ChatRoom');
 const CallSession = require('../models/CallSession');
 const { normalizeRole } = require('../utils/governanceRoles');
+const { canonicalizeAcademicName, findBestAcademicMatch } = require('../utils/academicNormalization');
 
 function getRoleVariants(role) {
     const value = String(role || 'all').trim().toLowerCase();
     if (value === 'student') return ['student', 'Student'];
     if (value === 'employer') return ['employer', 'Employer', 'Industry Partner'];
-    if (value === 'admin') return ['admin', 'dean', 'hod', 'Admin', 'SuperAdmin', 'CollegeAdmin', 'DeptAdmin'];
+    if (value === 'admin') return ['admin', 'Admin'];
     if (value === 'dean') return ['dean', 'collegeadmin', 'CollegeAdmin'];
     if (value === 'hod') return ['hod', 'deptadmin', 'DeptAdmin'];
+    if (value === 'superadmin') return ['admin', 'Admin', 'superadmin', 'super_admin', 'super-admin', 'SuperAdmin'];
     return [];
+}
+
+function escapeRegex(value = '') {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function uniqueStrings(values = []) {
+    return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function normalizeAcademicKey(value = '') {
+    return canonicalizeAcademicName(value).toLowerCase();
+}
+
+function getRoleLabel(role = '') {
+    const value = normalizeRole(role);
+    if (value === 'student') return 'STUDENT';
+    if (value === 'hod') return 'HOD';
+    if (value === 'dean') return 'DEAN';
+    if (value === 'admin') return 'ADMIN';
+    if (value === 'employer') return 'PARTNER';
+    return String(role || 'USER').toUpperCase();
+}
+
+function getRoleBadgeClass(role = '') {
+    const value = normalizeRole(role);
+    if (value === 'student') return 'bg-sky-50 text-sky-700 border-sky-200';
+    if (value === 'hod') return 'bg-violet-50 text-violet-700 border-violet-200';
+    if (value === 'dean') return 'bg-amber-50 text-amber-700 border-amber-200';
+    if (value === 'admin') return 'bg-slate-900 text-white border-slate-900';
+    if (value === 'employer') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+    return 'bg-slate-50 text-slate-700 border-slate-200';
+}
+
+function normalizeObjectIds(values = []) {
+    return uniqueStrings(values).filter((value) => mongoose.Types.ObjectId.isValid(String(value)));
+}
+
+function getCompanyDisplayName(user = {}, companyProfile = null) {
+    return String(
+        companyProfile?.companyName
+        || user.fullName
+        || user.name
+        || user.email
+        || ''
+    ).trim();
+}
+
+function getCompanyRepresentativeName(user = {}, companyProfile = null) {
+    return String(
+        companyProfile?.focalPerson?.name
+        || companyProfile?.representative?.name
+        || user.fullName
+        || user.name
+        || user.email
+        || ''
+    ).trim();
+}
+
+function getCompanyDisplayEmail(user = {}, companyProfile = null) {
+    return String(
+        companyProfile?.focalPerson?.email
+        || companyProfile?.representative?.email
+        || companyProfile?.officialEmail
+        || user.email
+        || ''
+    ).trim();
+}
+
+function getCompanyDisplayAvatar(user = {}, companyProfile = null) {
+    return String(
+        companyProfile?.logoUrl
+        || companyProfile?.logo
+        || user.avatar
+        || user.profileImage
+        || ''
+    ).trim();
+}
+
+function enrichContactUser(user = {}, companyProfile = null) {
+    const normalizedRole = normalizeRole(user.role);
+    const isEmployer = normalizedRole === 'employer';
+    const displayName = isEmployer ? getCompanyDisplayName(user, companyProfile) : String(user.fullName || user.name || user.email || '').trim();
+    const representativeName = isEmployer ? getCompanyRepresentativeName(user, companyProfile) : '';
+    const displayEmail = isEmployer ? getCompanyDisplayEmail(user, companyProfile) : String(user.email || '').trim();
+
+    return {
+        ...user,
+        displayName,
+        name: displayName,
+        fullName: displayName,
+        email: displayEmail,
+        avatar: isEmployer ? getCompanyDisplayAvatar(user, companyProfile) : user.avatar || user.profileImage || null,
+        companyName: companyProfile?.companyName || user.companyName || '',
+        representativeName,
+        focalPersonName: companyProfile?.focalPerson?.name || '',
+        focalPersonEmail: companyProfile?.focalPerson?.email || '',
+        focalPersonPhone: companyProfile?.focalPerson?.phone || '',
+        role: normalizedRole,
+        roleLabel: getRoleLabel(normalizedRole),
+        roleBadgeClass: getRoleBadgeClass(normalizedRole)
+    };
+}
+
+function extractCompanyProfileIds(message = {}) {
+    return uniqueStrings([
+        String(message?.senderId?._id || message?.senderId || ''),
+        String(message?.receiverId?._id || message?.receiverId || '')
+    ]).filter(Boolean);
+}
+
+async function enrichMessageWithDisplayNames(message = {}, companyProfileMap = new Map()) {
+    if (!message) return message;
+
+    const senderId = String(message?.senderId?._id || message?.senderId || '').trim();
+    const receiverId = String(message?.receiverId?._id || message?.receiverId || '').trim();
+    const senderProfile = companyProfileMap.get(senderId) || null;
+    const receiverProfile = companyProfileMap.get(receiverId) || null;
+
+    return {
+        ...message,
+        senderId: message.senderId && typeof message.senderId === 'object'
+            ? enrichContactUser(message.senderId, senderProfile)
+            : message.senderId,
+        receiverId: message.receiverId && typeof message.receiverId === 'object'
+            ? enrichContactUser(message.receiverId, receiverProfile)
+            : message.receiverId,
+        replyTo: message.replyTo && typeof message.replyTo === 'object'
+            ? {
+                ...message.replyTo,
+                senderName: message.replyTo.senderName || ''
+            }
+            : message.replyTo
+    };
+}
+
+async function fetchCompanyContactIdentityMap(companyIds = []) {
+    const ids = normalizeObjectIds(companyIds);
+    if (!ids.length) return new Map();
+
+    const companyProfiles = await CompanyProfile.find({ user: { $in: ids } })
+        .select('user companyName focalPerson representative officialEmail phone logo logoUrl')
+        .lean();
+
+    return new Map(companyProfiles.map((profile) => [String(profile.user), profile]));
+}
+
+function internshipMatchesAcademicScope(internship = {}, scopeDepartmentKeys = []) {
+    const internshipDepartmentKeys = uniqueStrings([
+        internship?.department,
+        ...(Array.isArray(internship?.targetDepartments) ? internship.targetDepartments : [])
+    ]).map(normalizeAcademicKey).filter(Boolean);
+
+    if (!scopeDepartmentKeys.length) return false;
+    if (!internshipDepartmentKeys.length) return false;
+
+    return internshipDepartmentKeys.some((departmentKey) => scopeDepartmentKeys.includes(departmentKey));
+}
+
+async function resolveEmployerContactScope(userId) {
+    const employerId = String(userId || '').trim();
+    if (!employerId) return null;
+
+    const internships = await Internship.find({ companyId: employerId })
+        .select('_id companyId targetDepartments')
+        .lean();
+
+    const internshipIds = internships.map((internship) => internship._id);
+    const targetDepartments = uniqueStrings(
+        internships.flatMap((internship) => Array.isArray(internship.targetDepartments) ? internship.targetDepartments : [])
+    );
+
+    const [applications, departments] = await Promise.all([
+        internshipIds.length > 0
+            ? Application.find({ internshipId: { $in: internshipIds } })
+                .select('studentId internshipId')
+                .lean()
+            : Promise.resolve([]),
+        Department.find({}).select('_id name collegeId headId head college').lean()
+    ]);
+
+    const studentIds = uniqueStrings(applications.map((application) => application.studentId));
+    const normalizedTargetDepartments = targetDepartments.map(normalizeAcademicKey).filter(Boolean);
+
+    const matchedDepartments = departments.filter((department) => {
+        const departmentKey = normalizeAcademicKey(department?.name || '');
+        return departmentKey && normalizedTargetDepartments.includes(departmentKey);
+    });
+
+    const collegeIds = uniqueStrings(matchedDepartments.map((department) => department.collegeId || department.college));
+    const hodIds = uniqueStrings(matchedDepartments.map((department) => department.headId || department.head));
+
+    const colleges = collegeIds.length > 0
+        ? await College.find({ _id: { $in: collegeIds } }).select('_id deanId dean name').lean()
+        : [];
+    const deanIds = uniqueStrings(colleges.map((college) => college.deanId || college.dean));
+
+    const [applicantUsers, hodUsers, deanUsers, superAdmins] = await Promise.all([
+        studentIds.length > 0
+            ? User.find({ _id: { $in: studentIds }, role: { $in: getRoleVariants('student') } })
+                .select('_id name fullName email role department college departmentId collegeId isOnline lastSeen')
+                .lean()
+            : Promise.resolve([]),
+        hodIds.length > 0
+            ? User.find({ _id: { $in: hodIds }, role: { $in: getRoleVariants('hod') } })
+                .select('_id name fullName email role department college departmentId collegeId isOnline lastSeen')
+                .lean()
+            : Promise.resolve([]),
+        deanIds.length > 0
+            ? User.find({ _id: { $in: deanIds }, role: { $in: getRoleVariants('dean') } })
+                .select('_id name fullName email role department college departmentId collegeId isOnline lastSeen')
+                .lean()
+            : Promise.resolve([]),
+        User.find({ role: { $in: getRoleVariants('superadmin') } })
+            .select('_id name fullName email role department college departmentId collegeId isOnline lastSeen')
+            .lean()
+    ]);
+
+    const users = [...applicantUsers, ...hodUsers, ...deanUsers, ...superAdmins]
+        .filter(Boolean)
+        .filter((user) => String(user._id) !== employerId);
+
+    return {
+        applicants: applicantUsers,
+        hods: hodUsers,
+        deans: deanUsers,
+        superAdmins,
+        users,
+        internshipIds,
+        collegeIds
+    };
+}
+
+async function resolveAppliedCompanyIdsForStudent(studentId) {
+    const applications = await Application.find({ studentId })
+        .select('internshipId')
+        .lean();
+
+    const internshipIds = normalizeObjectIds(applications.map((application) => application.internshipId));
+    if (!internshipIds.length) return [];
+
+    const internships = await Internship.find({ _id: { $in: internshipIds } })
+        .select('companyId')
+        .lean();
+
+    return normalizeObjectIds(internships.map((internship) => internship.companyId));
+}
+
+async function resolveIndustryPartnerIdsForAcademicScope(scope = {}) {
+    const departmentNames = [];
+
+    if (scope.departmentName) {
+        departmentNames.push(scope.departmentName);
+    }
+
+    if (scope.collegeId) {
+        const departmentDocs = await Department.find({ collegeId: asObjectId(scope.collegeId) || scope.collegeId })
+            .select('name')
+            .lean();
+        departmentNames.push(...departmentDocs.map((department) => department.name));
+    }
+
+    const scopeDepartmentKeys = uniqueStrings(departmentNames).map(normalizeAcademicKey).filter(Boolean);
+    if (!scopeDepartmentKeys.length) return [];
+
+    const internships = await Internship.find({})
+        .select('companyId department targetDepartments')
+        .lean();
+
+    const companyIds = internships
+        .filter((internship) => internshipMatchesAcademicScope(internship, scopeDepartmentKeys))
+        .map((internship) => internship.companyId);
+
+    return normalizeObjectIds(companyIds);
+}
+
+async function resolveCollegeScope(userId) {
+    const actor = await User.findById(userId)
+        .select('college collegeId')
+        .lean();
+
+    if (!actor) return null;
+
+    if (actor.collegeId && mongoose.Types.ObjectId.isValid(String(actor.collegeId))) {
+        const collegeById = await College.findById(actor.collegeId).select('_id name').lean();
+        if (collegeById) return collegeById;
+    }
+
+    const normalizedCollegeName = canonicalizeAcademicName(actor.college || '');
+    if (!normalizedCollegeName) return null;
+
+    const colleges = await College.find({}).select('_id name').lean();
+    const candidates = colleges.map((college) => ({
+        _id: String(college?._id || ''),
+        name: String(college?.name || '')
+    }));
+    return findBestAcademicMatch(normalizedCollegeName, candidates, 0.8)?.candidate || null;
+}
+
+async function resolveStudentScope(userId) {
+    const actor = await User.findById(userId)
+        .select('college collegeId department departmentId')
+        .lean();
+
+    if (!actor) return null;
+
+    const college = await resolveCollegeScope(userId);
+    const collegeId = college?._id ? String(college._id) : String(actor.collegeId || '').trim();
+    const collegeName = college?.name ? String(college.name).trim() : String(actor.college || '').trim();
+
+    let department = null;
+    if (actor.departmentId && mongoose.Types.ObjectId.isValid(String(actor.departmentId))) {
+        const departmentById = await require('../models/Department').findById(actor.departmentId).select('_id name college collegeId').lean();
+        if (departmentById) department = departmentById;
+    }
+
+    if (!department) {
+        const departmentName = canonicalizeAcademicName(actor.department || '');
+        if (departmentName) {
+            const Department = require('../models/Department');
+            const departments = await Department.find({}).select('_id name college collegeId').lean();
+            const candidates = departments.filter((item) => {
+                const candidateCollegeId = String(item?.collegeId || item?.college || '').trim();
+                return !collegeId || candidateCollegeId === collegeId;
+            }).map((item) => ({
+                _id: String(item?._id || ''),
+                name: String(item?.name || ''),
+                collegeId: String(item?.collegeId || item?.college || '').trim()
+            }));
+            department = findBestAcademicMatch(departmentName, candidates, 0.8)?.candidate || null;
+        }
+    }
+
+    return {
+        collegeId,
+        collegeName,
+        departmentId: department?._id ? String(department._id) : String(actor.departmentId || '').trim(),
+        departmentName: department?.name ? String(department.name).trim() : String(actor.department || '').trim()
+    };
+}
+
+async function resolveDepartmentScope(userId) {
+    const actor = await User.findById(userId)
+        .select('college collegeId department departmentId')
+        .lean();
+
+    if (!actor) return null;
+
+    const college = await resolveCollegeScope(userId);
+    const collegeId = college?._id ? String(college._id) : String(actor.collegeId || '').trim();
+    const collegeName = college?.name ? String(college.name).trim() : String(actor.college || '').trim();
+
+    let department = null;
+    if (actor.departmentId && mongoose.Types.ObjectId.isValid(String(actor.departmentId))) {
+        department = await require('../models/Department').findById(actor.departmentId).select('_id name college collegeId').lean();
+    }
+
+    if (!department) {
+        const departmentName = canonicalizeAcademicName(actor.department || '');
+        if (departmentName) {
+            const Department = require('../models/Department');
+            const departments = await Department.find({}).select('_id name college collegeId').lean();
+            const candidates = departments.filter((item) => {
+                const candidateCollegeId = String(item?.collegeId || item?.college || '').trim();
+                return !collegeId || candidateCollegeId === collegeId;
+            });
+            department = findBestAcademicMatch(departmentName, candidates, 0.8)?.candidate || null;
+        }
+    }
+
+    return {
+        collegeId,
+        collegeName,
+        departmentId: department?._id ? String(department._id) : String(actor.departmentId || '').trim(),
+        departmentName: department?.name ? String(department.name).trim() : String(actor.department || '').trim()
+    };
 }
 
 function asObjectId(value) {
@@ -31,11 +413,16 @@ function emitSocket(io, room, event, payload) {
 }
 
 async function populateMessage(messageId) {
-    return Message.findById(messageId)
+    const message = await Message.findById(messageId)
         .populate('senderId', 'name fullName email role')
         .populate('receiverId', 'name fullName email role')
         .populate('replyTo', 'content senderId createdAt messageType attachment')
         .lean();
+
+    if (!message) return null;
+
+    const companyProfileMap = await fetchCompanyContactIdentityMap(extractCompanyProfileIds(message));
+    return enrichMessageWithDisplayNames(message, companyProfileMap);
 }
 
 // Lightweight online status endpoint - returns isOnline & lastSeen for given user IDs
@@ -59,16 +446,352 @@ router.get('/contacts', auth, async (req, res) => {
         const role = String(req.query.role || 'all').trim().toLowerCase();
         const search = String(req.query.search || '').trim();
         const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+        const currentRole = normalizeRole(req.user?.role);
+        const currentAdminType = String(req.user?.adminType || '').trim().toLowerCase();
+        const currentUserId = asObjectId(req.user.id);
+        let companyContactIds = [];
 
-        const filter = { _id: { $ne: asObjectId(req.user.id) } };
-        const roleVariants = getRoleVariants(role);
-        if (role !== 'all' && roleVariants.length > 0) {
-            filter.role = { $in: roleVariants };
+        const filter = { _id: { $ne: currentUserId } };
+
+        if (currentRole === 'employer') {
+            const employerScope = await resolveEmployerContactScope(req.user.id);
+            if (!employerScope) {
+                return res.json([]);
+            }
+
+            const searchRegex = search
+                ? new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+                : null;
+
+            const items = employerScope.users.filter((user) => {
+                if (!searchRegex) return true;
+                return [user.name, user.fullName, user.email, user.department, user.college, getRoleLabel(user.role)]
+                    .some((value) => searchRegex.test(String(value || '')));
+            });
+
+            const itemIds = items.map((item) => item._id);
+            const itemObjectIds = itemIds.map((itemId) => asObjectId(itemId)).filter(Boolean);
+
+            const contactDocs = await User.aggregate([
+                { $match: { _id: { $in: itemObjectIds } } },
+                { $sort: { fullName: 1, name: 1 } },
+                {
+                    $lookup: {
+                        from: 'profiles',
+                        localField: '_id',
+                        foreignField: 'userId',
+                        as: 'profileData'
+                    }
+                },
+                {
+                    $lookup: {
+                        from: 'companyprofiles',
+                        localField: '_id',
+                        foreignField: 'user',
+                        as: 'companyData'
+                    }
+                },
+                {
+                    $lookup: {
+                        from: 'messages',
+                        let: { contactId: '$_id' },
+                        pipeline: [
+                            {
+                                $match: {
+                                    $expr: {
+                                        $and: [
+                                            { $eq: ['$conversationType', 'direct'] },
+                                            { $not: { $in: [asObjectId(req.user.id), { $ifNull: ['$deletedForUsers', []] }] } },
+                                            {
+                                                $or: [
+                                                    { $and: [{ $eq: ['$senderId', '$$contactId'] }, { $eq: ['$receiverId', asObjectId(req.user.id)] }] },
+                                                    { $and: [{ $eq: ['$senderId', asObjectId(req.user.id)] }, { $eq: ['$receiverId', '$$contactId'] }] }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                }
+                            },
+                            { $sort: { createdAt: -1 } },
+                            { $limit: 1 }
+                        ],
+                        as: 'lastMsgData'
+                    }
+                },
+                {
+                    $lookup: {
+                        from: 'messages',
+                        let: { contactId: '$_id' },
+                        pipeline: [
+                            {
+                                $match: {
+                                    $expr: {
+                                        $and: [
+                                            { $eq: ['$conversationType', 'direct'] },
+                                            { $eq: ['$senderId', '$$contactId'] },
+                                            { $eq: ['$receiverId', asObjectId(req.user.id)] },
+                                            { $eq: ['$isRead', false] },
+                                            { $not: { $in: [asObjectId(req.user.id), { $ifNull: ['$deletedForUsers', []] }] } }
+                                        ]
+                                    }
+                                }
+                            },
+                            { $count: 'count' }
+                        ],
+                        as: 'unreadCountData'
+                    }
+                },
+                {
+                    $project: {
+                        _id: 1,
+                        name: 1,
+                        fullName: 1,
+                        email: 1,
+                        role: 1,
+                        department: 1,
+                        college: 1,
+                        isOnline: 1,
+                        lastSeen: 1,
+                        avatar: {
+                            $cond: [
+                                { $gt: [{ $size: '$companyData' }, 0] },
+                                { $arrayElemAt: ['$companyData.logo', 0] },
+                                {
+                                    $cond: [
+                                        { $gt: [{ $size: '$profileData' }, 0] },
+                                        { $arrayElemAt: ['$profileData.profilePicUrl', 0] },
+                                        null
+                                    ]
+                                }
+                            ]
+                        },
+                        lastMessage: { $arrayElemAt: ['$lastMsgData', 0] },
+                        unreadCount: { $ifNull: [{ $arrayElemAt: ['$unreadCountData.count', 0] }, 0] }
+                    }
+                },
+                { $sort: { unreadCount: -1, 'lastMessage.createdAt': -1, fullName: 1, name: 1 } },
+                { $limit: limit }
+            ]);
+
+            const rolePriority = { student: 1, hod: 2, dean: 3, admin: 4 };
+            const companyIdentityMap = await fetchCompanyContactIdentityMap(itemIds);
+            const result = contactDocs.map((u) => ({
+                ...enrichContactUser(u, companyIdentityMap.get(String(u._id))),
+                id: String(u._id),
+                _id: String(u._id),
+                type: 'direct',
+                role: normalizeRole(u.role),
+                roleLabel: getRoleLabel(u.role),
+                roleBadgeClass: getRoleBadgeClass(u.role),
+                lastMessage: u.lastMessage ? {
+                    content: u.lastMessage.content,
+                    createdAt: u.lastMessage.createdAt,
+                    senderId: String(u.lastMessage.senderId)
+                } : null,
+                unreadCount: Number(u.unreadCount || 0),
+                categoryRank: rolePriority[normalizeRole(u.role)] || 99
+            })).sort((left, right) => {
+                if (left.categoryRank !== right.categoryRank) return left.categoryRank - right.categoryRank;
+                return String(left.fullName || left.name || '').localeCompare(String(right.fullName || right.name || ''));
+            });
+
+            return res.json(result);
         }
-        if (search) {
-            const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-            filter.$or = [{ name: regex }, { fullName: regex }, { email: regex }, { department: regex }, { college: regex }];
+
+        if (currentRole === 'student') {
+            const studentScope = await resolveStudentScope(req.user.id);
+            if (!studentScope?.collegeId || !studentScope?.departmentId) {
+                return res.status(403).json({ message: 'Unable to resolve the student academic scope.' });
+            }
+
+            companyContactIds = await resolveAppliedCompanyIdsForStudent(req.user.id);
+
+            const studentCollegeRegex = studentScope.collegeName
+                ? new RegExp(`^\\s*${escapeRegex(studentScope.collegeName)}\\s*$`, 'i')
+                : null;
+            const studentDepartmentRegex = studentScope.departmentName
+                ? new RegExp(`^\\s*${escapeRegex(studentScope.departmentName)}\\s*$`, 'i')
+                : null;
+
+            filter.$or = [
+                {
+                    role: { $in: getRoleVariants('student') },
+                    departmentId: asObjectId(studentScope.departmentId)
+                },
+                {
+                    role: { $in: getRoleVariants('student') },
+                    department: studentDepartmentRegex
+                },
+                {
+                    role: { $in: getRoleVariants('hod') },
+                    departmentId: asObjectId(studentScope.departmentId)
+                },
+                {
+                    role: { $in: getRoleVariants('hod') },
+                    department: studentDepartmentRegex
+                },
+                {
+                    role: { $in: getRoleVariants('dean') },
+                    collegeId: asObjectId(studentScope.collegeId)
+                },
+                {
+                    role: { $in: getRoleVariants('dean') },
+                    college: studentCollegeRegex
+                },
+                {
+                    role: { $in: getRoleVariants('superadmin') }
+                },
+                {
+                    role: { $in: getRoleVariants('employer') },
+                    _id: { $in: normalizeObjectIds(companyContactIds).map(asObjectId).filter(Boolean) }
+                }
+            ];
+
+            if (search) {
+                const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                filter.$and = [{
+                    $or: [
+                        { name: regex },
+                        { fullName: regex },
+                        { email: regex },
+                        { department: regex },
+                        { college: regex }
+                    ]
+                }];
+            }
+        } else if (currentRole === 'hod' || currentAdminType === 'deptadmin') {
+            const hodScope = await resolveDepartmentScope(req.user.id);
+            if (!hodScope?.collegeId || !hodScope?.departmentId) {
+                return res.status(403).json({ message: 'Unable to resolve the HOD academic scope.' });
+            }
+
+            companyContactIds = await resolveIndustryPartnerIdsForAcademicScope(hodScope);
+
+            const hodCollegeRegex = hodScope.collegeName
+                ? new RegExp(`^\\s*${escapeRegex(hodScope.collegeName)}\\s*$`, 'i')
+                : null;
+            const hodDepartmentRegex = hodScope.departmentName
+                ? new RegExp(`^\\s*${escapeRegex(hodScope.departmentName)}\\s*$`, 'i')
+                : null;
+
+            filter.$or = [
+                {
+                    role: { $in: getRoleVariants('student') },
+                    $and: [
+                        {
+                            $or: [
+                                { departmentId: asObjectId(hodScope.departmentId) },
+                                ...(hodDepartmentRegex ? [{ department: hodDepartmentRegex }] : [])
+                            ]
+                        },
+                        {
+                            $or: [
+                                { collegeId: asObjectId(hodScope.collegeId) },
+                                ...(hodCollegeRegex ? [{ college: hodCollegeRegex }] : [])
+                            ]
+                        }
+                    ]
+                },
+                {
+                    role: { $in: getRoleVariants('hod') },
+                    _id: { $ne: currentUserId }
+                },
+                {
+                    role: { $in: getRoleVariants('dean') },
+                    $and: [
+                        {
+                            $or: [
+                                { collegeId: asObjectId(hodScope.collegeId) },
+                                ...(hodCollegeRegex ? [{ college: hodCollegeRegex }] : [])
+                            ]
+                        }
+                    ]
+                },
+                {
+                    role: { $in: getRoleVariants('superadmin') }
+                },
+                {
+                    role: { $in: getRoleVariants('employer') },
+                    _id: { $in: normalizeObjectIds(companyContactIds).map(asObjectId).filter(Boolean) }
+                }
+            ];
+
+            if (search) {
+                const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                filter.$and = [{
+                    $or: [
+                        { name: regex },
+                        { fullName: regex },
+                        { email: regex },
+                        { department: regex },
+                        { college: regex }
+                    ]
+                }];
+            }
+        } else if (currentRole === 'dean' || currentAdminType === 'collegeadmin') {
+            const deanCollege = await resolveCollegeScope(req.user.id);
+            if (!deanCollege) {
+                return res.status(403).json({ message: 'Unable to resolve the Dean college scope.' });
+            }
+
+            companyContactIds = await resolveIndustryPartnerIdsForAcademicScope({ collegeId: deanCollege._id, collegeName: deanCollege.name });
+
+            const deanCollegeName = String(deanCollege.name || '').trim();
+            const deanCollegeRegex = deanCollegeName
+                ? new RegExp(`^\\s*${escapeRegex(deanCollegeName)}\\s*$`, 'i')
+                : null;
+
+            filter.$or = [
+                {
+                    role: { $in: getRoleVariants('student') },
+                    $or: [
+                        { collegeId: deanCollege._id },
+                        ...(deanCollegeRegex ? [{ college: deanCollegeRegex }] : [])
+                    ]
+                },
+                {
+                    role: { $in: getRoleVariants('hod') },
+                    $or: [
+                        { collegeId: deanCollege._id },
+                        ...(deanCollegeRegex ? [{ college: deanCollegeRegex }] : [])
+                    ]
+                },
+                {
+                    role: { $in: getRoleVariants('dean') }
+                },
+                {
+                    role: { $in: getRoleVariants('superadmin') }
+                },
+                {
+                    role: { $in: getRoleVariants('employer') },
+                    _id: { $in: normalizeObjectIds(companyContactIds).map(asObjectId).filter(Boolean) }
+                }
+            ];
+
+            if (search) {
+                const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                filter.$and = [{
+                    $or: [
+                        { name: regex },
+                        { fullName: regex },
+                        { email: regex },
+                        { department: regex },
+                        { college: regex }
+                    ]
+                }];
+            }
+        } else {
+            const roleVariants = getRoleVariants(role);
+            if (role !== 'all' && roleVariants.length > 0) {
+                filter.role = { $in: roleVariants };
+            }
+            if (search) {
+                const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                filter.$or = [{ name: regex }, { fullName: regex }, { email: regex }, { department: regex }, { college: regex }];
+            }
         }
+
+        const companyIdentityMap = await fetchCompanyContactIdentityMap(companyContactIds);
 
         const items = await User.aggregate([
             { $match: filter },
@@ -118,6 +841,29 @@ router.get('/contacts', auth, async (req, res) => {
                 }
             },
             {
+                $lookup: {
+                    from: 'messages',
+                    let: { contactId: '$_id' },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ['$conversationType', 'direct'] },
+                                        { $eq: ['$senderId', '$$contactId'] },
+                                        { $eq: ['$receiverId', asObjectId(req.user.id)] },
+                                        { $eq: ['$isRead', false] },
+                                        { $not: { $in: [asObjectId(req.user.id), { $ifNull: ['$deletedForUsers', []] }] } }
+                                    ]
+                                }
+                            }
+                        },
+                        { $count: 'count' }
+                    ],
+                    as: 'unreadCountData'
+                }
+            },
+            {
                 $project: {
                     _id: 1,
                     name: 1,
@@ -141,28 +887,66 @@ router.get('/contacts', auth, async (req, res) => {
                             }
                         ]
                     },
-                    lastMessage: { $arrayElemAt: ['$lastMsgData', 0] }
+                    lastMessage: { $arrayElemAt: ['$lastMsgData', 0] },
+                    unreadCount: { $ifNull: [{ $arrayElemAt: ['$unreadCountData.count', 0] }, 0] }
                 }
-            }
+            },
+            { $sort: { unreadCount: -1, 'lastMessage.createdAt': -1, fullName: 1, name: 1 } }
         ]);
 
-        const result = items.map(u => ({
-            ...u,
-            id: String(u._id),
-            _id: String(u._id),
-            type: 'direct',
-            role: normalizeRole(u.role),
-            lastMessage: u.lastMessage ? {
-                content: u.lastMessage.content,
-                createdAt: u.lastMessage.createdAt,
-                senderId: String(u.lastMessage.senderId)
-            } : null,
-            unreadCount: 0 
-        }));
+        const result = items.map((u) => {
+            const companyProfile = companyIdentityMap.get(String(u._id));
+            return {
+                ...enrichContactUser(u, companyProfile),
+                id: String(u._id),
+                _id: String(u._id),
+                type: 'direct',
+                lastMessage: u.lastMessage ? {
+                    content: u.lastMessage.content,
+                    createdAt: u.lastMessage.createdAt,
+                    senderId: String(u.lastMessage.senderId)
+                } : null,
+                unreadCount: Number(u.unreadCount || 0)
+            };
+        });
 
         res.json(result);
     } catch (error) {
         res.status(500).json({ message: 'Failed to load chat contacts.' });
+    }
+});
+
+router.get('/unread-count', auth, async (req, res) => {
+    try {
+        const userId = asObjectId(req.user.id);
+        if (!userId) return res.status(400).json({ message: 'Invalid user ID.' });
+
+        const directUnreadCount = await Message.countDocuments({
+            conversationType: 'direct',
+            receiverId: userId,
+            isRead: false,
+            deletedForEveryone: false,
+            deletedForUsers: { $nin: [userId] }
+        });
+
+        const rooms = await ChatRoom.find({ members: req.user.id }).select('_id').lean();
+        const roomIds = rooms.map((room) => room._id).filter(Boolean);
+
+        let roomUnreadCount = 0;
+        if (roomIds.length > 0) {
+            roomUnreadCount = await Message.countDocuments({
+                roomId: { $in: roomIds },
+                conversationType: { $in: ['group', 'channel'] },
+                senderId: { $ne: userId },
+                seenBy: { $nin: [userId] },
+                deletedForEveryone: false,
+                deletedForUsers: { $nin: [userId] }
+            });
+        }
+
+        res.json({ unreadCount: directUnreadCount + roomUnreadCount });
+    } catch (error) {
+        res.status(500).json({ message: 'Failed to load unread message count.' });
     }
 });
 
@@ -367,7 +1151,10 @@ router.get('/history/direct/:otherUserId', auth, async (req, res) => {
             .populate('replyTo', 'content senderId createdAt messageType attachment')
             .lean();
 
-        res.json(messages);
+        const companyProfileMap = await fetchCompanyContactIdentityMap(messages.flatMap((message) => extractCompanyProfileIds(message)));
+        const enrichedMessages = await Promise.all(messages.map((message) => enrichMessageWithDisplayNames(message, companyProfileMap)));
+
+        res.json(enrichedMessages);
     } catch (error) {
         res.status(500).json({ message: 'Failed to load direct chat history.' });
     }
@@ -402,7 +1189,10 @@ router.get('/history/room/:roomId', auth, async (req, res) => {
             .populate('replyTo', 'content senderId createdAt messageType attachment')
             .lean();
 
-        res.json(messages);
+        const companyProfileMap = await fetchCompanyContactIdentityMap(messages.flatMap((message) => extractCompanyProfileIds(message)));
+        const enrichedMessages = await Promise.all(messages.map((message) => enrichMessageWithDisplayNames(message, companyProfileMap)));
+
+        res.json(enrichedMessages);
     } catch (error) {
         res.status(500).json({ message: 'Failed to load room history.' });
     }
@@ -525,6 +1315,43 @@ router.post('/', auth, async (req, res) => {
         res.status(201).json(populated);
     } catch (error) {
         res.status(500).json({ message: 'Failed to send message.' });
+    }
+});
+
+router.patch('/mark-as-read', auth, async (req, res) => {
+    try {
+        const { otherUserId = null, roomId = null } = req.body;
+        const userId = asObjectId(req.user.id);
+
+        if (!otherUserId && !roomId) {
+            return res.status(400).json({ message: 'otherUserId or roomId is required.' });
+        }
+
+        const query = {
+            conversationType: otherUserId ? 'direct' : { $in: ['group', 'channel'] },
+            senderId: otherUserId ? asObjectId(otherUserId) : { $ne: userId },
+            seenBy: { $nin: [userId] }
+        };
+
+        if (otherUserId) {
+            query.receiverId = userId;
+        }
+
+        if (roomId) {
+            query.roomId = asObjectId(roomId);
+        }
+
+        const updated = await Message.updateMany(
+            query,
+            {
+                $addToSet: { seenBy: userId, deliveredTo: userId },
+                $set: { isRead: true, status: 'read', readAt: new Date() }
+            }
+        );
+
+        res.json({ message: 'Conversation marked as read.', updatedCount: updated.modifiedCount });
+    } catch (error) {
+        res.status(500).json({ message: 'Failed to mark conversation as read.' });
     }
 });
 

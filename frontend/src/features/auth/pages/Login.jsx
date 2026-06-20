@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { AnimatePresence, motion } from 'framer-motion';
 import { authAPI } from '../authAPI';
 import ErrorMessage from '@/components/common/ErrorMessage';
 import useAuth from '@/hooks/useAuth';
@@ -34,6 +35,16 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [fieldErrors, setFieldErrors] = useState({});
+  const [successToastVisible, setSuccessToastVisible] = useState(false);
+  const redirectTimerRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (redirectTimerRef.current) {
+        clearTimeout(redirectTimerRef.current);
+      }
+    };
+  }, []);
 
   const validateForm = () => {
     const errors = {};
@@ -81,7 +92,16 @@ export default function Login() {
       auth.setSession({ user: data.user, token: data.token });
       const role = data.user?.role || 'student';
       const adminType = String(data.user?.adminType || '').toLowerCase();
-      navigate(resolveDashboardRoute(role, adminType), { replace: true });
+
+      setSuccessToastVisible(true);
+      if (redirectTimerRef.current) {
+        clearTimeout(redirectTimerRef.current);
+      }
+
+      redirectTimerRef.current = setTimeout(() => {
+        setSuccessToastVisible(false);
+        navigate(resolveDashboardRoute(role, adminType), { replace: true });
+      }, 3000);
     } catch (requestError) {
       const errorMessage = requestError.response?.data?.message;
 
@@ -104,6 +124,37 @@ export default function Login() {
 
   return (
     <div className="auth-dot-bg flex min-h-screen">
+      <AnimatePresence>
+        {successToastVisible ? (
+          <motion.div
+            key="login-success-toast"
+            initial={{ opacity: 0, y: -18, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -14, scale: 0.98 }}
+            transition={{ type: 'spring', stiffness: 320, damping: 24 }}
+            className="fixed right-5 top-5 z-[100] w-[min(92vw,440px)] rounded-xl border border-emerald-950/30 bg-[#065F46] p-4 text-white shadow-lg backdrop-blur-xl"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full bg-white/10 text-white ring-1 ring-white/20">
+                <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                  <path d="M20 6L9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="font-['Inter'] text-sm font-semibold leading-6 text-white">
+                  Authentication Successful. Welcome back to the Studio!
+                </p>
+                <p className="mt-1 text-xs font-semibold uppercase tracking-[0.18em] text-white/90">
+                  Redirecting now
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
       <aside className="auth-left-panel hidden w-full max-w-[390px] px-10 py-10 text-white lg:flex lg:flex-col lg:justify-between">
         <div>
           <div className="mb-16 flex items-center gap-4">
@@ -174,6 +225,7 @@ export default function Login() {
                   placeholder="••••••••"
                   value={form.password}
                   onChange={handleChange}
+                  autoComplete="new-password"
                   className="h-full w-full bg-transparent px-5 text-lg font-medium text-slate-900 outline-none placeholder:text-slate-400"
                 />
                 <button

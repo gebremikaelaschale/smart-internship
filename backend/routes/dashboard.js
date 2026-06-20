@@ -4,13 +4,24 @@ const authMiddleware = require('../middleware/authMiddleware');
 const Application = require('../models/Application');
 const Internship = require('../models/Internship');
 const Profile = require('../models/Profile');
+const User = require('../models/User');
 const CompanyProfile = require('../models/CompanyProfile');
+const Certificate = require('../models/Certificate');
 const Task = require('../models/Task');
 const Event = require('../models/Event');
 const Report = require('../models/Report');
 const Evaluation = require('../models/Evaluation');
 const natural = require('natural');
 const PDFDocument = require('pdfkit');
+const { calculateMatchScore } = require('../utils/internshipMatching');
+
+function resolveStoredMatchScore(application = {}) {
+    const camel = Number(application?.matchingScore);
+    const snake = Number(application?.match_score);
+    const camelValue = Number.isFinite(camel) ? camel : 0;
+    const snakeValue = Number.isFinite(snake) ? snake : 0;
+    return Math.max(camelValue, snakeValue);
+}
 
 function dataUrlToBuffer(dataUrl = '') {
     const value = String(dataUrl || '');
@@ -101,6 +112,162 @@ async function buildEmployerRecentActivity({ partnerId, internshipIds, today, li
     };
 }
 
+const CAREER_JOURNEY_STEPS = [
+    'Onboarding',
+    'Profile Review',
+    'Internship Search',
+    'Applied',
+    'Interview',
+    'Internship',
+    'Certification'
+];
+
+function normalizeValue(value = '') {
+    return String(value || '').trim().toLowerCase();
+}
+
+function addDays(date, days) {
+    const result = new Date(date);
+    result.setDate(result.getDate() + Number(days || 0));
+    return result;
+}
+
+function buildStudentJourney({ verificationStatus, applications = [], reports = [], certificates = [], now = new Date() }) {
+    const normalizedVerification = normalizeValue(verificationStatus);
+    const acceptedStatuses = new Set(['accepted', 'placed']);
+    const interviewStatuses = new Set(['interview']);
+    const offerStatuses = new Set(['offered']);
+    const reviewStatuses = new Set(['pending', 'seen', 'shortlisted']);
+
+    const activeApplication = applications.find((application) => acceptedStatuses.has(normalizeValue(application?.status)));
+    const interviewApplication = applications.find((application) => interviewStatuses.has(normalizeValue(application?.status)));
+    const offerApplication = applications.find((application) => offerStatuses.has(normalizeValue(application?.status)));
+    const completedCertificate = certificates.find((certificate) => normalizeValue(certificate?.verificationStatus) === 'verified' || certificate?.issued);
+
+    const submittedReports = reports.filter((report) => normalizeValue(report?.status) !== 'draft');
+    const latestSubmittedWeek = submittedReports.reduce((max, report) => Math.max(max, Number(report?.weekNumber) || 0), 0);
+
+    const acceptedInternshipEnd = activeApplication?.internshipId?.endDate ? new Date(activeApplication.internshipId.endDate) : null;
+    const internshipCompleted = acceptedInternshipEnd && !Number.isNaN(acceptedInternshipEnd.getTime()) && acceptedInternshipEnd < now;
+
+    let stageIndex = 2;
+    if (normalizedVerification === 'not submitted' || !normalizedVerification) {
+        stageIndex = 0;
+    } else if (normalizedVerification === 'submitted' || normalizedVerification === 'pending') {
+        stageIndex = 1;
+    } else if (completedCertificate || internshipCompleted) {
+        stageIndex = 6;
+    } else if (activeApplication) {
+        stageIndex = 5;
+    } else if (interviewApplication) {
+        stageIndex = 4;
+    } else if (offerApplication || applications.some((application) => reviewStatuses.has(normalizeValue(application?.status)))) {
+        stageIndex = 3;
+    } else if (normalizedVerification === 'verified') {
+        stageIndex = 2;
+    }
+
+    const summaries = [
+        'Complete your onboarding details to enter the verification flow.',
+        'Your profile is being reviewed by the department team.',
+        'You are verified and ready to explore internships.',
+        'Your applications are active and waiting for responses.',
+        'An interview is on the horizon. Prepare and stay alert.',
+        'You are in an active internship placement.',
+        'Your placement is ready for certification.'
+    ];
+
+    return {
+        currentStage: CAREER_JOURNEY_STEPS[stageIndex],
+        currentIndex: stageIndex,
+        progress: Math.round((stageIndex / (CAREER_JOURNEY_STEPS.length - 1)) * 100),
+        summary: summaries[stageIndex],
+        completedReports: submittedReports.length,
+        latestWeek: latestSubmittedWeek,
+        steps: CAREER_JOURNEY_STEPS.map((label, index) => ({
+            label,
+            state: index < stageIndex ? 'complete' : index === stageIndex ? 'current' : 'upcoming'
+        }))
+    };
+}
+
+function buildActionRequiredItems({ applications = [], reports = [], calendarEvents = [], now = new Date() }) {
+    const items = [];
+    const acceptedStatuses = new Set(['accepted', 'placed']);
+
+    calendarEvents
+        .filter((event) => normalizeValue(event?.type) === 'interview')
+        .slice(0, 2)
+        .forEach((event, index) => {
+            items.push({
+                id: `interview-${index}-${event?.title || 'event'}`,
+                type: 'interview',
+                title: event?.title || 'Upcoming interview',
+                subtitle: 'Interview date is scheduled. Be ready on time.',
+                dueAt: event?.originalDate || event?.date || now.toISOString(),
+                route: '/student/applications'
+            });
+        });
+
+    const activeApplication = applications.find((application) => acceptedStatuses.has(normalizeValue(application?.status)));
+    if (activeApplication) {
+        const submittedReports = reports.filter((report) => normalizeValue(report?.status) !== 'draft');
+        const latestWeek = submittedReports.reduce((max, report) => Math.max(max, Number(report?.weekNumber) || 0), 0);
+        const internshipStart = activeApplication?.internshipId?.startDate ? new Date(activeApplication.internshipId.startDate) : null;
+        const dueAt = internshipStart && !Number.isNaN(internshipStart.getTime())
+            ? addDays(internshipStart, (latestWeek + 1) * 7)
+            : addDays(now, 3);
+
+        items.push({
+            id: 'logbook-next-entry',
+            type: 'logbook',
+            title: `Week ${latestWeek + 1} logbook entry`,
+            subtitle: 'Submit your weekly internship progress report.',
+            dueAt: dueAt.toISOString(),
+            route: '/student/logbook'
+        });
+    }
+
+    applications
+        .filter((application) => normalizeValue(application?.status) === 'offered')
+        .slice(0, 2)
+        .forEach((application, index) => {
+            const dueAt = application?.updatedAt
+                ? addDays(new Date(application.updatedAt), 2)
+                : application?.createdAt
+                    ? addDays(new Date(application.createdAt), 2)
+                    : addDays(now, 2);
+
+            items.push({
+                id: `offer-${index}-${application?._id || 'item'}`,
+                type: 'offer',
+                title: `${application?.internshipId?.title || 'Internship'} offer expiring`,
+                subtitle: 'Confirm or respond before the offer window closes.',
+                dueAt: dueAt.toISOString(),
+                route: '/student/applications'
+            });
+        });
+
+    calendarEvents
+        .filter((event) => normalizeValue(event?.type) === 'deadline')
+        .slice(0, 2)
+        .forEach((event, index) => {
+            items.push({
+                id: `deadline-${index}-${event?.title || 'item'}`,
+                type: 'deadline',
+                title: event?.title || 'Upcoming deadline',
+                subtitle: 'Complete this action before it expires.',
+                dueAt: event?.originalDate || event?.date || now.toISOString(),
+                route: '/student/dashboard'
+            });
+        });
+
+    return items
+        .filter((item) => item?.dueAt)
+        .sort((a, b) => new Date(a.dueAt) - new Date(b.dueAt))
+        .slice(0, 4);
+}
+
 // @route    GET api/dashboard/student
 // @desc     Get student dashboard overview data with Strategic Analytics (Master Edition)
 // @access   Private
@@ -110,19 +277,45 @@ router.get('/student', authMiddleware, async (req, res) => {
         const studentId = req.user.id;
 
         // 1. Fetch Profile & Strength
-        const profile = await Profile.findOne({ userId: studentId }).populate('userId', ['fullName', 'email']);
+        const [profile, studentUser] = await Promise.all([
+            Profile.findOne({ userId: studentId }).populate('userId', ['fullName', 'email']),
+            User.findById(studentId).select('department college isVerified verificationStatus verificationNote rejectionReason').lean()
+        ]);
         
         // 2. Fetch Application Stats
         const totalApps = await Application.countDocuments({ studentId });
         const pendingApps = await Application.countDocuments({ studentId, status: { $in: ['Pending', 'Seen', 'Shortlisted', 'Interview'] } });
         const acceptedApps = await Application.countDocuments({ studentId, status: 'Accepted' });
         const rejectedApps = await Application.countDocuments({ studentId, status: 'Rejected' });
+        const openInternships = await Internship.countDocuments({ status: 'Open' });
 
         // 3. Fetch Recent Applications (Last 5)
-        const recentApplications = await Application.find({ studentId })
-            .populate('internshipId', ['title', 'location', 'type'])
+        const studentApplications = await Application.find({ studentId })
+            .populate('internshipId', ['title', 'location', 'type', 'startDate', 'endDate', 'deadline'])
             .sort({ createdAt: -1 })
-            .limit(5);
+            .lean();
+
+        // Normalize score fields so every consumer sees the same stored value.
+        studentApplications.forEach((application) => {
+            const finalScore = resolveStoredMatchScore(application);
+            application.matchingScore = finalScore;
+            application.match_score = finalScore;
+            application.matchScore = finalScore;
+        });
+
+        const recentApplications = studentApplications.slice(0, 5);
+
+        const studentReports = await Report.find({ studentId, type: 'Weekly' })
+            .select('weekNumber status internshipId createdAt updatedAt')
+            .populate('internshipId', 'title startDate endDate deadline')
+            .sort({ weekNumber: 1, createdAt: 1 })
+            .lean();
+
+        const studentCertificates = await Certificate.find({ studentId })
+            .select('verificationStatus issued internshipId applicationId updatedAt')
+            .populate('internshipId', 'title startDate endDate deadline')
+            .sort({ updatedAt: -1 })
+            .lean();
 
         // 4. Fetch Pending Tasks (Last 5)
         const pendingTasks = await Task.find({ status: 'Pending' })
@@ -137,52 +330,43 @@ router.get('/student', authMiddleware, async (req, res) => {
 
         // 5. Smart Recommendations (AI Matching)
         const allInternships = await Internship.find({ status: 'Open' }).limit(10).lean();
-        
+
         const companyIds = [...new Set(allInternships.map(i => i.companyId).filter(Boolean))];
-        const companyProfiles = await CompanyProfile.find({ user: { $in: companyIds } }).lean();
+        // Only consider internships from verified companies
+        const companyProfiles = await CompanyProfile.find({ user: { $in: companyIds }, 'verification.status': 'Verified' }).lean();
+        const verifiedCompanyIds = companyProfiles.map(cp => String(cp.user));
+        // filter internships to only those posted by verified companies
+        const verifiedInternships = allInternships.filter(i => verifiedCompanyIds.includes(String(i.companyId)));
         const compMap = {};
         companyProfiles.forEach(cp => { compMap[String(cp.user)] = cp; });
 
-        let recommendations = [];
+        const studentDepartment = String(studentUser?.department || profile?.personalInfo?.department || '').trim();
+        const storedScoreByInternshipId = new Map(
+            studentApplications
+                .filter((application) => application?.internshipId?._id)
+                .map((application) => [String(application.internshipId._id), resolveStoredMatchScore(application)])
+        );
 
-        if (profile && profile.academicInfo && profile.academicInfo.skills) {
-            const studentSkills = profile.academicInfo.skills.filter(Boolean).map(s => s.toLowerCase().trim());
-            
-            recommendations = allInternships.map(internship => {
-                const reqSkillsArray = internship.requiredSkills || [];
-                const requiredSkills = reqSkillsArray.filter(Boolean).map(s => s.toLowerCase().trim());
-                
-                let calculatedScore = 0;
-                if (requiredSkills.length > 0) {
-                    let matchedCount = 0;
-                    requiredSkills.forEach(req => {
-                        if (studentSkills.some(stu => stu.includes(req) || req.includes(stu))) {
-                            matchedCount++;
-                        }
-                    });
-                    calculatedScore = Math.round((matchedCount / requiredSkills.length) * 100);
-                    
-                    const sDept = String(profile?.personalInfo?.department || '').toLowerCase().trim();
-                    const iDept = String(internship?.department || '').toLowerCase().trim();
-                    if (sDept && iDept && (sDept.includes(iDept) || iDept.includes(sDept))) {
-                        calculatedScore = Math.max(calculatedScore, 95);
-                    }
-                }
+        const recommendations = verifiedInternships
+            .map((internship) => {
+                // For internships the student already applied to, always use the stored score from the application.
+                const storedScore = storedScoreByInternshipId.get(String(internship?._id || ''));
+                const match = storedScore != null
+                    ? { score: storedScore, reasoning: '', matchedTerms: [], departmentMatched: true }
+                    : calculateMatchScore(profile, internship, { student: studentUser, studentDepartment });
 
-                const score = Math.min(100, calculatedScore);
                 return {
                     ...internship,
                     companyProfile: compMap[String(internship.companyId)] || null,
-                    matchScore: score
+                    matchScore: match.score,
+                    matchReasoning: match.reasoning,
+                    matchedTerms: match.matchedTerms,
+                    departmentMatched: match.departmentMatched
                 };
-            }).sort((a, b) => b.matchScore - a.matchScore).slice(0, 3);
-        } else {
-            recommendations = allInternships.slice(0, 3).map(i => ({ 
-                ...i, 
-                companyProfile: compMap[String(i.companyId)] || null,
-                matchScore: 0 
-            }));
-        }
+            })
+            .filter((item) => item.departmentMatched !== false)
+            .sort((a, b) => b.matchScore - a.matchScore)
+            .slice(0, 3);
 
         // 6. Fetch Calendar Events
         const now = new Date();
@@ -223,6 +407,19 @@ router.get('/student', authMiddleware, async (req, res) => {
             };
         });
 
+        const journey = buildStudentJourney({
+            verificationStatus: studentUser?.verificationStatus || profile?.verificationStatus,
+            applications: studentApplications,
+            reports: studentReports,
+            certificates: studentCertificates
+        });
+
+        const actionRequired = buildActionRequiredItems({
+            applications: studentApplications,
+            reports: studentReports,
+            calendarEvents: finalCalendarEvents
+        });
+
         // 7. Generate Smart Tasks
         let finalTasks = [];
         if (!profile || profile.profileStrength < 100) finalTasks.push({ title: 'Complete Your Profile', actionPath: '/dashboard/profile', iconType: 'TrendingUp' });
@@ -232,9 +429,14 @@ router.get('/student', authMiddleware, async (req, res) => {
 
         // 8. [MASTER EDITION] STRATEGIC ANALYTICS
         // A. Market Sentiment: Trending Skills
-        const marketInternships = await Internship.find({ status: 'Open' }).limit(50);
-        let marketSkillCounts = {};
-        marketInternships.forEach(i => {
+        const marketInternships = await Internship.find({ status: 'Open' }).limit(50).lean();
+        // filter market internships to only verified companies
+        const marketCompanyIds = [...new Set(marketInternships.map(i => i.companyId).filter(Boolean))];
+        const marketCompanyProfiles = await CompanyProfile.find({ user: { $in: marketCompanyIds }, 'verification.status': 'Verified' }).lean();
+        const marketVerifiedIds = marketCompanyProfiles.map(cp => String(cp.user));
+        const filteredMarketInternships = marketInternships.filter(i => marketVerifiedIds.includes(String(i.companyId)));
+        let marketSkillCounts = {}; 
+        filteredMarketInternships.forEach(i => {
            if(i.requiredSkills) {
                i.requiredSkills.forEach(sk => {
                    if (sk && typeof sk === 'string') {
@@ -262,7 +464,7 @@ router.get('/student', authMiddleware, async (req, res) => {
                               Math.round(((currentActivity - previousActivity) / previousActivity) * 100);
 
         // C. Peer Benchmarking (Simulated University Average)
-        const totalStudents = await Profile.countDocuments();
+        const totalStudents = await User.distinct('_id', { role: { $in: ['student', 'Student'] } }).then((ids) => ids.length);
         const globalAcceptedApps = await Application.countDocuments({ status: 'Accepted' });
         const avgAccepted = totalStudents > 0 ? (globalAcceptedApps / totalStudents) : 0;
         const marketPosition = acceptedApps >= avgAccepted ? 'Top Performer' : 'Emerging Talent';
@@ -325,13 +527,35 @@ router.get('/student', authMiddleware, async (req, res) => {
 
         analytics.activity = Object.values(activityMap);
 
+        const profilePayload = profile
+            ? (typeof profile.toObject === 'function' ? profile.toObject() : { ...profile })
+            : { profileStrength: 0 };
+
+        if (studentUser) {
+            profilePayload.isVerified = Boolean(studentUser.isVerified);
+            profilePayload.verificationStatus = studentUser.verificationStatus
+                || (studentUser.isVerified ? 'Verified' : 'Not Submitted');
+            profilePayload.verificationNote = studentUser.verificationNote || '';
+            profilePayload.rejectionReason = studentUser.rejectionReason || '';
+            profilePayload.rejection_reason = studentUser.rejection_reason || studentUser.rejectionReason || '';
+        }
+
         res.json({
-            profile: profile || { profileStrength: 0 },
-            stats: { total: totalApps, pending: pendingApps, accepted: acceptedApps, rejected: rejectedApps, saved: profile?.savedInternships?.length || 0 },
+            profile: profilePayload,
+            stats: {
+              total: totalApps,
+              pending: pendingApps,
+              accepted: acceptedApps,
+              rejected: rejectedApps,
+              saved: profile?.savedInternships?.length || 0,
+              openInternships: openInternships
+            },
             recentApplications,
             tasks: finalTasks,
             recommendations,
             calendarEvents: finalCalendarEvents,
+            journey,
+            actionRequired,
             analytics,
             saved: profile?.savedInternships?.length || 0,
             profileCompletion: profile?.profileStrength || 0
@@ -370,6 +594,7 @@ router.get('/employer', authMiddleware, async (req, res) => {
             : myInternships;
         const internshipIds = filteredInternships.map((item) => item._id);
         const activePrograms = filteredInternships.filter((item) => String(item.status || '').toLowerCase() === 'open').length;
+        const totalPrograms = myInternships.length;
         const availablePrograms = myInternships.map((item) => ({
             id: item._id,
             title: item.title || 'Untitled Program'
@@ -379,6 +604,10 @@ router.get('/employer', authMiddleware, async (req, res) => {
             return res.json({
                 stats: {
                     activePrograms: 0,
+                    totalPrograms: 0,
+                    totalApplicants: 0,
+                    totalActiveInterns: 0,
+                    totalAcceptedStudents: 0,
                     totalInterns: 0,
                     ongoing: 0,
                     completed: 0
@@ -413,12 +642,32 @@ router.get('/employer', authMiddleware, async (req, res) => {
             .select('internshipId status studentId matchingScore timeline createdAt')
             .lean();
 
+        const companyApplicationsFilter = {
+            internshipId: { $in: internshipIds }
+        };
+
+        const [distinctApplicantIds, distinctActiveIds, distinctAcceptedIds] = await Promise.all([
+            Application.distinct('studentId', companyApplicationsFilter),
+            Application.distinct('studentId', {
+                ...companyApplicationsFilter,
+                status: { $in: ['Accepted', 'Placed', 'PLACED'] }
+            }),
+            Application.distinct('studentId', {
+                ...companyApplicationsFilter,
+                status: { $in: ['Accepted', 'Placed', 'PLACED', 'Completed', 'COMPLETED'] }
+            })
+        ]);
+
         const acceptedApplications = await Application.find({
             internshipId: { $in: internshipIds },
-            status: 'Accepted'
+            status: { $in: ['Accepted', 'Placed', 'PLACED', 'Completed', 'COMPLETED'] }
         })
             .populate('internshipId', 'endDate')
             .lean();
+
+        const totalApplicants = distinctApplicantIds.length;
+        const totalActiveInterns = distinctActiveIds.length;
+        const totalAcceptedStudents = distinctAcceptedIds.length;
 
         let ongoing = 0;
         let completed = 0;
@@ -443,6 +692,7 @@ router.get('/employer', authMiddleware, async (req, res) => {
             performanceMap.set(String(internship._id), {
                 internshipId: internship._id,
                 programTitle: internship.title || 'Untitled Program',
+                status: internship.status || 'Pending',
                 applicants: 0,
                 accepted: 0,
                 completed: 0,
@@ -657,6 +907,10 @@ router.get('/employer', authMiddleware, async (req, res) => {
         return res.json({
             stats: {
                 activePrograms,
+                totalPrograms,
+                totalApplicants,
+                totalActiveInterns,
+                totalAcceptedStudents,
                 totalInterns,
                 ongoing,
                 completed

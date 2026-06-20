@@ -1,9 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { AnimatePresence, motion } from 'framer-motion';
 import { authAPI } from '../authAPI';
 import ErrorMessage from '@/components/common/ErrorMessage';
 import useAuth from '@/hooks/useAuth';
 import { isStrongPassword, isValidGoogleEmail, startsWithCapitalLetter } from '@/utils/authValidation';
+import EthiopianPhoneInput, { validateEthiopianPhone } from '@/components/ui/EthiopianPhoneInput';
 import { resolveDashboardRoute } from '@/utils/roleRedirect';
 
 const STEPS = [
@@ -78,14 +80,25 @@ function EyeIcon() {
   );
 }
 
+function SparklesIcon() {
+  return (
+    <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9">
+      <path d="M12 2l1.5 5.2L19 9l-5.5 1.8L12 16l-1.5-5.2L5 9l5.5-1.8L12 2z" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M19.5 14l.7 2.4L22 17l-1.8.6-.7 2.4-.7-2.4L17 17l1.8-.6.7-2.4z" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 export default function Register() {
   const navigate = useNavigate();
   const auth = useAuth();
+  const redirectTimerRef = useRef(null);
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [fieldErrors, setFieldErrors] = useState({});
   const [showPassword, setShowPassword] = useState(false);
+  const [successToastVisible, setSuccessToastVisible] = useState(false);
   const [form, setForm] = useState({
     fullName: '',
     email: '',
@@ -93,6 +106,44 @@ export default function Register() {
     role: 'student',
     password: ''
   });
+
+  useEffect(() => {
+    return () => {
+      if (redirectTimerRef.current) {
+        clearTimeout(redirectTimerRef.current);
+      }
+    };
+  }, []);
+
+  const playSuccessSound = () => {
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+
+      const audioContext = new AudioContextClass();
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(880, audioContext.currentTime);
+      oscillator.frequency.exponentialRampToValueAtTime(1320, audioContext.currentTime + 0.12);
+
+      gainNode.gain.setValueAtTime(0.0001, audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.025, audioContext.currentTime + 0.02);
+      gainNode.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + 0.22);
+
+      oscillator.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      oscillator.start(audioContext.currentTime);
+      oscillator.stop(audioContext.currentTime + 0.24);
+
+      oscillator.onended = () => {
+        audioContext.close().catch(() => {});
+      };
+    } catch {
+      // silent fallback if audio is blocked
+    }
+  };
 
   const copyByStep = {
     1: { title: 'Basic Info', subtitle: 'Please fill in your details to create an account.' },
@@ -116,8 +167,9 @@ export default function Register() {
         errors.email = 'Please enter a valid Google email format';
       }
 
-      if (form.phone && !/^\+?[0-9\s-]{8,15}$/.test(form.phone)) {
-        errors.phone = 'Please enter a valid phone number';
+      const phoneError = validateEthiopianPhone(form.phone);
+      if (phoneError) {
+        errors.phone = phoneError;
       }
     }
 
@@ -159,12 +211,26 @@ export default function Register() {
         fullName: form.fullName,
         email: form.email,
         password: form.password,
-        phone: form.phone || null,
+        phone: form.phone ? `+251${form.phone}` : null,
         role: form.role
       });
 
       auth.setSession({ user: data.user, token: data.token });
-      navigate(resolveDashboardRoute(data.user?.role || form.role, data.user?.adminType), { replace: true });
+      const role = data.user?.role || form.role;
+      const adminType = data.user?.adminType;
+      const redirectPath = role === 'student' ? '/student/profile' : resolveDashboardRoute(role, adminType);
+
+      setSuccessToastVisible(true);
+      playSuccessSound();
+
+      if (redirectTimerRef.current) {
+        clearTimeout(redirectTimerRef.current);
+      }
+
+      redirectTimerRef.current = setTimeout(() => {
+        setSuccessToastVisible(false);
+        navigate(redirectPath, { replace: true });
+      }, 4000);
     } catch (requestError) {
       const message = requestError.response?.data?.message || 'Unable to create account. Please try again.';
       const status = requestError.response?.status;
@@ -221,6 +287,35 @@ export default function Register() {
 
   return (
     <div className="auth-dot-bg flex min-h-screen">
+      <AnimatePresence>
+        {successToastVisible ? (
+          <motion.div
+            key="registration-success-toast"
+            initial={{ opacity: 0, scale: 0.94, y: 18 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.97, y: 10 }}
+            transition={{ type: 'spring', stiffness: 280, damping: 24 }}
+            className="fixed bottom-5 right-5 z-[100] w-[min(92vw,460px)] rounded-2xl border border-emerald-500/45 bg-emerald-50/85 p-4 text-slate-900 shadow-[0_18px_45px_rgba(16,185,129,0.18)] backdrop-blur-xl"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="flex items-start gap-3">
+              <div className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-emerald-500/15 text-emerald-600 ring-1 ring-emerald-500/20">
+                <SparklesIcon />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="font-['Inter'] text-sm font-semibold leading-6 text-[#002147]">
+                  Account Created Successfully! Welcome to the UOG Internship Studio.
+                </p>
+                <p className="mt-1 text-xs font-medium uppercase tracking-[0.18em] text-emerald-700/80">
+                  Taking you to your next step
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
       <StepSidebar step={step} />
 
       <main className="flex flex-1 items-center justify-center px-4 py-10 lg:px-16">
@@ -260,16 +355,11 @@ export default function Register() {
               </div>
 
               <div>
-                <FieldLabel>Phone Number (Optional for SMS recovery)</FieldLabel>
-                <input
+                <EthiopianPhoneInput
                   value={form.phone}
-                  onChange={(e) => onFieldChange('phone', e.target.value)}
-                  placeholder="+251 91..."
-                  className={`h-14 w-full rounded-[20px] border bg-[#f0f4fb] px-5 text-lg font-medium text-slate-900 outline-none transition placeholder:text-slate-400 focus:ring-4 ${
-                    fieldErrors.phone ? 'border-red-300 focus:border-red-300 focus:ring-red-100' : 'border-slate-200 focus:border-blue-300 focus:ring-blue-100'
-                  }`}
+                  onChange={(digits) => onFieldChange('phone', digits)}
+                  error={fieldErrors.phone}
                 />
-                {fieldErrors.phone ? <p className="mt-1 text-sm text-red-500">{fieldErrors.phone}</p> : null}
               </div>
             </div>
           ) : null}

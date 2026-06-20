@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>University of Gondar Internship Acceptance Form</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @page {
+      size: A4;
+      margin: 16mm;
+    }
+
+    body {
+      font-family: "Times New Roman", Times, serif;
+      background: #f3f4f6;
+    }
+
+    .field-line {
+      border-bottom: 1px solid #000;
+      min-height: 20px;
+      display: inline-block;
+      vertical-align: baseline;
+    }
+
+    .print-paper {
+      width: 210mm;
+      min-height: 297mm;
+    }
+
+    @media print {
+      body {
+        background: #fff;
+      }
+
+      .print-paper {
+        width: auto;
+        min-height: auto;
+        margin: 0;
+        box-shadow: none;
+      }
+    }
+  </style>
+</head>
+<body class="p-6 md:p-10 text-black">
+  <div class="print-paper mx-auto bg-white shadow-lg rounded-sm p-10 md:p-14 text-black">
+    <div class="flex items-start gap-4">
+      <img src="/uog-logo.jpg" alt="University of Gondar Logo" class="h-16 w-16 object-cover" />
+      <div class="flex-1 text-center">
+        <p class="text-3xl font-bold leading-tight">University of Gondar</p>
+        <p class="mt-1 text-2xl font-bold leading-tight">College of Informatics</p>
+        <p class="mt-1 text-2xl font-bold leading-tight">Department of Computer Science</p>
+        <p class="mt-2 text-2xl font-bold underline leading-tight">Internship Acceptance Form</p>
+      </div>
+      <div class="w-16"></div>
+    </div>
+
+    <div class="mt-10">
+      <p class="text-xl font-bold underline">To be filled by the student</p>
+
+      <div class="mt-6 grid grid-cols-2 gap-x-8 gap-y-5 text-lg">
+        <div>
+          <span class="font-bold">Name of student:</span>
+          <span class="field-line ml-2 w-64"></span>
+        </div>
+        <div>
+          <span class="font-bold">ID.No:</span>
+          <span class="field-line ml-2 w-56"></span>
+        </div>
+
+        <div>
+          <span class="font-bold">Department/ program:</span>
+          <span class="ml-2 font-bold underline">Computer science</span>
+        </div>
+        <div>
+          <span class="font-bold">Year/ Semester:</span>
+          <span class="ml-2 font-bold underline">3rd / 2nd</span>
+        </div>
+
+        <div>
+          <span class="font-bold">Phone Number:</span>
+          <span class="field-line ml-2 w-56"></span>
+        </div>
+        <div>
+          <span class="font-bold">Email:</span>
+          <span class="field-line ml-2 w-64"></span>
+        </div>
+
+        <div class="col-span-2">
+          <span class="font-bold">Signature:</span>
+          <span class="field-line ml-2 w-72"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-10">
+      <p class="text-xl font-bold underline">To be filled by the company</p>
+
+      <div class="mt-6 space-y-5 text-lg">
+        <div>
+          <span class="font-bold">Company name:</span>
+          <span class="field-line ml-2 w-[70%]"></span>
+        </div>
+
+        <div>
+          <span class="font-bold">Place/town:</span>
+          <span class="field-line ml-2 w-[73%]"></span>
+        </div>
+
+        <div>
+          <span class="font-bold">Contact person:</span>
+          <span class="field-line ml-2 w-[70%]"></span>
+        </div>
+
+        <div class="grid grid-cols-2 gap-x-8">
+          <div>
+            <span class="font-bold">Phone Number:</span>
+            <span class="field-line ml-2 w-56"></span>
+          </div>
+          <div>
+            <span class="font-bold">Email:</span>
+            <span class="field-line ml-2 w-64"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-10 text-lg leading-relaxed">
+      <p>
+        I, on behalf of <span class="field-line w-56"></span> (Company Name), confirm the Acceptance of the aforementioned student as an intern for the designated amount of time (i.e. for at least 200 hours for Two- months).
+      </p>
+      <p class="mt-5">
+        After completing this form, please email it to Misganaw.Abeje@uog.edu.et or misganaw.abeje13@gmail.com or hand it over to the student.
+      </p>
+    </div>
+
+    <div class="mt-12 grid grid-cols-3 gap-8 text-lg">
+      <div>
+        <p class="font-bold">Name:</p>
+        <div class="field-line mt-3 w-full"></div>
+      </div>
+      <div>
+        <p class="font-bold">Signature:</p>
+        <div class="field-line mt-3 w-full"></div>
+      </div>
+      <div>
+        <p class="font-bold">Date:</p>
+        <div class="field-line mt-3 w-full"></div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
