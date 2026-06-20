@@ -3,6 +3,38 @@ const router = express.Router();
 const auth = require('../middleware/authMiddleware');
 const User = require('../models/User');
 const Profile = require('../models/Profile');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+// Configure Multer for local student resume uploads
+const resumeStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        const uploadPath = path.join(__dirname, '../uploads/resumes');
+        if (!fs.existsSync(uploadPath)) {
+            fs.mkdirSync(uploadPath, { recursive: true });
+        }
+        cb(null, uploadPath);
+    },
+    filename: (req, file, cb) => {
+        const studentName = req.body.fullName || 'student';
+        const safeName = studentName.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        const uniqueSuffix = Date.now();
+        cb(null, `${safeName}-resume-${uniqueSuffix}${path.extname(file.originalname)}`);
+    }
+});
+
+const resumeUpload = multer({
+    storage: resumeStorage,
+    limits: { fileSize: 50 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'application/pdf') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PDF files are allowed for resumes.'));
+        }
+    }
+});
 
 function ensureStudent(req, res) {
     if (String(req.user?.role || '').toLowerCase() !== 'student') {
